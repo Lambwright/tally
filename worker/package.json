@@ -1,0 +1,19 @@
+{
+  "name": "tally-worker",
+  "version": "0.0.0",
+  "private": true,
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "start": "wrangler dev",
+    "test": "vitest",
+    "smoke": "node test/smoke.mjs"
+  },
+  "devDependencies": {
+    "vitest": "~3.2.0",
+    "wrangler": "^4.120.1"
+  },
+  "dependencies": {
+    "@neondatabase/serverless": "^1.1.0"
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "subject": "Expense EXP-0002",
+  "from": "test.employee@einbau.ca",
+  "employee_name": "Test Employee",
+  "employee_email": "test.employee@einbau.ca",
+  "province": "QC",
+  "project_number": "000_000_1",
+  "category": "materials",
+  "body": "Materials receipt attached.",
+  "attachments": [
+    {
+      "name": "receipt.jpg",
+      "contentType": "image/jpeg",
+      "contentBytes": "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAMCAgICAgMCAgIDAwMDBAYEBAQEBAgGBgUGCQgKCgkICQkKDA8MCgsOCwkJDRENDg8QEBEQCgwSExIQEw8QEBD/2wBDAQMDAwQDBAgEBAgQCwkLEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBD/wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAf/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFAEBAAAAAAAAAAAAAAAAAAAAAP/EABQRAQAAAAAAAAAAAAAAAAAAAAD/2gAMAwEAAhEDEQA/AJgAA//Z"
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "subject": "Expense EXP-0001",
+  "from": "test.employee@einbau.ca",
+  "employee_name": "Test Employee",
+  "employee_email": "test.employee@einbau.ca",
+  "province": "ON",
+  "project_number": "000_000_1",
+  "category": "per_diem",
+  "claimed_amount": "75.00",
+  "body": "Per diem claim for the week of testing."
+}

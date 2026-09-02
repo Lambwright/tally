@@ -1,0 +1,57 @@
+/**
+ * tally-worker — expense-receipt intake, Claude extraction, validation, review-queue
+ * API, and the Procore Direct Cost write.
+ *
+ * Wrangler config reference: https://developers.cloudflare.com/workers/wrangler/configuration/
+ */
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "tally-worker",
+	"main": "src/index.js",
+	"compatibility_date": "2026-08-31",
+	"observability": {
+		"enabled": true
+	},
+	"upload_source_maps": true,
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	"vars": {
+		"PROCORE_COMPANY_ID": "562949953508586",
+		// us02 is this account's regional data-plane host — confirmed against the
+		// payroll Direct Cost flow, which hits us02.procore.com/rest/v1.0/... too.
+		"PROCORE_API_BASE": "https://us02.procore.com",
+		// Which Einbau ID role(s) may use the review queue. Any valid login whose
+		// role is in this comma list passes; everyone else gets a clear 403.
+		"ALLOWED_ROLES": "admin,user",
+		"CURRENT_APP": "tally"
+	},
+	// One schedule: refresh the cached active-project list from Procore every 6h.
+	// There is deliberately NO mail-polling cron — Power Automate pushes each email
+	// to /intake as it arrives, so every invocation only ever does one email's work
+	// (a handful of subrequests), well clear of this account's confirmed-low
+	// per-invocation subrequest ceiling (see punch-worker's Stage Enforcer notes).
+	"triggers": {
+		"crons": ["0 */6 * * *"]
+	},
+	// A Worker calling another Worker's *.workers.dev URL over plain fetch() gets
+	// blocked with Cloudflare error 1042 — the service binding is the supported way
+	// to reach auth-worker's /auth/verify from in here. Same pattern as punch-worker.
+	"services": [
+		{ "binding": "AUTH_WORKER", "service": "auth" }
+	],
+	// Receipt images. NOT a public bucket — the frontend only ever reads them back
+	// through GET /submissions/:id/receipt/:key, which checks the same Einbau ID
+	// token as every other queue route.
+	"r2_buckets": [
+		{ "binding": "RECEIPTS", "bucket_name": "tally-receipts" }
+	]
+	/**
+	 * Secrets (set with `wrangler secret put <NAME>`):
+	 *   DATABASE_URL         - Neon Postgres connection string (the dedicated `tally` project)
+	 *   ANTHROPIC_API_KEY    - Anthropic API key (receipt vision calls)
+	 *   TALLY_SERVICE_KEY    - shared secret Power Automate sends as X-Tally-Service-Key on /intake
+	 *   PROCORE_CLIENT_ID    - Procore data-connection client id (client_credentials)
+	 *   PROCORE_CLIENT_SECRET - Procore data-connection client secret
+	 */
+}
