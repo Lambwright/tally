@@ -9,13 +9,16 @@ export default function Cameo({ onEnd }) {
     return () => clearTimeout(t);
   }, [onEnd]);
 
+  // Try cameo.png, fall back to cameo.jpg, then give up quietly.
+  const onErr = (e) => {
+    const img = e.currentTarget;
+    if (img.src.endsWith(".png")) img.src = `${import.meta.env.BASE_URL}cameo.jpg`;
+    else img.style.display = "none";
+  };
+
   return (
     <div className="cameo-run" aria-hidden="true">
-      <img
-        src={`${import.meta.env.BASE_URL}cameo.png`}
-        alt=""
-        onError={(e) => { e.currentTarget.style.display = "none"; }}
-      />
+      <img src={`${import.meta.env.BASE_URL}cameo.png`} alt="" onError={onErr} />
     </div>
   );
 }
