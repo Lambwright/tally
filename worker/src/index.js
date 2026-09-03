@@ -1154,13 +1154,14 @@ export default {
         return withRefresh(json({ projects: rows }));
       }
 
+      // No role split inside TALLY for now — any allowed user (see ALLOWED_USERS)
+      // has full control, ops routes included. Fine-grained permissions come with
+      // the suite-wide settings dashboard.
       if (url.pathname === "/admin/refresh-projects" && request.method === "POST") {
-        if (auth.user.role !== "admin") return json({ error: "forbidden", reason: "admin only" }, 403);
         return withRefresh(json({ refreshed: await refreshProjectsCache(env, sql) }));
       }
 
       if (url.pathname === "/admin/procore-probe" && request.method === "GET") {
-        if (auth.user.role !== "admin") return json({ error: "forbidden", reason: "admin only" }, 403);
         const path = url.searchParams.get("path");
         if (!path || !path.startsWith("/rest/")) return json({ error: "bad_path", detail: "pass ?path=/rest/..." }, 400);
         const token = await getProcoreToken(env);

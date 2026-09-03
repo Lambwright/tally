@@ -153,7 +153,15 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
   }
 
   if (loading) return <div className="empty-state">Loading…</div>;
-  if (error) return <div className="empty-state">{error}</div>;
+  if (error)
+    return (
+      <div>
+        <button className="btn btn-ghost btn-sm" onClick={onClose} style={{ marginBottom: 16 }}>← Back to queue</button>
+        <div className="empty-state">
+          {error === "not_found" ? "That submission no longer exists." : error}
+        </div>
+      </div>
+    );
   if (!sub) return null;
 
   return (

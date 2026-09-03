@@ -78,6 +78,25 @@ body {
   margin-top: 2px;
   display: block;
 }
+.app-switcher { position: relative; }
+.app-switcher-caret { font-size: 11px; margin-left: 6px; color: var(--text-tertiary); vertical-align: middle; }
+.app-switcher-menu {
+  position: absolute; top: calc(100% + 8px); left: 0; z-index: 300;
+  background: var(--bg-card); border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm); min-width: 170px; box-shadow: var(--shadow-md); overflow: hidden;
+}
+.app-switcher-item {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 10px 14px; font-family: 'JetBrains Mono', monospace; font-size: 11px;
+  font-weight: 700; letter-spacing: 0.06em; text-decoration: none;
+  color: var(--text-secondary); border-bottom: 1px solid var(--border-color);
+}
+.app-switcher-item:last-child { border-bottom: none; }
+.app-switcher-item:hover { background: var(--bg-page); color: var(--text-primary); }
+.app-switcher-item.current { color: var(--orange); background: rgba(226,135,26,0.08); }
+.app-switcher-item.disabled { color: var(--text-tertiary); cursor: default; }
+.app-switcher-soon { font-size: 9px; font-weight: 400; color: var(--text-tertiary); }
+
 .header-user { display: flex; align-items: center; gap: 12px; margin-top: 6px; }
 .header-username {
   font-family: 'JetBrains Mono', monospace;
