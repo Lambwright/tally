@@ -24,7 +24,7 @@
 		// Who may use the review queue. ALLOWED_USERS (comma list of Einbau ID
 		// usernames) is the real gate — TALLY is Ben + Josh only. ALLOWED_ROLES is
 		// just a fallback when ALLOWED_USERS is unset.
-		"ALLOWED_USERS": "ben,josh",
+		"ALLOWED_USERS": "ben,josh@einbau.ca",
 		"ALLOWED_ROLES": "admin,user",
 		"CURRENT_APP": "tally"
 	},
