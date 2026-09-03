@@ -192,10 +192,21 @@ async function requireLogin(request, env) {
     }
     const data = await res.json();
     if (!data.valid) return { ok: false, reason: "Session is invalid or expired — please log in again." };
+    if (!data.user) return { ok: false, reason: "auth-worker returned no user for this session." };
 
-    const allowed = String(env.ALLOWED_ROLES || "admin,user").split(",").map((r) => r.trim());
-    if (!data.user || !allowed.includes(data.user.role)) {
-      return { ok: false, reason: `Logged in as "${data.user && data.user.username}" (role "${data.user && data.user.role}"), which isn't allowed in TALLY.` };
+    // TALLY is used by a named few (Ben + Josh). ALLOWED_USERS is the real gate —
+    // a comma list of Einbau ID usernames. ALLOWED_ROLES stays as a coarser
+    // fallback when ALLOWED_USERS isn't set.
+    const allowedUsers = String(env.ALLOWED_USERS || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+    if (allowedUsers.length) {
+      if (!allowedUsers.includes(String(data.user.username || "").toLowerCase())) {
+        return { ok: false, reason: `TALLY is limited to specific users — "${data.user.username}" isn't one of them.` };
+      }
+    } else {
+      const allowedRoles = String(env.ALLOWED_ROLES || "admin,user").split(",").map((r) => r.trim());
+      if (!allowedRoles.includes(data.user.role)) {
+        return { ok: false, reason: `Logged in as "${data.user.username}" (role "${data.user.role}"), which isn't allowed in TALLY.` };
+      }
     }
     return { ok: true, user: data.user, refreshedToken: data.refreshedToken || null };
   } catch (e) {
