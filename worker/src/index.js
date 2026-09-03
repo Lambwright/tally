@@ -261,6 +261,10 @@ Return ONLY a JSON object, no prose, no markdown fences:
 
 Rules:
 - Read numbers exactly as printed. Never infer tax that isn't shown.
+- One line_item per row the employee filled in — the amount is in exactly one of the
+  six category columns (Parking $, Materials $, Fuel $, Mileage (KM), Per Diem $, Other $).
+- IGNORE the "For Office Use Only" block (Subtotal / Net Total / Expense Total) and the
+  "Authorized By" / "Date Authorized" fields — those are handled downstream, not by you.
 - If the form is missing or unreadable, return "form" with null fields and "line_items": [].
 - If a receipt is unreadable, still include its entry with nulls and confidence 0.`;
 
