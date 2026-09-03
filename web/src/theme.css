@@ -277,14 +277,14 @@ body {
   position: fixed; left: 0; bottom: 0; z-index: 9999; pointer-events: none;
   will-change: transform; animation: cameo-across 3.4s linear forwards;
 }
-.cameo-run img { height: 190px; display: block; animation: cameo-bob 0.34s ease-in-out infinite; }
+.cameo-run img { height: 200px; display: block; animation: cameo-bob 0.28s ease-in-out infinite; }
 @keyframes cameo-across {
-  from { transform: translateX(-280px); }
+  from { transform: translateX(-300px); }
   to   { transform: translateX(calc(100vw + 40px)); }
 }
 @keyframes cameo-bob {
-  0%, 100% { transform: translateY(0) rotate(-3deg); }
-  50%      { transform: translateY(-16px) rotate(3deg); }
+  0%, 100% { transform: translateY(0) rotate(-1.5deg); }
+  50%      { transform: translateY(-9px) rotate(1.5deg); }
 }
 
 /* --- multi-line submission detail --- */
