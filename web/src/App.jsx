@@ -5,6 +5,10 @@ import Header from "./components/Header.jsx";
 import LoginScreen from "./components/LoginScreen.jsx";
 import QueueList from "./components/QueueList.jsx";
 import SubmissionDetail from "./components/SubmissionDetail.jsx";
+import Cameo from "./components/Cameo.jsx";
+
+const CAMEO_USER = "josh@einbau.ca";
+const CAMEO_EVERY = 7;
 
 const STATUSES = [
   { key: "needs_review", label: "Needs Review" },
@@ -28,6 +32,7 @@ export default function App() {
   const [loadingList, setLoadingList] = useState(false);
   const [listError, setListError] = useState(null);
   const [selectedId, setSelectedId] = useState(getHashId());
+  const [cameo, setCameo] = useState(0);
 
   useEffect(() => {
     const token = getStoredToken();
@@ -73,9 +78,20 @@ export default function App() {
     window.location.hash = id ? `#/submission/${id}` : "";
   }
 
+  const endCameo = useCallback(() => setCameo(0), []);
+
   function handleLoggedIn(u) {
     setUser(u);
     setAuthState("in");
+    if (u && String(u.username).toLowerCase() === CAMEO_USER) {
+      try {
+        const n = (parseInt(localStorage.getItem("tally_visits") || "0", 10) || 0) + 1;
+        localStorage.setItem("tally_visits", String(n));
+        if (n % CAMEO_EVERY === 0) setCameo((c) => c + 1);
+      } catch {
+        /* storage blocked — no run */
+      }
+    }
   }
   function handleLogout() {
     doLogout();
@@ -96,6 +112,7 @@ export default function App() {
 
   return (
     <>
+      {cameo > 0 && <Cameo onEnd={endCameo} />}
       <Header user={user} onLogout={handleLogout} />
       <div className="container">
         {selectedId ? (

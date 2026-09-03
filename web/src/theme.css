@@ -273,6 +273,20 @@ body {
 
 .spinner-inline { font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--text-tertiary); }
 
+.cameo-run {
+  position: fixed; left: 0; bottom: 0; z-index: 9999; pointer-events: none;
+  will-change: transform; animation: cameo-across 3.4s linear forwards;
+}
+.cameo-run img { height: 190px; display: block; animation: cameo-bob 0.34s ease-in-out infinite; }
+@keyframes cameo-across {
+  from { transform: translateX(-280px); }
+  to   { transform: translateX(calc(100vw + 40px)); }
+}
+@keyframes cameo-bob {
+  0%, 100% { transform: translateY(0) rotate(-3deg); }
+  50%      { transform: translateY(-16px) rotate(3deg); }
+}
+
 /* --- multi-line submission detail --- */
 .lines-table { width: 100%; border-collapse: collapse; font-size: 12px; min-width: 900px; }
 .lines-table th {
