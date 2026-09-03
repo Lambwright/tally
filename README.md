@@ -1,11 +1,14 @@
 # TALLY
 
-Automates the middle of Einbau's expense-reimbursement pipeline: an employee's
-receipt email in → Claude reads the receipt → deterministic checks flag anything
-off → a human approves in a review queue → a correct **net-of-tax** Direct Cost
-lands in Procore, tagged with the form's invoice number. Everything before
-("employee emails a form") and after ("Procore→NetSuite sync, payroll
-reimbursement") already exists and stays exactly as-is.
+Automates the middle of Einbau's expense-reimbursement pipeline: an employee
+emails their multi-line Employee Expense Form (as a Procore Forms PDF) plus
+receipt photos → Claude parses the form into line items and reads each receipt →
+TALLY matches lines to receipts and derives the **net-of-tax** amount per line →
+a human reviews and fixes anything in a queue → one Procore Direct Cost (one
+header, one line item per expense row) lands, tagged with the form's Expense ID.
+Everything before ("employee fills the form") and after ("Procore→NetSuite sync,
+payroll reimbursement") already exists and stays as-is. The only form change:
+Einbau removes the embedded province tax script (it was fragile, esp. for QC).
 
 Full design context lives in the kickoff prompt this was built from (v4) and the
 approved build plan; the load-bearing constraints, repeated here because they
@@ -39,33 +42,32 @@ See [`worker/README.md`](worker/README.md) for the Worker's own deploy steps.
 ## Architecture at a glance
 
 ```
- employee fills the (stripped) Employee Expense Form, emails it to expenses@einbau.ca
+ employee fills the Employee Expense Form (Procore Forms), emails it + receipts to expenses@einbau.ca
         │
         ▼
  Ben's inbox ── Outlook rule ──▶ dedicated folder
         │
         ▼
- Power Automate "new email in folder" trigger
-   (its own connector auth — no Azure app registration)
-        │  POST { subject, from, body, attachments[], province, employee_name,
-        │         project_number, category, claimed_amount? }
-        │  category ∈ parking | materials | fuel | mileage | per_diem | other
+ Power Automate "new email in folder" trigger  (own connector auth — no Azure app reg)
+        │  POST { subject, from, body, attachments[] }   ← one form PDF + N receipt images
         ▼
  tally-worker  POST /intake
-   ├─ per_diem / mileage?  → flat claimed amount, no receipt, no Claude call
-   └─ else                 → store image(s) in R2 → Claude vision extraction
-                             → read tax, or fall back to a province rate table (flagged)
-   → deterministic validation (active project, geo sanity, amount checks)
-   → insert into Neon `submissions`, status = needs_review
+   → store every attachment in R2 (private)
+   → ONE Claude call: parse the form into line_items, read each receipt, propose line↔receipt matches
+   → deterministic match layer (amount + vendor/date, strictly 1:1; unsure → flagged, left for a human)
+   → per line: net = receipt subtotal (or gross − printed tax); province rate table only as a flagged fallback;
+               mileage / per_diem = flat claim (net = gross, no receipt)
+   → insert submissions (1) + line_items (N) + receipts (M);  status = needs_review
+      (Claude failing entirely still creates the row — reviewer builds the lines by hand)
         │
         ▼
  review queue (web/, Einbau ID login)
-   reviewer approves / requests revision / rejects
-        │  approve
+   lines table + receipt strip: fix fields, match/unmatch receipts, add/delete lines, set per-line cost codes
+        │  approve  (enabled only when every line is complete)
         ▼
  tally-worker  POST /submissions/:id/approve
-   → resolve the project's wbs_code_id live (never hardcode a per-project id)
-   → POST an invoice-type Direct Cost header + line item to Procore at the NET amount
+   → resolve each line's wbs_code_id live from GET /rest/v1.0/projects/{id}/wbs_codes
+   → POST ONE invoice-type Direct Cost header + one line item per expense row, at each line's NET
         │
         ▼
  existing Procore → NetSuite sync (untouched, out of scope)
@@ -84,12 +86,13 @@ See [`worker/README.md`](worker/README.md) for the Worker's own deploy steps.
    - An Outlook rule files mail sent to `expenses@einbau.ca` into a dedicated
      folder.
    - A flow on the built-in "When a new email arrives in a folder" trigger reads
-     the message + "Get attachment content" (already base64) and POSTs both to
-     `https://tally-worker.<subdomain>.workers.dev/intake` with header
+     the message and **all** attachments (form PDF + receipt photos, each already
+     base64 from "Get attachment content") and POSTs them as
+     `{ subject, from, body, attachments: [{ name, contentType, contentBytes }] }`
+     to `https://tally-worker.ben-a90.workers.dev/intake` with header
      `X-Tally-Service-Key: <the secret>`.
-   - **Confirm the base64 attachment doesn't hit Power Automate's HTTP action
-     body-size cap before assuming it "just works"** — phone photos are usually
-     fine (2-8MB) but worth checking once for real.
+   - **Check the combined base64 payload doesn't hit Power Automate's HTTP action
+     body cap** — phone photos run 2–8MB each; a form with many receipts adds up.
 5. **Frontend** — create a `tally` (or similar) GitHub repo, push `web/`, set
    the `VITE_TALLY_API` / `VITE_AUTH_API` repository variables the
    `.github/workflows/pages.yml` workflow reads, enable Pages (Source: GitHub
@@ -110,9 +113,11 @@ Direct Cost API — `worker/src/procore-directcost.js` is built from it:
 - Headers: `Accept`, `Content-Type`, `Authorization: Bearer`,
   `Procore-Company-Id: 562949953508586`. `status: "approved"`.
 - Idempotency = embed a token in the line-item description and string-search
-  existing line items for it before writing. TALLY uses `[INV:<expense id>]`
+  existing line items for it before writing. TALLY uses `[EXP:<expense id>]`
   (the payroll flow uses `[TC:<timecard id>]`).
 - Einbau company vendor id `562949959021641`.
+- Project WBS codes: `GET /rest/v1.0/projects/{id}/wbs_codes` (confirmed live) →
+  rows with `id` + `flat_code` (`"49-01-05-05.L"`) + `flat_name`.
 
 Confirmed with Ben since:
 
@@ -136,38 +141,42 @@ Confirmed with Ben since:
 
 ## Still open
 
-The Procore write stays gated off (`DIRECTCOST_VERIFIED = false`) until it's been
-smoke-tested once against live Procore — approve returns the exact payload it
-*would* send via `?dryRun=1` until then. Specifically still to verify live:
+The Procore write stays gated off (`DIRECTCOST_VERIFIED = false`) until one real
+write has been smoke-tested against live Procore — `approve?dryRun=1` returns the
+exact header + per-line payloads (with resolved `wbs_code_id`s) until then.
 
-1. **The WBS/budget-code endpoint + field names.** `listProjectWbsCodes()` reads
-   `/rest/v1.0/projects/{id}/budget_line_items` and matches on the flat code
-   string; the payroll flow got these from a report column, never the API, so the
-   exact shape needs one real check. The dry-run response shows the resolved
-   `wbsCodeId` for exactly this reason.
-2. **`uom` on the line item** — payroll uses `"hours"`; TALLY sends `"each"` for a
-   lump expense. Confirm Procore accepts it.
-3. **The Expense ID → email subject wiring** (see the revision-loop note below).
-4. The dedicated Outlook folder name (intake address is `expenses@einbau.ca` — a
-   distribution group; Ben joins it so a real mailbox receives the mail).
+1. **First live Direct Cost write** on a budgeted test project → confirm one
+   header + N line items appear and flow to NetSuite → flip the flag.
+2. **`uom` on the line item** — payroll uses `"hours"`; TALLY sends `"each"`.
+   Confirm Procore accepts it.
+3. **The form change** — Einbau removes the province tax script + the Net Total
+   row calc; keeps the layout, the six columns, the mileage km×rate math (must
+   still output a dollar), and the `DDMMYY-JJJJJ-EEEE` Expense ID. Ideally the
+   Expense ID also lands in the email subject (for the deferred revision loop).
+4. **Power Automate flow** — folder trigger → forward the email + *all*
+   attachments to `/intake` with `X-Tally-Service-Key`. Check phone-photo
+   attachments don't hit PA's HTTP body cap, and watch `wrangler tail` on a big
+   multi-receipt form for the subrequest ceiling (fallback: POST form first, each
+   receipt to a follow-up route).
+5. The dedicated Outlook folder name (`expenses@einbau.ca` is a distribution
+   group; Ben joins it so a real mailbox receives the mail).
 
 ### Revision loop — manual for MVP
 
-Reply-threading (an employee's revision reply auto-matching back to the original
-claim) needs the Expense ID in the email subject, which depends on how the
-stripped form sends mail — not yet settled. For the MVP the expense team links a
-revision reply to its original claim **by hand**. `POST
-/submissions/:id/request-revision` still produces a copy-ready reply carrying
-`[INV:<id>]`; the `/intake` dedup will pick threading up automatically once the
-Expense ID reliably lands in the subject, with no code change.
+Auto-threading a revision reply back to its form needs the Expense ID in the
+email subject, which depends on the form change. Until then the expense team
+links a reply to its form by hand. `POST /submissions/:id/request-revision`
+already produces a copy-ready reply carrying the Expense ID; `/intake`'s dedup
+picks up threading automatically once it reliably lands in the subject.
 
 ## Verification
 
-- `cd worker && npm test` — unit tests over the pure logic (invoice-number
-  parsing, PA-body salvage, every validation flag, tax math). No live
-  Neon/R2/Procore/Anthropic needed.
+- `cd worker && npm test` — pure-logic unit tests (expense-id parsing,
+  line↔receipt matching, net derivation, form + line flags). No live services.
+- `cd worker && npm run smoke` — against the deployed Worker: the multi-line
+  pipeline end to end plus the fully-manual build path.
 - `cd worker && npm run dev` + `cd web && npm run dev` — full local loop against
-  real Neon/R2/Procore/Anthropic (point `DATABASE_URL` at a Neon branch, not
-  production, while iterating). Vite's dev proxy keeps the browser same-origin
-  so `auth-worker`'s CORS lock doesn't get in the way locally.
-- Full checklist in [`worker/README.md`](worker/README.md) and the build plan.
+  real Neon/R2/Procore/Anthropic (point `DATABASE_URL` at a Neon branch). Vite's
+  dev proxy keeps the browser same-origin so `auth-worker`'s CORS lock is a
+  non-issue locally.
+- Full checklist in [`worker/README.md`](worker/README.md).

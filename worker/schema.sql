@@ -1,118 +1,151 @@
 -- TALLY database schema — dedicated Neon project `tally`, separate from PUNCH/others.
 --
--- Holds in-flight expense-submission state (there is no Power Automate Approvals
--- feature giving this for free) plus a small cache of Procore's active projects
--- for the deterministic validation layer.
+-- Model: one `submissions` row per emailed Employee Expense Form (the "header"),
+-- many `line_items` (one per expense row on the form), many `receipts` (one per
+-- attached image/PDF). TALLY parses the form PDF into line items, parses each
+-- receipt, matches lines to receipts, and derives the net (pre-tax) amount per
+-- line from the matched receipt. On approval a form becomes one Procore Direct
+-- Cost header + one line item per expense row.
 --
--- The `submissions` columns are deliberately shaped so the deferred company-wide
--- expenditure dashboard can be added later as a pure read layer (group by
--- employee / project / category / month) with NO migration.
+-- Only throwaway test rows existed before this rewrite — safe to drop.
 
 create extension if not exists pgcrypto;
 
+drop table if exists line_items cascade;
+drop table if exists receipts cascade;
+drop table if exists submissions cascade;
+
 -- ---------------------------------------------------------------------------
--- submissions — one row per expense claim, from intake through to Procore write
+-- submissions — one emailed expense form
 -- ---------------------------------------------------------------------------
 create table submissions (
   id uuid primary key default gen_random_uuid(),
 
-  -- The auto-generated invoice number off the (stripped) Procore form. Also the
-  -- tracking token: revision-loop replies carry it in the subject so they merge
-  -- back onto this row instead of creating a duplicate.
-  invoice_number text unique not null,
+  -- The form's auto-generated Expense ID (DDMMYY-JJJJJ-EEEE). Also the tracking
+  -- token: a revision-loop reply carrying it merges back onto this row.
+  expense_id text unique not null,
 
-  -- who submitted
   employee_name  text,
   employee_email text,
-  province       text,                 -- 2-letter province code as stated on the form
+  province       text,                 -- 2-letter province/territory code
 
-  -- which project (project_number comes exact from the stripped form; the rest is
-  -- resolved against projects_cache at intake time)
   project_number     text,
   project_procore_id bigint,
   project_name       text,
   project_stage      text,
 
-  -- The columns on Einbau's Employee Expense Form: Parking, Materials, Fuel,
-  -- Mileage, Per Diem, Other. One category per submission (the stripped form is a
-  -- single dropdown).
-  category text not null check (category in
-    ('parking', 'materials', 'fuel', 'mileage', 'per_diem', 'other')),
-  -- No receipt to parse — a flat claimed amount (per diem = daily allowance,
-  -- mileage = km * rate). Skips the Claude extraction / gross-tax-net path.
-  is_flat_claim boolean not null default false,
-
-  -- what was on the receipt (or claimed, for per diem)
-  vendor       text,
-  receipt_date date,
-  currency     text not null default 'CAD',
-
-  gross_amount numeric(12, 2),         -- printed gross / claimed amount
-  tax_amount   numeric(12, 2),         -- sum of tax line items (or fallback estimate)
-  net_amount   numeric(12, 2),         -- pre-tax — THIS is what posts to Procore
-
-  -- provenance of tax_amount. 'read' = taken straight off the receipt (trusted).
-  -- 'fallback_table' = estimated from the province x category rate table because
-  -- the receipt didn't itemize tax — always flagged, never treated as equal.
-  -- 'none' = per diem / not applicable.
-  tax_source text not null default 'none'
-    check (tax_source in ('read', 'fallback_table', 'none')),
-
-  confidence numeric(4, 3),            -- Claude's own 0..1 confidence on the figures
-
   status text not null default 'needs_review' check (status in
     ('needs_review', 'needs_revision', 'approved', 'rejected')),
 
-  -- [{ code, severity, detail }] — deterministic validation results. Advisory:
-  -- flags never block approval, they just surface in the queue.
+  -- Form-level deterministic checks: [{ code, severity, detail }]. Advisory —
+  -- they surface in the queue, they don't block. (Per-line flags live on line_items.)
   flags jsonb not null default '[]'::jsonb,
 
-  receipt_keys jsonb not null default '[]'::jsonb,  -- R2 object keys for the images
-  parsed       jsonb,                               -- full Claude output incl tax_lines[]
-
-  -- The original email body. Only ever needed for a manual "view original" look —
-  -- never selected into the list endpoint (see punch-worker's egress-overage note).
-  raw_email text,
-
-  history       jsonb not null default '[]'::jsonb, -- [{ at, type, text }]
-  revision_note text,                               -- last note sent back to the employee
+  raw_email     text,                              -- original body, never in list endpoints
+  history       jsonb not null default '[]'::jsonb,
+  revision_note text,
 
   reviewed_by text,
   reviewed_at timestamptz,
 
-  cost_code text,                                  -- WBS/budget flat code the reviewer approved against (blank = category default)
-  procore_direct_cost_id text,                      -- set once the Direct Cost is created
+  procore_direct_cost_id text,                     -- set once the Direct Cost is created
 
-  submitted_at timestamptz,                         -- when the employee's email arrived
+  submitted_at timestamptz,
   created_at   timestamptz not null default now(),
   updated_at   timestamptz not null default now()
 );
 
-create index idx_submissions_status       on submissions (status, created_at desc);
-create index idx_submissions_invoice      on submissions (invoice_number);
--- Future-dashboard group-bys — present now so the dashboard is a read layer, not a migration:
-create index idx_submissions_employee     on submissions (employee_name);
-create index idx_submissions_project      on submissions (project_number);
-create index idx_submissions_category     on submissions (category, submitted_at);
+create index idx_submissions_status  on submissions (status, created_at desc);
+create index idx_submissions_expense  on submissions (expense_id);
+
+-- ---------------------------------------------------------------------------
+-- receipts — one attached image/PDF (the form itself is stored too, kind='form')
+-- ---------------------------------------------------------------------------
+create table receipts (
+  id uuid primary key default gen_random_uuid(),
+  submission_id uuid not null references submissions(id) on delete cascade,
+
+  r2_key text not null,                  -- object key in the tally-receipts bucket
+  kind   text not null default 'receipt' check (kind in ('receipt', 'form')),
+
+  -- what Claude read off it (null for kind='form' and for anything unreadable)
+  vendor       text,
+  receipt_date date,
+  subtotal     numeric(12, 2),           -- printed pre-tax amount
+  tax_json     jsonb,                     -- [{ label, amount }]
+  gross        numeric(12, 2),           -- printed total
+  currency     text default 'CAD',
+  confidence   numeric(4, 3),
+
+  matched_line_item_id uuid,             -- back-pointer; the source of truth is line_items.receipt_id
+
+  created_at timestamptz not null default now()
+);
+
+create index idx_receipts_submission on receipts (submission_id);
+
+-- ---------------------------------------------------------------------------
+-- line_items — one expense row on the form
+-- ---------------------------------------------------------------------------
+create table line_items (
+  id uuid primary key default gen_random_uuid(),
+  submission_id uuid not null references submissions(id) on delete cascade,
+
+  row_index   integer,
+  line_date   date,
+  description text,
+  category    text not null check (category in
+    ('parking', 'materials', 'fuel', 'mileage', 'per_diem', 'other')),
+  -- mileage / per diem: flat claim, no receipt, net = gross, no tax
+  is_flat_claim boolean not null default false,
+
+  gross_amount numeric(12, 2),           -- amount entered in the category column
+  tax_amount   numeric(12, 2),
+  net_amount   numeric(12, 2),           -- pre-tax — THIS is what posts to Procore
+  tax_source   text not null default 'none'
+    check (tax_source in ('read', 'fallback_table', 'none')),
+
+  receipt_id       uuid references receipts(id) on delete set null,
+  match_method     text not null default 'none' check (match_method in ('auto', 'manual', 'none')),
+  match_confidence numeric(4, 3),
+
+  cost_code text,                        -- chosen WBS flat code; blank = category default
+
+  -- per-line deterministic checks: [{ code, severity, detail }]
+  flags jsonb not null default '[]'::jsonb,
+
+  -- denormalized from the parent so the future company-wide dashboard is a pure
+  -- line_items scan (group by employee / project / category / month)
+  employee_name      text,
+  project_number     text,
+  project_procore_id bigint,
+
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create index idx_line_items_submission on line_items (submission_id);
+create index idx_line_items_category   on line_items (category, created_at);
+create index idx_line_items_project    on line_items (project_number);
+create index idx_line_items_employee   on line_items (employee_name);
 
 -- ---------------------------------------------------------------------------
 -- projects_cache — refreshed from Procore every 6h by the scheduled handler.
--- Backs the project_missing / project_invalid / project_inactive / geo_mismatch
--- validation checks without a live Procore call on every intake.
+-- Backs the project_missing / project_invalid / project_inactive / geo checks
+-- without a live Procore call on every intake.
 -- ---------------------------------------------------------------------------
-create table projects_cache (
+create table if not exists projects_cache (
   procore_id     bigint primary key,
   project_number text,
   name           text,
-  stage          text,          -- Procore project_stage.name
+  stage          text,
   active         boolean not null default true,
-  region         text,          -- Procore project_region.name
-  province       text,          -- 2-letter, derived from the project's state/region
+  region         text,
+  province       text,
   refreshed_at   timestamptz not null default now()
 );
 
-create index idx_projects_cache_number on projects_cache (project_number);
+create index if not exists idx_projects_cache_number on projects_cache (project_number);
 
--- Note: no row-level security here. TALLY is a single internal tenant (the Einbau
--- expense team) and there is no per-user data partition to enforce. If that ever
--- changes, add the same `app.user_id` SET-per-request scaffolding PUNCH uses.
+-- No row-level security: TALLY is a single internal tenant (the Einbau expense
+-- team), no per-user data partition to enforce.

@@ -62,27 +62,27 @@ function normalizeCode(s) {
   return String(s || "").replace(/\s/g, "").toLowerCase();
 }
 
-// Normalize whatever Procore returns for a project's WBS/budget codes into
-// { id, code, description } rows for the app's cost-code dropdown.
-// TODO(ben): confirm the endpoint + field names against a live project — the
-// payroll flow read these from a report column, never from the API, so the
-// fallbacks below are belt-and-suspenders until a real write succeeds.
+// A project's budget WBS lines — { id, code, description } for the app's
+// cost-code dropdown and for resolveWbsCodeId().
+//
+// Endpoint confirmed live: GET /rest/v1.0/projects/{id}/wbs_codes returns the
+// project's active WBS lines, each with `id`, `flat_code` ("49-01-05-05.L") and
+// `flat_name` ("Millwork Install.Labor"). Note: the list always includes a
+// placeholder row with an empty flat_code — filtered out here.
 export async function listProjectWbsCodes(env, token, procoreFetch, projectId) {
   const raw = await procoreFetch(
     env, token,
-    `/rest/v1.0/projects/${projectId}/budget_line_items?per_page=1000`,
+    `/rest/v1.0/projects/${projectId}/wbs_codes`,
     { method: "GET" }
   );
   const rows = Array.isArray(raw) ? raw : raw?.data || [];
   return rows
-    .map((r) => {
-      const w = r.wbs_code || r;
-      return {
-        id: String(w.id ?? r.wbs_code_id ?? r.id ?? ""),
-        code: String(w.flat_code || w.code || r.cost_code?.full_code || r.cost_code?.name || ""),
-        description: String(r.description || w.description || r.cost_code?.name || ""),
-      };
-    })
+    .filter((w) => w && w.status !== "inactive" && w.flat_code)
+    .map((w) => ({
+      id: String(w.id ?? ""),
+      code: String(w.flat_code),
+      description: String(w.flat_name || w.description || ""),
+    }))
     .filter((r) => r.id && r.code);
 }
 
@@ -119,17 +119,18 @@ export async function resolveWbsCodeId(env, token, procoreFetch, projectId, cate
   return hit.id;
 }
 
-// The header POST body. Amount is NOT set here — it goes on the line item.
+// One header per emailed expense form. The amounts live on the line items.
 export function buildDirectCostHeader(submission, { employeeId = null } = {}) {
-  const date = submission.receipt_date || new Date().toISOString().slice(0, 10);
+  const date =
+    submission.header_date || submission.receipt_date || new Date().toISOString().slice(0, 10);
   const item = {
     direct_cost_type: DIRECT_COST_TYPE,
     status: "approved",
     direct_cost_date: date,
     received_date: date,
-    invoice_number: submission.invoice_number, // CONFIRMED (Ben): the form's Expense ID
+    invoice_number: submission.expense_id, // CONFIRMED (Ben): the form's Expense ID
     vendor_id: EINBAU_VENDOR_ID,
-    description: `TALLY ${submission.category} — ${submission.employee_name || submission.employee_email || "employee"} — ${dedupToken(submission)}`,
+    description: `TALLY expense form ${submission.expense_id} — ${submission.employee_name || submission.employee_email || "employee"}`,
   };
   if (employeeId) item.employee_id = String(employeeId); // string, no int cast (payroll flow)
 
@@ -140,19 +141,22 @@ export function buildDirectCostHeader(submission, { employeeId = null } = {}) {
   };
 }
 
-export function buildDirectCostLineItem(submission, wbsCodeId) {
-  const net = Number(submission.net_amount);
+// One line item per expense row on the form. `line` is a line_items row (carries
+// its own project_procore_id, denormalized). Amount posted is the NET.
+export function buildDirectCostLineItem(line, wbsCodeId, expenseId) {
+  const net = Number(line.net_amount);
   if (!Number.isFinite(net) || net <= 0) {
-    throw new Error(`Refusing to build a line item with net_amount=${submission.net_amount}`);
+    throw new Error(`Refusing to build a line item with net_amount=${line.net_amount}`);
   }
+  const label = (line.description || line.category || "expense").toString().slice(0, 120);
   return {
     method: "POST",
     // caller substitutes {dc_id}
-    pathTemplate: `/rest/v1.0/projects/${submission.project_procore_id}/direct_costs/{dc_id}/line_items`,
+    pathTemplate: `/rest/v1.0/projects/${line.project_procore_id}/direct_costs/{dc_id}/line_items`,
     data: {
       line_item: {
         wbs_code_id: String(wbsCodeId),
-        description: `${submission.category} net of tax ${dedupToken(submission)}`,
+        description: `${label} ${dedupToken({ expense_id: expenseId })}`,
         quantity: 1,
         unit_cost: net.toFixed(2),
         uom: "each", // TODO(ben): payroll uses "hours"; confirm the unit for a lump expense
@@ -163,12 +167,13 @@ export function buildDirectCostLineItem(submission, wbsCodeId) {
 
 // The token embedded in every line-item description so a re-run / re-approval
 // can't create a duplicate — same idea as the payroll flow's [TC:<id>].
-export function dedupToken(submission) {
-  return `[INV:${submission.invoice_number}]`;
+// Takes anything with an `expense_id`.
+export function dedupToken(x) {
+  return `[EXP:${x.expense_id}]`;
 }
 
 // Given the project's existing direct-cost line items (raw array from
-// GET /rest/v1.0/projects/{id}/direct_costs/line_items), is this invoice already in?
+// GET /rest/v1.0/projects/{id}/direct_costs/line_items), is this form already in?
 export function alreadyPosted(existingLineItems, submission) {
   const hay = JSON.stringify(existingLineItems || []);
   return hay.includes(dedupToken(submission));

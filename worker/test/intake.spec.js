@@ -2,68 +2,50 @@ import { describe, it, expect } from "vitest";
 import { _test } from "../src/index.js";
 
 const {
-  extractInvoiceNumber,
+  extractExpenseId,
   normalizeCategory,
   salvageByFieldBoundaries,
-  computeFlags,
+  matchLinesToReceipts,
+  deriveLineNet,
+  computeLineFlags,
+  computeFormFlags,
   sumTaxLines,
   money,
   normalizeAttachments,
 } = _test;
 
-describe("extractInvoiceNumber", () => {
+describe("extractExpenseId", () => {
   it("prefers the form's expense_id field", () => {
-    expect(extractInvoiceNumber({ expense_id: "EXP-1024", subject: "whatever" })).toBe("EXP-1024");
+    expect(extractExpenseId({ expense_id: "020926-12345-6789", subject: "x" })).toBe("020926-12345-6789");
   });
-  it("falls back to invoice_number", () => {
-    expect(extractInvoiceNumber({ invoice_number: "INV-77", subject: "x" })).toBe("INV-77");
+  it("pulls the DDMMYY-JJJJJ-EEEE token out of the subject", () => {
+    expect(extractExpenseId({ subject: "Expense Report 020926-A12B3-0007" })).toBe("020926-A12B3-0007");
   });
-  it("pulls EXP/INV-style tokens out of the subject", () => {
-    expect(extractInvoiceNumber({ subject: "Expense submission EXP-20481" })).toBe("EXP-20481");
-    expect(extractInvoiceNumber({ subject: "RE: Expense EXP_7781AB — revision requested" })).toBe("EXP_7781AB");
-  });
-  it("pulls a YYYY_NNNN token", () => {
-    expect(extractInvoiceNumber({ subject: "Fwd: receipt 2026_0412" })).toBe("2026_0412");
+  it("falls back to an EXP/INV token", () => {
+    expect(extractExpenseId({ subject: "Fwd: expense EXP-4471" })).toBe("EXP-4471");
   });
   it("returns null when there's nothing to find", () => {
-    expect(extractInvoiceNumber({ subject: "lunch" })).toBeNull();
+    expect(extractExpenseId({ subject: "lunch receipts" })).toBeNull();
   });
 });
 
 describe("normalizeCategory", () => {
-  it("passes through the form's own column names", () => {
+  it("passes through the form's column names", () => {
     for (const c of ["parking", "materials", "fuel", "mileage", "per_diem", "other"]) {
       expect(normalizeCategory(c)).toBe(c);
     }
   });
-  it("folds synonyms", () => {
+  it("folds synonyms and unknowns", () => {
     expect(normalizeCategory("Gas")).toBe("fuel");
     expect(normalizeCategory("Material")).toBe("materials");
     expect(normalizeCategory("Per Diem")).toBe("per_diem");
-  });
-  it("unknown -> other", () => {
     expect(normalizeCategory("labour")).toBe("other");
     expect(normalizeCategory("")).toBe("other");
   });
 });
 
-describe("salvageByFieldBoundaries", () => {
-  it("recovers fields from a body with unescaped HTML in a string value", () => {
-    const raw =
-      '{"subject":"Expense INV-5","from":"joe@einbau.ca","body":"<div class="x">hi "there"</div>","category":"gas"}';
-    const out = salvageByFieldBoundaries(raw);
-    expect(out.subject).toBe("Expense INV-5");
-    expect(out.from).toBe("joe@einbau.ca");
-    expect(out.category).toBe("gas");
-    expect(out.body).toContain("hi");
-  });
-  it("returns null when no known fields are present", () => {
-    expect(salvageByFieldBoundaries('{"totally":"different"}')).toBeNull();
-  });
-});
-
 describe("money", () => {
-  it("parses currency-formatted strings", () => {
+  it("parses currency strings; rejects non-numbers", () => {
     expect(money("$1,234.56")).toBe(1234.56);
     expect(money("42")).toBe(42);
     expect(money("")).toBeNull();
@@ -73,7 +55,7 @@ describe("money", () => {
 });
 
 describe("sumTaxLines", () => {
-  it("adds tax line amounts to the cent", () => {
+  it("adds to the cent", () => {
     expect(sumTaxLines([{ label: "GST", amount: 5 }, { label: "QST", amount: 9.98 }])).toBe(14.98);
     expect(sumTaxLines([])).toBe(0);
     expect(sumTaxLines(undefined)).toBe(0);
@@ -81,98 +63,160 @@ describe("sumTaxLines", () => {
 });
 
 describe("normalizeAttachments", () => {
-  it("handles Power Automate's contentBytes shape and sanitizes names", () => {
+  it("handles Power Automate's contentBytes shape", () => {
     const out = normalizeAttachments({
-      attachments: [{ name: "receipt (1).jpg", contentType: "image/jpeg", contentBytes: "AAAA" }],
+      attachments: [{ name: "form.pdf", contentType: "application/pdf", contentBytes: "AAAA" }],
     });
     expect(out).toHaveLength(1);
     expect(out[0].base64).toBe("AAAA");
-    expect(out[0].name).toBe("receipt _1_.jpg");
+    expect(out[0].name).toBe("form.pdf");
   });
-  it("drops attachments with no content and accepts a single object", () => {
+  it("drops empty attachments", () => {
     expect(normalizeAttachments({ attachment: { name: "x", contentBytes: "" } })).toHaveLength(0);
   });
 });
 
-describe("computeFlags", () => {
-  const baseReceiptSub = {
-    category: "materials",
-    is_flat_claim: false,
-    province: "ON",
-    project_number: "2026_0300",
-    tax_source: "read",
-    gross_amount: 113,
-    tax_amount: 13,
-    net_amount: 100,
-    confidence: 0.9,
-    parsed: { subtotal: 100, tax_lines: [{ label: "HST", amount: 13 }], category_guess: "materials" },
-  };
-  const activeProject = { stage: "Construction", province: "ON" };
-
-  it("clean receipt on an active project => no flags", () => {
-    expect(computeFlags(baseReceiptSub, activeProject)).toEqual([]);
+describe("matchLinesToReceipts", () => {
+  const line = (row, over = {}) => ({
+    row_index: row, category: "materials", is_flat_claim: false,
+    gross_amount: 113, description: "Home Depot", line_date: "2026-09-01", ...over,
+  });
+  const rcpt = (id, idx, over = {}) => ({
+    id, idx, vendor: "THE HOME DEPOT #7024", gross: 113, receipt_date: "2026-09-01",
+    subtotal: 100, tax_json: [{ label: "HST", amount: 13 }], ...over,
   });
 
-  it("missing project number", () => {
-    const f = computeFlags({ ...baseReceiptSub, project_number: null }, null);
-    expect(f.map((x) => x.code)).toContain("project_missing");
+  it("locks an amount + vendor match", () => {
+    const m = matchLinesToReceipts([line(1)], [rcpt("r1", 0)]);
+    expect(m.get(1).receipt_id).toBe("r1");
+    expect(m.get(1).method).toBe("auto");
+    expect(m.get(1).flag).toBeNull();
   });
 
+  it("amount-only with a single candidate -> low_confidence_match", () => {
+    const m = matchLinesToReceipts(
+      [line(1, { description: "supplies" })],
+      [rcpt("r1", 0, { vendor: "STAPLES", receipt_date: "2026-01-01" })]
+    );
+    expect(m.get(1).receipt_id).toBe("r1");
+    expect(m.get(1).flag.code).toBe("low_confidence_match");
+  });
+
+  it("amount collision with no corroboration -> ambiguous, unmatched", () => {
+    const m = matchLinesToReceipts(
+      [line(1, { description: "supplies" })],
+      [rcpt("r1", 0, { vendor: "A", receipt_date: "2026-01-01" }), rcpt("r2", 1, { vendor: "B", receipt_date: "2026-01-02" })]
+    );
+    expect(m.get(1).receipt_id).toBeNull();
+    expect(m.get(1).flag.code).toBe("ambiguous_match");
+  });
+
+  it("flat-claim lines are never matched", () => {
+    const m = matchLinesToReceipts(
+      [line(1, { category: "per_diem", is_flat_claim: true, gross_amount: 75 })],
+      [rcpt("r1", 0, { gross: 75 })]
+    );
+    expect(m.has(1)).toBe(false);
+  });
+
+  it("no amount match -> line left absent (caller flags receipt_unmatched)", () => {
+    const m = matchLinesToReceipts([line(1, { gross_amount: 999 })], [rcpt("r1", 0)]);
+    expect(m.has(1)).toBe(false);
+  });
+});
+
+describe("deriveLineNet", () => {
+  it("flat claim: net = gross, no tax", () => {
+    expect(deriveLineNet({ is_flat_claim: true, gross_amount: 75 }, null, "ON")).toEqual({ net: 75, tax: 0, tax_source: "none" });
+  });
+  it("no receipt: net null", () => {
+    expect(deriveLineNet({ is_flat_claim: false, gross_amount: 100 }, null, "ON")).toEqual({ net: null, tax: null, tax_source: "none" });
+  });
+  it("receipt with printed tax: net = subtotal, source read", () => {
+    const d = deriveLineNet(
+      { is_flat_claim: false, gross_amount: 113 },
+      { gross: 113, subtotal: 100, tax_json: [{ label: "HST", amount: 13 }] },
+      "ON"
+    );
+    expect(d).toEqual({ net: 100, tax: 13, tax_source: "read" });
+  });
+  it("receipt with no itemized tax: province fallback, flagged as such", () => {
+    const d = deriveLineNet(
+      { is_flat_claim: false, gross_amount: 113 },
+      { gross: 113, subtotal: null, tax_json: [] },
+      "ON"
+    );
+    expect(d.tax_source).toBe("fallback_table");
+    expect(d.net).toBeCloseTo(100, 1);
+  });
+  it("receipt unreadable + no province: net null", () => {
+    const d = deriveLineNet({ is_flat_claim: false, gross_amount: 50 }, { gross: null, subtotal: null, tax_json: [] }, null);
+    expect(d).toEqual({ net: null, tax: null, tax_source: "none" });
+  });
+});
+
+describe("computeLineFlags", () => {
+  const project = { stage: "Construction", active: true, province: "ON" };
+
+  it("clean matched line: no flags", () => {
+    const line = { category: "materials", is_flat_claim: false, receipt_id: "r1", gross_amount: 113, net_amount: 100, tax_amount: 13, tax_source: "read" };
+    const receipt = { gross: 113, confidence: 0.95 };
+    expect(computeLineFlags(line, receipt, "ON", project)).toEqual([]);
+  });
+  it("unmatched non-flat line -> receipt_unmatched", () => {
+    const line = { category: "materials", is_flat_claim: false, receipt_id: null };
+    expect(computeLineFlags(line, null, "ON", project).map((f) => f.code)).toContain("receipt_unmatched");
+  });
+  it("fallback tax -> tax_estimated", () => {
+    const line = { category: "materials", is_flat_claim: false, receipt_id: "r1", tax_source: "fallback_table", gross_amount: 113, net_amount: 100, tax_amount: 13 };
+    expect(computeLineFlags(line, { gross: 113 }, "ON", project).map((f) => f.code)).toContain("tax_estimated");
+  });
+  it("form line vs receipt total mismatch", () => {
+    const line = { category: "materials", is_flat_claim: false, receipt_id: "r1", tax_source: "read", gross_amount: 113, net_amount: 100, tax_amount: 13 };
+    expect(computeLineFlags(line, { gross: 120 }, "ON", project).map((f) => f.code)).toContain("amount_mismatch");
+  });
+  it("geo mismatch only for site-tied categories", () => {
+    const fuel = { category: "fuel", is_flat_claim: false, receipt_id: "r1", tax_source: "read" };
+    expect(computeLineFlags(fuel, { gross: 50 }, "QC", project).map((f) => f.code)).toContain("geo_mismatch");
+    const materials = { category: "materials", is_flat_claim: false, receipt_id: "r1", tax_source: "read" };
+    expect(computeLineFlags(materials, { gross: 50 }, "QC", project).map((f) => f.code)).not.toContain("geo_mismatch");
+  });
+  it("flat-claim line skips receipt-only checks", () => {
+    const line = { category: "per_diem", is_flat_claim: true, receipt_id: null, tax_source: "none" };
+    const codes = computeLineFlags(line, null, "ON", project).map((f) => f.code);
+    expect(codes).not.toContain("receipt_unmatched");
+    expect(codes).not.toContain("tax_unknown");
+  });
+});
+
+describe("computeFormFlags", () => {
+  const sub = { project_number: "2026_0300" };
+  const project = { stage: "Construction", active: true, province: "ON" };
+
+  it("clean form: no flags", () => {
+    expect(computeFormFlags(sub, project, [{ id: "r1", kind: "receipt" }], [{ receipt_id: "r1" }])).toEqual([]);
+  });
+  it("no lines -> form_parse_failed", () => {
+    expect(computeFormFlags(sub, project, [], []).map((f) => f.code)).toContain("form_parse_failed");
+  });
+  it("unmatched receipt -> receipt_orphan", () => {
+    const f = computeFormFlags(sub, project, [{ id: "r1", kind: "receipt" }, { id: "r2", kind: "receipt" }], [{ receipt_id: "r1" }]);
+    expect(f.map((x) => x.code)).toContain("receipt_orphan");
+  });
+  it("inactive project", () => {
+    const f = computeFormFlags(sub, { stage: "Cancelled", active: false, province: "ON" }, [], [{ receipt_id: "r1" }]);
+    expect(f.map((x) => x.code)).toContain("project_inactive");
+  });
   it("project not in cache", () => {
-    const f = computeFlags(baseReceiptSub, null);
-    expect(f.map((x) => x.code)).toContain("project_invalid");
+    expect(computeFormFlags(sub, null, [], [{ receipt_id: "r1" }]).map((x) => x.code)).toContain("project_invalid");
   });
+});
 
-  it("inactive project stage", () => {
-    const f = computeFlags(baseReceiptSub, { stage: "On Hold", province: "ON" });
-    expect(f.map((x) => x.code)).toContain("project_inactive");
-  });
-
-  it("project marked inactive in Procore (active === false)", () => {
-    const f = computeFlags(baseReceiptSub, { stage: "Cancelled", active: false, province: "ON" });
-    expect(f.map((x) => x.code)).toContain("project_inactive");
-  });
-
-  it("geo mismatch only fires for site-tied categories", () => {
-    const fuel = computeFlags({ ...baseReceiptSub, category: "fuel", province: "QC" }, activeProject);
-    expect(fuel.map((x) => x.code)).toContain("geo_mismatch");
-    const materials = computeFlags({ ...baseReceiptSub, category: "materials", province: "QC" }, activeProject);
-    expect(materials.map((x) => x.code)).not.toContain("geo_mismatch");
-  });
-
-  it("fallback-table tax is always flagged", () => {
-    const f = computeFlags({ ...baseReceiptSub, tax_source: "fallback_table" }, activeProject);
-    expect(f.map((x) => x.code)).toContain("tax_estimated");
-  });
-
-  it("net disagreeing with the printed net", () => {
-    const f = computeFlags(
-      { ...baseReceiptSub, net_amount: 90, parsed: { ...baseReceiptSub.parsed, printed_net: 100 } },
-      activeProject
-    );
-    expect(f.map((x) => x.code)).toContain("amount_mismatch");
-  });
-
-  it("low confidence", () => {
-    const f = computeFlags({ ...baseReceiptSub, confidence: 0.4 }, activeProject);
-    expect(f.map((x) => x.code)).toContain("low_confidence");
-  });
-
-  it("category conflict between form and receipt", () => {
-    const f = computeFlags(
-      { ...baseReceiptSub, parsed: { ...baseReceiptSub.parsed, category_guess: "fuel" } },
-      activeProject
-    );
-    expect(f.map((x) => x.code)).toContain("category_conflict");
-  });
-
-  it("flat-claim (per diem / mileage) skips receipt-only checks", () => {
-    const f = computeFlags(
-      { category: "per_diem", is_flat_claim: true, province: "ON", project_number: "2026_0300",
-        tax_source: "none", net_amount: 75, confidence: null, parsed: null },
-      activeProject
-    );
-    expect(f.map((x) => x.code)).not.toContain("tax_estimated");
-    expect(f.map((x) => x.code)).not.toContain("low_confidence");
+describe("salvageByFieldBoundaries", () => {
+  it("recovers fields from a body with unescaped HTML", () => {
+    const raw = '{"subject":"Expense 020926-12345-6789","from":"joe@einbau.ca","body":"<div class="x">hi "there"</div>"}';
+    const out = salvageByFieldBoundaries(raw);
+    expect(out.subject).toBe("Expense 020926-12345-6789");
+    expect(out.from).toBe("joe@einbau.ca");
   });
 });

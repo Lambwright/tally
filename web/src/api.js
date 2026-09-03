@@ -44,17 +44,18 @@ async function request(path, { method = "GET", body, headers } = {}) {
 
 export const api = {
   listSubmissions: (status) => request(`/submissions${status ? `?status=${encodeURIComponent(status)}` : ""}`),
-  getSubmission: (id) => request(`/submissions/${id}`),
-  getCostCodes: (id) => request(`/submissions/${id}/cost-codes`),
-  approve: (id, { dryRun = false, netAmount, costCode } = {}) => {
-    const body = {};
-    if (netAmount !== undefined) body.net_amount = netAmount;
-    if (costCode) body.cost_code = costCode;
-    return request(`/submissions/${id}/approve${dryRun ? "?dryRun=1" : ""}`, {
-      method: "POST",
-      body: Object.keys(body).length ? body : undefined,
-    });
-  },
+  getSubmission: (id) => request(`/submissions/${id}`), // { submission, line_items, receipts }
+  getCostCodes: (id) => request(`/submissions/${id}/cost-codes`), // { codes, defaults }
+
+  addLine: (id, fields) => request(`/submissions/${id}/lines`, { method: "POST", body: fields }),
+  patchLine: (id, lineId, fields) => request(`/submissions/${id}/lines/${lineId}`, { method: "PATCH", body: fields }),
+  deleteLine: (id, lineId) => request(`/submissions/${id}/lines/${lineId}`, { method: "DELETE" }),
+  matchLine: (id, lineId, receiptId) =>
+    request(`/submissions/${id}/lines/${lineId}/match`, { method: "POST", body: { receipt_id: receiptId } }),
+  unmatchLine: (id, lineId) => request(`/submissions/${id}/lines/${lineId}/unmatch`, { method: "POST", body: {} }),
+
+  approve: (id, { dryRun = false } = {}) =>
+    request(`/submissions/${id}/approve${dryRun ? "?dryRun=1" : ""}`, { method: "POST", body: {} }),
   requestRevision: (id, note) => request(`/submissions/${id}/request-revision`, { method: "POST", body: { note } }),
   reject: (id, reason) => request(`/submissions/${id}/reject`, { method: "POST", body: { reason } }),
   listProjects: () => request("/projects"),

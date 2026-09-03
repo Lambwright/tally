@@ -45,7 +45,7 @@ export default function RevisionModal({ submission, onClose, onDone }) {
           <form onSubmit={handleSend}>
             <div className="card-title" style={{ marginBottom: 4 }}>Request Revision</div>
             <p className="row-secondary" style={{ marginBottom: 12 }}>
-              What does {submission.employee_name || "the employee"} need to fix on {submission.invoice_number}?
+              What does {submission.employee_name || "the employee"} need to fix on {submission.expense_id}?
             </p>
             <div className="field">
               <label htmlFor="revision-note">Note</label>
