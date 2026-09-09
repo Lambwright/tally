@@ -1208,6 +1208,18 @@ async function handleReject(subId, request, sql, user) {
   return json({ rejected: true, submission: row });
 }
 
+// Hard delete — the row, its lines/receipts (cascade), and the R2 objects. For
+// spam / garbage / a test you want to recycle. Reject keeps the record; this
+// removes it and frees the Expense ID.
+async function handleSubmissionDelete(subId, env, sql, user) {
+  const receipts = await sql`select r2_key from receipts where submission_id = ${subId}`;
+  await Promise.all(receipts.map((r) => env.RECEIPTS.delete(r.r2_key).catch(() => {})));
+  const rows = await sql`delete from submissions where id = ${subId} returning expense_id`;
+  if (!rows.length) return json({ error: "not_found" }, 404);
+  console.log(`submission ${subId} (${rows[0].expense_id}) hard-deleted by ${user.username}`);
+  return json({ deleted: true, expense_id: rows[0].expense_id });
+}
+
 // ---------------------------------------------------------------------------
 // router
 // ---------------------------------------------------------------------------
@@ -1275,6 +1287,7 @@ export default {
 
           if (!seg && request.method === "GET") return withRefresh(await handleDetail(subId, sql));
           if (!seg && request.method === "PATCH") return withRefresh(await handleSubmissionPatch(subId, request, sql, auth.user));
+          if (!seg && request.method === "DELETE") return withRefresh(await handleSubmissionDelete(subId, env, sql, auth.user));
           if (seg === "receipt" && request.method === "GET") return await handleReceipt(subId, url, env, sql);
           if (seg === "cost-codes" && request.method === "GET") return withRefresh(await handleCostCodes(subId, env, sql));
           if (seg === "approve" && request.method === "POST") return withRefresh(await handleApprove(subId, url, request, env, sql, auth.user));

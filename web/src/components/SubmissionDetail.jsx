@@ -186,6 +186,19 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
     await mutate(() => api.reject(id, reason.trim()));
     setBusy(false);
   }
+  async function handleDelete() {
+    if (!window.confirm(`Permanently delete ${sub.expense_id}? This removes the row, its lines, and the stored files — and frees the Expense ID.`)) return;
+    setBusy(true);
+    setActionError(null);
+    try {
+      await api.deleteSubmission(id);
+      onChanged?.();
+      onClose();
+    } catch (e) {
+      setActionError(e.data?.detail || e.message);
+      setBusy(false);
+    }
+  }
   async function handleAddLine() {
     if (!newLine.category) return;
     setBusy(true);
@@ -392,21 +405,27 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
 
       {actionError && <div className="card" style={{ color: "var(--red)" }}>{actionError}</div>}
 
-      {actionable && (
-        <div className="modal-actions" style={{ justifyContent: "flex-start", flexWrap: "wrap" }}>
-          <button className="btn btn-orange" disabled={busy || !allComplete} onClick={handleApprove}>
-            {busy ? "Working…" : "Approve"}
-          </button>
-          <button className="btn btn-ghost" disabled={busy} onClick={handleDryRun}>Preview payload</button>
-          <button className="btn btn-ghost" disabled={busy} onClick={() => setShowRevision(true)}>Request Revision</button>
-          <button className="btn btn-danger" disabled={busy} onClick={handleReject}>Reject</button>
-          {!allComplete && lines.length > 0 && (
-            <span className="row-secondary" style={{ alignSelf: "center" }}>
-              Every line needs a receipt (or be flat-claim), a net amount, and a cost code.
-            </span>
-          )}
-        </div>
-      )}
+      <div className="modal-actions" style={{ justifyContent: "flex-start", flexWrap: "wrap" }}>
+        {actionable && (
+          <>
+            <button className="btn btn-orange" disabled={busy || !allComplete} onClick={handleApprove}>
+              {busy ? "Working…" : "Approve"}
+            </button>
+            <button className="btn btn-ghost" disabled={busy} onClick={handleDryRun}>Preview payload</button>
+            <button className="btn btn-ghost" disabled={busy} onClick={() => setShowRevision(true)}>Request Revision</button>
+            <button className="btn btn-danger" disabled={busy} onClick={handleReject}>Reject</button>
+          </>
+        )}
+        <button className="btn btn-danger" disabled={busy} onClick={handleDelete}
+          title="Permanently remove this submission and free its Expense ID" style={{ marginLeft: "auto" }}>
+          Delete
+        </button>
+        {actionable && !allComplete && lines.length > 0 && (
+          <span className="row-secondary" style={{ alignSelf: "center", width: "100%" }}>
+            Every line needs a receipt (or be flat-claim), a net amount, and a cost code.
+          </span>
+        )}
+      </div>
 
       {dryRun && (
         <div className="card">

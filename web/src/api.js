@@ -46,6 +46,7 @@ export const api = {
   listSubmissions: (status) => request(`/submissions${status ? `?status=${encodeURIComponent(status)}` : ""}`),
   getSubmission: (id) => request(`/submissions/${id}`), // { submission, line_items, receipts }
   patchSubmission: (id, fields) => request(`/submissions/${id}`, { method: "PATCH", body: fields }),
+  deleteSubmission: (id) => request(`/submissions/${id}`, { method: "DELETE" }),
   getCostCodes: (id) => request(`/submissions/${id}/cost-codes`), // { codes, defaults }
 
   addLine: (id, fields) => request(`/submissions/${id}/lines`, { method: "POST", body: fields }),
