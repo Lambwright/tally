@@ -129,6 +129,9 @@ export default function App() {
                   {s.label}
                 </button>
               ))}
+              <button className="tab" onClick={loadList} disabled={loadingList} style={{ marginLeft: "auto" }} title="Refresh">
+                {loadingList ? "↻ …" : "↻ Refresh"}
+              </button>
             </div>
             {listError && <div className="card" style={{ color: "var(--red)" }}>{listError}</div>}
             <QueueList submissions={submissions} loading={loadingList} onSelect={selectSubmission} />

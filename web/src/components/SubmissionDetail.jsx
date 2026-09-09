@@ -221,7 +221,10 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
 
   return (
     <div>
-      <button className="btn btn-ghost btn-sm" onClick={onClose} style={{ marginBottom: 16 }}>← Back to queue</button>
+      <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+        <button className="btn btn-ghost btn-sm" onClick={onClose}>← Back to queue</button>
+        <button className="btn btn-ghost btn-sm" onClick={load} title="Refresh">↻ Refresh</button>
+      </div>
 
       <div className="card">
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 16 }}>
