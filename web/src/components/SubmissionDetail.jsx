@@ -63,6 +63,7 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
   const [busyLine, setBusyLine] = useState(null);
   const [actionError, setActionError] = useState(null);
   const [showRevision, setShowRevision] = useState(false);
+  const [dryRun, setDryRun] = useState(null);
   const [newLine, setNewLine] = useState({ line_date: "", description: "", category: "materials", gross_amount: "" });
 
   const load = useCallback(() => {
@@ -136,6 +137,18 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
     setBusy(true);
     await mutate(() => api.approve(id));
     setBusy(false);
+  }
+  async function handleDryRun() {
+    setBusy(true);
+    setActionError(null);
+    setDryRun(null);
+    try {
+      setDryRun(await api.approve(id, { dryRun: true }));
+    } catch (e) {
+      setActionError(e.data?.detail || e.message);
+    } finally {
+      setBusy(false);
+    }
   }
   async function handleReject() {
     const reason = window.prompt("Reason for rejecting this form?");
@@ -225,7 +238,11 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
                         <span className="row-secondary">— flat claim</span>
                       ) : matched ? (
                         <span className="receipt-chip">
-                          {receiptUrls[matched.r2_key] && <img src={receiptUrls[matched.r2_key]} alt="" />}
+                          {receiptUrls[matched.r2_key] && (
+                            <a href={receiptUrls[matched.r2_key]} target="_blank" rel="noreferrer" title="Open receipt">
+                              <img src={receiptUrls[matched.r2_key]} alt="" />
+                            </a>
+                          )}
                           <span>{matched.vendor || "receipt"} · {money(matched.gross)}</span>
                           {actionable && (
                             <button className="chip-x" title="Unmatch"
@@ -305,10 +322,17 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
           )}
           {receipts.filter((r) => r.kind === "receipt").map((r) => {
             const line = lines.find((l) => l.receipt_id === r.id);
-            return (
-              <div className={`receipt-thumb ${line ? "is-matched" : "is-unmatched"}`} key={r.id} title={r.vendor || ""}>
-                {receiptUrls[r.r2_key] ? <img src={receiptUrls[r.r2_key]} alt="" /> : <span>?</span>}
-                <span className="receipt-thumb-label">{money(r.gross)}{line ? ` → line ${line.row_index}` : ""}</span>
+            const label = <span className="receipt-thumb-label">{money(r.gross)}{line ? ` → line ${line.row_index}` : ""}</span>;
+            return receiptUrls[r.r2_key] ? (
+              <a className={`receipt-thumb ${line ? "is-matched" : "is-unmatched"}`} key={r.id}
+                 href={receiptUrls[r.r2_key]} target="_blank" rel="noreferrer" title={r.vendor || "Open receipt"}>
+                <img src={receiptUrls[r.r2_key]} alt="" />
+                {label}
+              </a>
+            ) : (
+              <div className={`receipt-thumb ${line ? "is-matched" : "is-unmatched"}`} key={r.id} title={`${r.vendor || "receipt"} — image didn't load`}>
+                <span>?</span>
+                {label}
               </div>
             );
           })}
@@ -319,10 +343,11 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
       {actionError && <div className="card" style={{ color: "var(--red)" }}>{actionError}</div>}
 
       {actionable && (
-        <div className="modal-actions" style={{ justifyContent: "flex-start" }}>
+        <div className="modal-actions" style={{ justifyContent: "flex-start", flexWrap: "wrap" }}>
           <button className="btn btn-orange" disabled={busy || !allComplete} onClick={handleApprove}>
             {busy ? "Working…" : "Approve"}
           </button>
+          <button className="btn btn-ghost" disabled={busy} onClick={handleDryRun}>Preview payload</button>
           <button className="btn btn-ghost" disabled={busy} onClick={() => setShowRevision(true)}>Request Revision</button>
           <button className="btn btn-danger" disabled={busy} onClick={handleReject}>Reject</button>
           {!allComplete && lines.length > 0 && (
@@ -330,6 +355,17 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
               Every line needs a receipt (or be flat-claim), a net amount, and a cost code.
             </span>
           )}
+        </div>
+      )}
+
+      {dryRun && (
+        <div className="card">
+          <div className="card-title">
+            Dry-run payload {dryRun.direct_cost_verified ? "" : "— DIRECTCOST_VERIFIED is off, nothing is sent"}
+          </div>
+          <pre style={{ overflowX: "auto", fontSize: 11, color: "var(--text-secondary)", whiteSpace: "pre-wrap" }}>
+            {JSON.stringify(dryRun, null, 2)}
+          </pre>
         </div>
       )}
 
