@@ -25,10 +25,11 @@
 //   - Einbau company vendor_id = 562949959021641.
 // ---------------------------------------------------------------------------
 
-// Flip to true ONLY after a real invoice-type Direct Cost has landed on a test
-// project AND been confirmed picked up by the Procore -> NetSuite sync. The
-// payload is settled (below); this is the "smoke-tested against live Procore" gate.
-export const DIRECTCOST_VERIFIED = false;
+// Armed at Ben's call (2026-09-08). Approve now posts real Direct Costs to
+// Procore. First real Approve should still be done on a TEST project and eyeballed
+// in Procore before using it for real — the "Preview payload" button in the UI
+// shows exactly what will be sent.
+export const DIRECTCOST_VERIFIED = true;
 
 export const PROCORE_COMPANY_ID = "562949953508586";
 export const EINBAU_VENDOR_ID = 562949959021641; // CONFIRMED (payroll flow)

@@ -183,14 +183,44 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
 
       <div className="card">
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
-          <div>
-            <div className="card-title">{sub.expense_id}</div>
-            <h2 style={{ fontSize: 20 }}>{sub.employee_name || sub.employee_email || "(unknown employee)"}</h2>
-            <div className="row-secondary">{sub.project_number || "no project"} · {sub.province || "?"}</div>
-          </div>
+          {actionable ? (
+            <div className="kv-grid" style={{ flex: 1, marginRight: 16 }}>
+              <div className="kv">
+                <span className="kv-label">Expense ID</span>
+                <input defaultValue={sub.expense_id} key={`e${sub.expense_id}`}
+                  onBlur={(e) => e.target.value.trim() !== sub.expense_id && mutate(() => api.patchSubmission(id, { expense_id: e.target.value.trim() }))} />
+              </div>
+              <div className="kv">
+                <span className="kv-label">Employee</span>
+                <input defaultValue={sub.employee_name || ""} key={`n${sub.employee_name}`}
+                  onBlur={(e) => e.target.value !== (sub.employee_name || "") && mutate(() => api.patchSubmission(id, { employee_name: e.target.value }))} />
+              </div>
+              <div className="kv">
+                <span className="kv-label">Project number</span>
+                <input defaultValue={sub.project_number || ""} key={`p${sub.project_number}`}
+                  onBlur={(e) => e.target.value.trim() !== (sub.project_number || "") && mutate(() => api.patchSubmission(id, { project_number: e.target.value.trim() }))} />
+              </div>
+              <div className="kv">
+                <span className="kv-label">Resolved</span>
+                <span className="kv-value">{sub.project_name || (sub.project_number ? "not in cache" : "—")} · {sub.province || "?"}</span>
+              </div>
+            </div>
+          ) : (
+            <div>
+              <div className="card-title">{sub.expense_id}</div>
+              <h2 style={{ fontSize: 20 }}>{sub.employee_name || sub.employee_email || "(unknown employee)"}</h2>
+              <div className="row-secondary">{sub.project_name || sub.project_number || "no project"} · {sub.province || "?"}</div>
+            </div>
+          )}
           <span className={`badge badge-${sub.status}`}>{sub.status.replace("_", " ")}</span>
         </div>
       </div>
+
+      {sub.flags?.some((f) => f.code === "parsing") && (
+        <div className="card" style={{ color: "var(--yellow)" }}>
+          Still reading the form and receipts in the background — <button className="btn btn-ghost btn-sm" onClick={load}>refresh</button> in a minute to see the lines.
+        </div>
+      )}
 
       {sub.flags?.length > 0 && (
         <div className="card">

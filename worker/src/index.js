@@ -7,7 +7,9 @@
 // a form becomes one Procore Direct Cost header + one line item per expense row.
 //
 // Routes:
-//   POST   /intake                              (X-Tally-Service-Key) PA forwards one email + attachments
+//   POST   /intake                              (X-Tally-Service-Key) PA forwards one email + attachments;
+//                                               returns 201 fast, parses the form + receipts in the background
+//   PATCH  /submissions/:id                     (Einbau ID) { expense_id?, employee_name?, project_number? } header corrections
 //   GET    /submissions?status=                 (Einbau ID) queue list — per-form summary
 //   GET    /submissions/:id                     (Einbau ID) { submission, line_items[], receipts[] }
 //   GET    /submissions/:id/receipt?key=        (Einbau ID) stream an attachment from R2 (private bucket)
@@ -567,8 +569,9 @@ function computeFormFlags(sub, project, receipts, lines) {
 
   if (!sub.project_number) add("project_missing", "high", "No project number on the form.");
   else if (!project) add("project_invalid", "high", `Project "${sub.project_number}" isn't in the projects cache.`);
-  else if (project.active === false) add("project_inactive", "high", `Project not active in Procore (stage "${project.stage || "?"}").`);
-  else if (INACTIVE_STAGES.has(project.stage)) add("project_inactive", "high", `Project stage is "${project.stage}".`);
+  // Advisory only — you can still post to a wrapped-up project, it's just worth a glance.
+  else if (project.active === false) add("project_inactive", "medium", `Project not active in Procore (stage "${project.stage || "?"}").`);
+  else if (INACTIVE_STAGES.has(project.stage)) add("project_inactive", "medium", `Project stage is "${project.stage}".`);
 
   if (!lines || lines.length === 0) add("form_parse_failed", "high", "No expense lines — build them by hand.");
 
@@ -615,17 +618,86 @@ function computeLineFlags(line, receipt, formProvince, project) {
 // /intake
 // ---------------------------------------------------------------------------
 
-async function handleIntake(request, env, sql) {
+// /intake returns FAST: store the attachments, create a skeleton submission,
+// respond 201, then do the (slow) Claude parse + matching in the background via
+// ctx.waitUntil. This is what stops Power Automate from timing out at ~2min and
+// retrying the whole thing 7 times.
+async function handleIntake(request, env, sql, ctx) {
   const body = await parseBody(request);
   const rawEmail = body.body || null;
   const fromEmail = body.employee_email || body.from || null;
 
+  // Cheap Expense ID (subject/body only — no Claude). Enough for fast dedup.
+  const cheapId = extractExpenseId(body);
+  if (cheapId) {
+    const [existing] = await sql`select * from submissions where expense_id = ${cheapId}`;
+    if (existing) {
+      const note = stripHtml(rawEmail || "").slice(0, 500);
+      const reopened = existing.status === "approved" || existing.status === "rejected";
+      const hist = [...(existing.history || []), historyEvent("reply_received", note || "(reply, no readable body)")];
+      const fl = reopened
+        ? [...(existing.flags || []), { code: "reply_on_closed", severity: "high", detail: `Reply on an already-${existing.status} form.` }]
+        : existing.flags;
+      const [u] = await sql`
+        update submissions set history = ${JSON.stringify(hist)}::jsonb, flags = ${JSON.stringify(fl)}::jsonb,
+          status = 'needs_review', updated_at = now()
+        where id = ${existing.id} returning id, expense_id, status`;
+      return json({ merged: true, submission: u }, 200);
+    }
+  }
+
   const atts = normalizeAttachments(body);
+  if (atts.length === 0) return json({ error: "no_attachments", detail: "No form or receipts on the email." }, 422);
+
   const formAtt = atts.find((a) => (a.contentType || "").toLowerCase().includes("pdf")) || null;
   const receiptAtts = atts.filter((a) => a !== formAtt).slice(0, MAX_RECEIPTS);
   const storeAtts = formAtt ? [formAtt, ...receiptAtts] : [...receiptAtts];
 
-  // Best-effort parse — failure must not block intake.
+  // R2 keys are opaque — a UUID prefix, unrelated to the Expense ID (which we may
+  // not know yet). Sequential puts keep the subrequest peak low.
+  const keyPrefix = crypto.randomUUID();
+  const stored = [];
+  for (const a of storeAtts) {
+    const key = `${keyPrefix}/${a.name}`;
+    await env.RECEIPTS.put(key, base64ToBytes(a.base64), { httpMetadata: { contentType: a.contentType } });
+    stored.push({ key, kind: a === formAtt ? "form" : "receipt" });
+  }
+
+  const expenseId = cheapId || `pending-${keyPrefix}`;
+  const projectNumber = (body.project_number && String(body.project_number).trim()) || null;
+  let project = null;
+  if (projectNumber) {
+    const [p] = await sql`select * from projects_cache where project_number = ${projectNumber} limit 1`;
+    project = p || null;
+  }
+
+  const history = [historyEvent("intake", `Received from ${fromEmail || "(unknown)"}.`)];
+  const [sub] = await sql`
+    insert into submissions
+      (expense_id, employee_name, employee_email, province, project_number, project_procore_id, project_name, project_stage,
+       status, flags, raw_email, history, submitted_at)
+    values
+      (${expenseId}, ${body.employee_name || null}, ${fromEmail}, ${(body.province || "").toUpperCase().slice(0, 2) || null},
+       ${projectNumber}, ${project?.procore_id || null}, ${project?.name || null}, ${project?.stage || null},
+       'needs_review', ${JSON.stringify([{ code: "parsing", severity: "low", detail: "Reading the form and receipts — refresh in a minute." }])}::jsonb,
+       ${rawEmail}, ${JSON.stringify(history)}::jsonb, now())
+    returning *`;
+
+  await sql.transaction(
+    stored.map((s) => sql`insert into receipts (submission_id, r2_key, kind) values (${sub.id}, ${s.key}, ${s.kind})`)
+  );
+
+  // The slow part — off the request path.
+  ctx.waitUntil(
+    parseSubmission(env, sql, sub.id, { formAtt, receiptAtts, body })
+      .catch((err) => console.error("background parse failed for", sub.id, err && err.message))
+  );
+
+  return json({ created: true, submission: { id: sub.id, expense_id: expenseId, status: "needs_review", parsing: true } }, 201);
+}
+
+// Background: the Claude call, matching, line inserts, receipt enrichment, flags.
+async function parseSubmission(env, sql, submissionId, { formAtt, receiptAtts, body }) {
   let claude = null, claudeError = null;
   try {
     claude = await parseFormAndReceipts(env, formAtt, receiptAtts);
@@ -636,73 +708,53 @@ async function handleIntake(request, env, sql) {
   const claudeReceipts = claude && Array.isArray(claude.receipts) ? claude.receipts : [];
   const claudeMatches = claude && Array.isArray(claude.matches) ? claude.matches : [];
 
-  const expenseId = (form.expense_id && String(form.expense_id).trim()) || extractExpenseId(body);
-  if (!expenseId) {
-    return json({ error: "no_expense_id", detail: "No Expense ID on the form or in the email." }, 422);
+  const [sub] = await sql`select * from submissions where id = ${submissionId}`;
+  if (!sub) return;
+
+  // Fill in the Expense ID if the form gave us a real one and we were on a placeholder.
+  let expenseId = sub.expense_id;
+  const formId = form.expense_id && String(form.expense_id).trim();
+  if (formId && sub.expense_id.startsWith("pending-") && formId !== sub.expense_id) {
+    try {
+      await sql`update submissions set expense_id = ${formId} where id = ${submissionId}`;
+      expenseId = formId;
+    } catch {
+      await sql`update submissions set flags = coalesce(flags, '[]'::jsonb) || ${JSON.stringify([{ code: "duplicate_expense_id", severity: "high", detail: `Form's Expense ID "${formId}" is already used by another submission.` }])}::jsonb where id = ${submissionId}`;
+    }
   }
 
-  // Revision-loop dedup — a reply carrying the same Expense ID merges onto the row.
-  const [existing] = await sql`select * from submissions where expense_id = ${expenseId}`;
-  if (existing) {
-    const note = stripHtml(rawEmail || "").slice(0, 500);
-    const reopened = existing.status === "approved" || existing.status === "rejected";
-    const hist = [...(existing.history || []), historyEvent("reply_received", note || "(reply, no readable body)")];
-    const fl = reopened
-      ? [...(existing.flags || []), { code: "reply_on_closed", severity: "high", detail: `Reply on an already-${existing.status} form.` }]
-      : existing.flags;
-    const [u] = await sql`
-      update submissions set history = ${JSON.stringify(hist)}::jsonb, flags = ${JSON.stringify(fl)}::jsonb,
-        status = 'needs_review', updated_at = now()
-      where id = ${existing.id} returning id, expense_id, status`;
-    return json({ merged: true, submission: u }, 200);
-  }
-
-  const projectNumber =
-    (form.project_number && String(form.project_number).trim()) ||
-    (body.project_number && String(body.project_number).trim()) || null;
+  // Resolve project (prefer the form's number over any the email body carried).
+  const projectNumber = (formId && form.project_number && String(form.project_number).trim()) || sub.project_number || null;
   let project = null;
   if (projectNumber) {
     const [p] = await sql`select * from projects_cache where project_number = ${projectNumber} limit 1`;
     project = p || null;
   }
-  const province = ((form.province || body.province || "") + "").toUpperCase().slice(0, 2) || null;
-  const employeeName = form.employee_name || body.employee_name || null;
+  const province = ((form.province || sub.province || "") + "").toUpperCase().slice(0, 2) || null;
+  const employeeName = form.employee_name || sub.employee_name || null;
+  await sql`
+    update submissions set employee_name = ${employeeName}, province = ${province}, project_number = ${projectNumber},
+      project_procore_id = ${project?.procore_id || null}, project_name = ${project?.name || null}, project_stage = ${project?.stage || null},
+      updated_at = now()
+    where id = ${submissionId}`;
 
-  // Store every attachment to R2 (private bucket).
-  await Promise.all(
-    storeAtts.map((a) =>
-      env.RECEIPTS.put(`${expenseId}/${a.name}`, base64ToBytes(a.base64), { httpMetadata: { contentType: a.contentType } })
-    )
-  );
-
-  const history = [historyEvent("intake", `Received from ${fromEmail || "(unknown)"}${claudeError ? ` — parse error: ${claudeError}` : ""}.`)];
-  const [sub] = await sql`
-    insert into submissions
-      (expense_id, employee_name, employee_email, province, project_number, project_procore_id, project_name, project_stage, status, flags, raw_email, history, submitted_at)
-    values
-      (${expenseId}, ${employeeName}, ${fromEmail}, ${province}, ${projectNumber}, ${project?.procore_id || null}, ${project?.name || null}, ${project?.stage || null}, 'needs_review', '[]'::jsonb, ${rawEmail}, ${JSON.stringify(history)}::jsonb, now())
-    returning *`;
-
-  // Receipts (form first, then receipts in order) — one transaction.
-  const receiptSpecs = [];
-  if (formAtt) receiptSpecs.push({ att: formAtt, kind: "form", idx: null, c: {} });
-  receiptAtts.forEach((a, i) => {
-    receiptSpecs.push({ att: a, kind: "receipt", idx: i, c: claudeReceipts.find((r) => Number(r.index) === i) || {} });
-  });
-  const receiptRows = [];
-  if (receiptSpecs.length) {
-    const results = await sql.transaction(
-      receiptSpecs.map((s) => sql`
-        insert into receipts (submission_id, r2_key, kind, vendor, receipt_date, subtotal, tax_json, gross, currency, confidence)
-        values (${sub.id}, ${`${expenseId}/${s.att.name}`}, ${s.kind}, ${s.c.vendor || null}, ${s.c.date || null},
-                ${money(s.c.subtotal)}, ${s.c.tax_lines ? JSON.stringify(s.c.tax_lines) : null}::jsonb, ${money(s.c.gross)},
-                ${(s.c.currency || "CAD")}, ${Number.isFinite(Number(s.c.confidence)) ? Number(s.c.confidence) : null})
-        returning *`)
-    );
-    results.forEach((r, i) => receiptRows.push({ ...r[0], _idx: receiptSpecs[i].idx }));
+  // Enrich the receipt rows with what Claude read.
+  const receiptRows = await sql`select * from receipts where submission_id = ${submissionId} order by (kind = 'form') desc, created_at asc`;
+  const realReceiptRows = receiptRows.filter((r) => r.kind === "receipt");
+  for (let i = 0; i < realReceiptRows.length; i++) {
+    const c = claudeReceipts.find((r) => Number(r.index) === i) || {};
+    await sql`
+      update receipts set vendor = ${c.vendor || null}, receipt_date = ${c.date || null}, subtotal = ${money(c.subtotal)},
+        tax_json = ${c.tax_lines ? JSON.stringify(c.tax_lines) : null}::jsonb, gross = ${money(c.gross)},
+        currency = ${c.currency || "CAD"}, confidence = ${Number.isFinite(Number(c.confidence)) ? Number(c.confidence) : null}
+      where id = ${realReceiptRows[i].id}`;
   }
+  const enriched = realReceiptRows.map((r, i) => {
+    const c = claudeReceipts.find((x) => Number(x.index) === i) || {};
+    return { id: r.id, idx: i, vendor: c.vendor || null, gross: money(c.gross), receipt_date: c.date || null, subtotal: money(c.subtotal), tax_json: c.tax_lines || null };
+  });
 
-  // Form lines → match → net → insert.
+  // Lines → match → net → insert.
   const formLines = Array.isArray(form.line_items) ? form.line_items : [];
   const lines = formLines.map((li, i) => {
     const category = normalizeCategory(li.category);
@@ -715,37 +767,32 @@ async function handleIntake(request, env, sql) {
       gross_amount: money(li.gross),
     };
   });
-  const receiptsForMatch = receiptRows
-    .filter((r) => r.kind === "receipt")
-    .map((r) => ({ id: r.id, idx: r._idx, vendor: r.vendor, gross: r.gross, receipt_date: r.receipt_date, subtotal: r.subtotal, tax_json: r.tax_json }));
-  const matches = matchLinesToReceipts(lines, receiptsForMatch, claudeMatches);
-
+  const matches = matchLinesToReceipts(lines, enriched, claudeMatches);
   const lineInserts = lines.map((l) => {
     const mm = matches.get(l.row_index) || null;
     const receiptId = mm?.receipt_id || null;
-    const receiptRow = receiptId ? receiptRows.find((r) => r.id === receiptId) : null;
+    const receiptRow = receiptId ? enriched.find((r) => r.id === receiptId) : null;
     const d = deriveLineNet(l, receiptRow, province);
-    const lf = computeLineFlags(
-      { ...l, receipt_id: receiptId, net_amount: d.net, tax_amount: d.tax, tax_source: d.tax_source },
-      receiptRow, province, project
-    );
+    const lf = computeLineFlags({ ...l, receipt_id: receiptId, net_amount: d.net, tax_amount: d.tax, tax_source: d.tax_source }, receiptRow, province, project);
     if (mm?.flag) lf.unshift(mm.flag);
     return sql`
       insert into line_items
         (submission_id, row_index, line_date, description, category, is_flat_claim, gross_amount, tax_amount, net_amount, tax_source,
          receipt_id, match_method, match_confidence, cost_code, flags, employee_name, project_number, project_procore_id)
       values
-        (${sub.id}, ${l.row_index}, ${l.line_date}, ${l.description}, ${l.category}, ${l.is_flat_claim}, ${l.gross_amount}, ${d.tax}, ${d.net}, ${d.tax_source},
+        (${submissionId}, ${l.row_index}, ${l.line_date}, ${l.description}, ${l.category}, ${l.is_flat_claim}, ${l.gross_amount}, ${d.tax}, ${d.net}, ${d.tax_source},
          ${receiptId}, ${mm?.method || "none"}, ${mm?.confidence ?? null}, ${""}, ${JSON.stringify(lf)}::jsonb, ${employeeName}, ${projectNumber}, ${project?.procore_id || null})`;
   });
   if (lineInserts.length) await sql.transaction(lineInserts);
 
+  // Recompute form flags from scratch (drops the transient `parsing` flag).
   const linesMini = lines.map((l) => ({ receipt_id: matches.get(l.row_index)?.receipt_id || null }));
-  const formFlags = computeFormFlags(sub, project, receiptRows.map((r) => ({ id: r.id, kind: r.kind })), linesMini);
-  if (claudeError) formFlags.unshift({ code: "claude_failed", severity: "high", detail: `Automatic parsing failed: ${claudeError}. Build the lines by hand.` });
-  await sql`update submissions set flags = ${JSON.stringify(formFlags)}::jsonb, updated_at = now() where id = ${sub.id}`;
-
-  return json({ created: true, submission: { id: sub.id, expense_id: expenseId, status: "needs_review", line_count: lines.length, flags: formFlags } }, 201);
+  const [freshSub] = await sql`select * from submissions where id = ${submissionId}`;
+  const formFlags = computeFormFlags(freshSub, project, receiptRows.map((r) => ({ id: r.id, kind: r.kind })), linesMini);
+  if (claudeError) formFlags.unshift({ code: "parse_failed", severity: "high", detail: `Automatic parsing failed: ${claudeError}. Build the lines by hand.` });
+  const dupFlag = (freshSub.flags || []).find((f) => f.code === "duplicate_expense_id");
+  if (dupFlag) formFlags.unshift(dupFlag);
+  await sql`update submissions set flags = ${JSON.stringify(formFlags)}::jsonb, updated_at = now() where id = ${submissionId}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -792,6 +839,52 @@ async function handleDetail(id, sql) {
     select id, submission_id, r2_key, kind, vendor, receipt_date, subtotal, tax_json, gross, currency, confidence, created_at
     from receipts where submission_id = ${id} order by (kind = 'form') desc, created_at asc`;
   return json({ submission: sub, line_items, receipts });
+}
+
+// Reviewer corrections to the form header — Claude misread the Expense ID, the
+// employee, or the project number.
+async function handleSubmissionPatch(subId, request, sql, user) {
+  const body = await parseBody(request).catch(() => ({}));
+  const [sub] = await sql`select * from submissions where id = ${subId}`;
+  if (!sub) return json({ error: "not_found" }, 404);
+
+  const nextName = body.employee_name !== undefined ? ((body.employee_name || "").toString().slice(0, 200) || null) : sub.employee_name;
+  let nextExpenseId = sub.expense_id;
+  if (body.expense_id !== undefined) {
+    nextExpenseId = (body.expense_id || "").toString().trim();
+    if (!nextExpenseId) return json({ error: "expense_id_required" }, 400);
+  }
+  const reResolve = body.project_number !== undefined;
+  const nextProjNum = reResolve ? ((body.project_number || "").toString().trim() || null) : sub.project_number;
+  let proj = { procore_id: sub.project_procore_id, name: sub.project_name, stage: sub.project_stage };
+  if (reResolve) {
+    proj = { procore_id: null, name: null, stage: null };
+    if (nextProjNum) {
+      const [p] = await sql`select * from projects_cache where project_number = ${nextProjNum} limit 1`;
+      if (p) proj = { procore_id: p.procore_id, name: p.name, stage: p.stage };
+    }
+  }
+
+  let row;
+  try {
+    [row] = await sql`
+      update submissions set
+        expense_id = ${nextExpenseId}, employee_name = ${nextName}, project_number = ${nextProjNum},
+        project_procore_id = ${proj.procore_id}, project_name = ${proj.name}, project_stage = ${proj.stage},
+        updated_at = now()
+      where id = ${subId} returning *`;
+  } catch (e) {
+    if (/unique|duplicate/i.test(e.message)) {
+      return json({ error: "expense_id_taken", detail: "Another submission already has that Expense ID." }, 409);
+    }
+    throw e;
+  }
+  if (reResolve) {
+    await sql`update line_items set project_number = ${nextProjNum}, project_procore_id = ${proj.procore_id}, updated_at = now() where submission_id = ${subId}`;
+  }
+  await bumpForm(sql, subId, historyEvent("submission_edited", `${user.username} edited the form header`));
+  const form_flags = await recomputeFormFlags(sql, subId);
+  return json({ submission: row, form_flags });
 }
 
 async function handleReceipt(id, url, env, sql) {
@@ -1122,7 +1215,7 @@ async function handleReject(subId, request, sql, user) {
 const isUuid = (s) => /^[0-9a-f-]{36}$/i.test(s || "");
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     if (request.method === "OPTIONS") return new Response(null, { headers: corsHeaders() });
 
     const url = new URL(request.url);
@@ -1133,7 +1226,7 @@ export default {
       // /intake — service key only
       if (url.pathname === "/intake" && request.method === "POST") {
         if (!isServiceCaller(request, env)) return json({ error: "unauthorized" }, 401);
-        return await handleIntake(request, env, sql);
+        return await handleIntake(request, env, sql, ctx);
       }
 
       // everything else needs an Einbau ID session
@@ -1181,6 +1274,7 @@ export default {
           const seg = parts[2];
 
           if (!seg && request.method === "GET") return withRefresh(await handleDetail(subId, sql));
+          if (!seg && request.method === "PATCH") return withRefresh(await handleSubmissionPatch(subId, request, sql, auth.user));
           if (seg === "receipt" && request.method === "GET") return await handleReceipt(subId, url, env, sql);
           if (seg === "cost-codes" && request.method === "GET") return withRefresh(await handleCostCodes(subId, env, sql));
           if (seg === "approve" && request.method === "POST") return withRefresh(await handleApprove(subId, url, request, env, sql, auth.user));
