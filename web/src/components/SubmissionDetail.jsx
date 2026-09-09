@@ -1,6 +1,10 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { Suspense, lazy, useCallback, useEffect, useMemo, useState } from "react";
 import { api, fetchReceiptObjectUrl } from "../api.js";
 import RevisionModal from "./RevisionModal.jsx";
+import EditableText from "./EditableText.jsx";
+
+// pdf-lib is bulky and only needed once someone opens an attachment.
+const Lightbox = lazy(() => import("./Lightbox.jsx"));
 
 const CATEGORIES = ["parking", "materials", "fuel", "mileage", "per_diem", "other"];
 const FLAT_CATEGORIES = new Set(["per_diem", "mileage"]);
@@ -64,6 +68,7 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
   const [actionError, setActionError] = useState(null);
   const [showRevision, setShowRevision] = useState(false);
   const [dryRun, setDryRun] = useState(null);
+  const [lightboxIdx, setLightboxIdx] = useState(null);
   const [newLine, setNewLine] = useState({ line_date: "", description: "", category: "materials", gross_amount: "" });
 
   const load = useCallback(() => {
@@ -92,14 +97,14 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
     return () => { cancelled = true; };
   }, [id, sub?.project_procore_id, actionable]);
 
-  // receipt thumbnails
+  // fetch each attachment as a blob URL (+ its mime type) for thumbnails / lightbox
   useEffect(() => {
     let cancelled = false;
     const made = [];
     Promise.all(
       receipts.map((r) =>
         fetchReceiptObjectUrl(id, r.r2_key)
-          .then((url) => { made.push(url); return [r.r2_key, url]; })
+          .then((res) => { made.push(res.url); return [r.r2_key, res]; })
           .catch(() => [r.r2_key, null])
       )
     ).then((pairs) => { if (!cancelled) setReceiptUrls(Object.fromEntries(pairs)); });
@@ -110,6 +115,30 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
   const usedReceiptIds = useMemo(() => new Set(lines.map((l) => l.receipt_id).filter(Boolean)), [lines]);
   const unmatchedReceipts = receipts.filter((r) => r.kind === "receipt" && !usedReceiptIds.has(r.id));
   const formDoc = receipts.find((r) => r.kind === "form");
+
+  // ordered attachment list for the lightbox: form first, then receipts
+  const lightboxItems = useMemo(() => {
+    const ordered = [...receipts].sort((a, b) => (a.kind === "form" ? -1 : 0) - (b.kind === "form" ? -1 : 0));
+    return ordered
+      .map((r) => {
+        const res = receiptUrls[r.r2_key];
+        if (!res) return null;
+        const line = lines.find((l) => l.receipt_id === r.id);
+        return {
+          url: res.url,
+          type: res.type,
+          name: r.r2_key.split("/").pop(),
+          label: r.kind === "form" ? "Expense form" : `${r.vendor || "Receipt"}${line ? ` → line ${line.row_index}` : ""}`,
+          receiptId: r.id,
+        };
+      })
+      .filter(Boolean);
+  }, [receipts, receiptUrls, lines]);
+
+  const openLightbox = (receiptId) => {
+    const i = lightboxItems.findIndex((it) => it.receiptId === receiptId);
+    if (i >= 0) setLightboxIdx(i);
+  };
 
   async function mutate(fn) {
     setActionError(null);
@@ -182,36 +211,25 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
       <button className="btn btn-ghost btn-sm" onClick={onClose} style={{ marginBottom: 16 }}>← Back to queue</button>
 
       <div className="card">
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
-          {actionable ? (
-            <div className="kv-grid" style={{ flex: 1, marginRight: 16 }}>
-              <div className="kv">
-                <span className="kv-label">Expense ID</span>
-                <input defaultValue={sub.expense_id} key={`e${sub.expense_id}`}
-                  onBlur={(e) => e.target.value.trim() !== sub.expense_id && mutate(() => api.patchSubmission(id, { expense_id: e.target.value.trim() }))} />
-              </div>
-              <div className="kv">
-                <span className="kv-label">Employee</span>
-                <input defaultValue={sub.employee_name || ""} key={`n${sub.employee_name}`}
-                  onBlur={(e) => e.target.value !== (sub.employee_name || "") && mutate(() => api.patchSubmission(id, { employee_name: e.target.value }))} />
-              </div>
-              <div className="kv">
-                <span className="kv-label">Project number</span>
-                <input defaultValue={sub.project_number || ""} key={`p${sub.project_number}`}
-                  onBlur={(e) => e.target.value.trim() !== (sub.project_number || "") && mutate(() => api.patchSubmission(id, { project_number: e.target.value.trim() }))} />
-              </div>
-              <div className="kv">
-                <span className="kv-label">Resolved</span>
-                <span className="kv-value">{sub.project_name || (sub.project_number ? "not in cache" : "—")} · {sub.province || "?"}</span>
-              </div>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 16 }}>
+          <div>
+            <div className="expense-id-heading">
+              <EditableText value={sub.expense_id} disabled={!actionable}
+                onSave={(v) => v && mutate(() => api.patchSubmission(id, { expense_id: v }))} />
             </div>
-          ) : (
-            <div>
-              <div className="card-title">{sub.expense_id}</div>
-              <h2 style={{ fontSize: 20 }}>{sub.employee_name || sub.employee_email || "(unknown employee)"}</h2>
-              <div className="row-secondary">{sub.project_name || sub.project_number || "no project"} · {sub.province || "?"}</div>
+            <div style={{ fontSize: 17, marginTop: 6 }}>
+              <EditableText value={sub.employee_name} placeholder="(no employee)" disabled={!actionable}
+                onSave={(v) => mutate(() => api.patchSubmission(id, { employee_name: v }))} />
             </div>
-          )}
+            <div className="row-secondary" style={{ marginTop: 4 }}>
+              <EditableText value={sub.project_number} placeholder="(no project #)" disabled={!actionable}
+                onSave={(v) => mutate(() => api.patchSubmission(id, { project_number: v }))} />
+              {" · "}
+              {sub.project_name || (sub.project_number ? "not in cache" : "")}
+              {sub.province ? ` · ${sub.province}` : ""}
+              {sub.employee_email ? ` · ${sub.employee_email}` : ""}
+            </div>
+          </div>
           <span className={`badge badge-${sub.status}`}>{sub.status.replace("_", " ")}</span>
         </div>
       </div>
@@ -268,10 +286,11 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
                         <span className="row-secondary">— flat claim</span>
                       ) : matched ? (
                         <span className="receipt-chip">
-                          {receiptUrls[matched.r2_key] && (
-                            <a href={receiptUrls[matched.r2_key]} target="_blank" rel="noreferrer" title="Open receipt">
-                              <img src={receiptUrls[matched.r2_key]} alt="" />
-                            </a>
+                          {receiptUrls[matched.r2_key]?.url && (
+                            <button type="button" className="receipt-chip-img" title="Open receipt"
+                              onClick={() => openLightbox(matched.id)}>
+                              <img src={receiptUrls[matched.r2_key].url} alt="" />
+                            </button>
                           )}
                           <span>{matched.vendor || "receipt"} · {money(matched.gross)}</span>
                           {actionable && (
@@ -346,21 +365,22 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
         <div className="card-title">Attachments</div>
         <div className="receipt-strip">
           {formDoc && (
-            <a className="receipt-thumb is-form" href={receiptUrls[formDoc.r2_key] || "#"} target="_blank" rel="noreferrer">
+            <button type="button" className="receipt-thumb is-form" onClick={() => openLightbox(formDoc.id)}
+              disabled={!receiptUrls[formDoc.r2_key]?.url}>
               FORM
-            </a>
+            </button>
           )}
           {receipts.filter((r) => r.kind === "receipt").map((r) => {
             const line = lines.find((l) => l.receipt_id === r.id);
             const label = <span className="receipt-thumb-label">{money(r.gross)}{line ? ` → line ${line.row_index}` : ""}</span>;
-            return receiptUrls[r.r2_key] ? (
-              <a className={`receipt-thumb ${line ? "is-matched" : "is-unmatched"}`} key={r.id}
-                 href={receiptUrls[r.r2_key]} target="_blank" rel="noreferrer" title={r.vendor || "Open receipt"}>
-                <img src={receiptUrls[r.r2_key]} alt="" />
+            return receiptUrls[r.r2_key]?.url ? (
+              <button type="button" className={`receipt-thumb ${line ? "is-matched" : "is-unmatched"}`} key={r.id}
+                onClick={() => openLightbox(r.id)} title={r.vendor || "Open receipt"}>
+                <img src={receiptUrls[r.r2_key].url} alt="" />
                 {label}
-              </a>
+              </button>
             ) : (
-              <div className={`receipt-thumb ${line ? "is-matched" : "is-unmatched"}`} key={r.id} title={`${r.vendor || "receipt"} — image didn't load`}>
+              <div className={`receipt-thumb ${line ? "is-matched" : "is-unmatched"}`} key={r.id} title={`${r.vendor || "receipt"} — didn't load`}>
                 <span>?</span>
                 {label}
               </div>
@@ -409,6 +429,17 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
           onClose={() => setShowRevision(false)}
           onDone={() => { setShowRevision(false); onChanged?.(); load(); }}
         />
+      )}
+
+      {lightboxIdx !== null && lightboxItems[lightboxIdx] && (
+        <Suspense fallback={null}>
+          <Lightbox
+            items={lightboxItems}
+            index={lightboxIdx}
+            onIndex={setLightboxIdx}
+            onClose={() => setLightboxIdx(null)}
+          />
+        </Suspense>
       )}
     </div>
   );

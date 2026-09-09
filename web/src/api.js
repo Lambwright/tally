@@ -64,15 +64,15 @@ export const api = {
 };
 
 // Receipt images live in a private R2 bucket behind an authed route — fetch as a
-// blob and hand the caller an object URL rather than ever exposing an R2 URL.
+// blob and hand the caller an object URL + its type, never an R2 URL.
 export async function fetchReceiptObjectUrl(id, key) {
   const token = getStoredToken();
   const res = await fetch(api.receiptUrl(id, key), {
     headers: token ? { Authorization: `Bearer ${token}` } : {},
   });
-  if (!res.ok) throw new Error(`Couldn't load receipt image (HTTP ${res.status}).`);
+  if (!res.ok) throw new Error(`Couldn't load attachment (HTTP ${res.status}).`);
   const blob = await res.blob();
-  return URL.createObjectURL(blob);
+  return { url: URL.createObjectURL(blob), type: blob.type || "" };
 }
 
 export { UnauthorizedError };
