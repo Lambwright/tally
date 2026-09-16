@@ -494,6 +494,8 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
                     </td>
                     <td>
                       <input type="number" step="0.01" defaultValue={l.net_amount ?? ""} disabled={!actionable}
+                        title={l.tax_source === "manual" ? "Set by hand — won't be recalculated" : ""}
+                        style={l.tax_source === "manual" ? { borderColor: "var(--orange)" } : undefined}
                         onBlur={(e) => String(e.target.value) !== String(l.net_amount ?? "") && patchLine(l.id, { net_amount: e.target.value })} />
                     </td>
                     <td>

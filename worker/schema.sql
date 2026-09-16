@@ -107,8 +107,11 @@ create table line_items (
   gross_amount numeric(12, 2),           -- amount entered in the category column
   tax_amount   numeric(12, 2),
   net_amount   numeric(12, 2),           -- pre-tax — THIS is what posts to Procore
+  -- 'manual' = the reviewer typed a net amount by hand; a shared-receipt
+  -- resync (another line joining/leaving the same receipt) must leave it
+  -- alone instead of recomputing over it. See migration_003.sql.
   tax_source   text not null default 'none'
-    check (tax_source in ('read', 'fallback_table', 'none')),
+    check (tax_source in ('read', 'fallback_table', 'none', 'manual')),
 
   receipt_id       uuid references receipts(id) on delete set null,
   match_method     text not null default 'none' check (match_method in ('auto', 'manual', 'none')),

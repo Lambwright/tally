@@ -786,7 +786,11 @@ function computeLineFlags(line, receipt, formProvince, project, { shared = false
 
   if (!flat && !line.receipt_id) add("receipt_unmatched", "high", "No receipt matched to this line.");
   if (!flat && line.receipt_id) {
-    if (shared) add("receipt_shared", "low", "This photo also backs another line — net is a province-rate estimate, not read off it directly.");
+    if (shared) {
+      add("receipt_shared", "low", line.tax_source === "manual"
+        ? "This photo also backs another line — net was entered by hand for this one."
+        : "This photo also backs another line — net is a province-rate estimate, not read off it directly.");
+    }
     if (line.tax_source === "fallback_table") {
       add("tax_estimated", "high", shared
         ? "Net is a province-rate estimate — can't isolate this line's tax from a receipt shared with another line."
@@ -1167,6 +1171,9 @@ async function recomputeFormFlags(sql, submissionId) {
 // delete that could change how many lines a receipt backs — a line matched
 // while it was the receipt's only user needs to drop back to an estimate the
 // moment a second line claims the same photo, and vice versa when un-shared.
+// A line the reviewer set by hand (tax_source = 'manual') is left alone —
+// a sibling joining/leaving the shared receipt must not silently overwrite
+// a number someone typed in on purpose.
 async function resyncLinesForReceipt(sql, subId, receiptId, province, project) {
   if (!receiptId) return;
   const [receipt] = await sql`select * from receipts where id = ${receiptId}`;
@@ -1174,6 +1181,11 @@ async function resyncLinesForReceipt(sql, subId, receiptId, province, project) {
   const siblings = await sql`select * from line_items where submission_id = ${subId} and receipt_id = ${receiptId}`;
   const shared = siblings.length > 1;
   for (const l of siblings) {
+    if (l.tax_source === "manual") {
+      const lf = computeLineFlags(l, receipt, province, project, { shared });
+      await sql`update line_items set flags = ${JSON.stringify(lf)}::jsonb, updated_at = now() where id = ${l.id}`;
+      continue;
+    }
     const d = deriveLineNet(l, receipt, province, { shared });
     const lf = computeLineFlags({ ...l, net_amount: d.net, tax_amount: d.tax, tax_source: d.tax_source }, receipt, province, project, { shared });
     await sql`
@@ -1251,8 +1263,16 @@ async function handleLinePatch(subId, lineId, request, sql, user) {
     shared = count > 0;
   }
 
-  if (body.net_amount !== undefined) {
-    next.net_amount = money(body.net_amount); // manual override, keep tax_source as-is
+  if (body.net_amount !== undefined && money(body.net_amount) !== null) {
+    // Typed by hand — mark it 'manual' so a later shared-receipt resync
+    // (another line joining/leaving the same receipt) leaves it alone.
+    next.net_amount = money(body.net_amount);
+    next.tax_source = "manual";
+  } else if (!next.is_flat_claim && line.tax_source === "manual" && body.net_amount === undefined) {
+    // Editing something else (description, date, cost code...) on a line
+    // whose net the reviewer already set by hand — leave that number alone
+    // instead of quietly recomputing over it. Clear the net field to opt
+    // back into auto.
   } else {
     const d = deriveLineNet(next, receipt, sub.province, { shared });
     next.net_amount = d.net; next.tax_amount = d.tax; next.tax_source = d.tax_source;
