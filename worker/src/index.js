@@ -11,6 +11,7 @@
 //                                               returns 201 fast, parses the form + receipts in the background
 //   PATCH  /submissions/:id                     (Einbau ID) { expense_id?, employee_name?, project_number? } header corrections
 //   DELETE /submissions/:id                     (Einbau ID) hard-delete (cascade + R2 cleanup) — frees the Expense ID
+//   DELETE /submissions/:id/receipts/:receiptId (Einbau ID) remove one attachment (unmatches any line it backed)
 //   POST   /submissions/:id/reparse             (Einbau ID) re-run the Claude parse against the already-stored attachments
 //   GET    /submissions?status=                 (Einbau ID) queue list — per-form summary
 //   GET    /submissions/:id                     (Einbau ID) { submission, line_items[], receipts[] }
@@ -22,6 +23,7 @@
 //   POST   /submissions/:id/lines/:lineId/match (Einbau ID) { receipt_id } -> attach a receipt, recompute net
 //   POST   /submissions/:id/lines/:lineId/unmatch (Einbau ID) detach the receipt
 //   POST   /submissions/:id/approve[?dryRun=1]  (Einbau ID) build 1 DC header + N line items, post at net
+//   POST   /submissions/:id/retry-attachments   (Einbau ID) re-upload the form + receipts to an already-created DC
 //   POST   /submissions/:id/request-revision    (Einbau ID) { note } -> needs_revision + a copy-ready reply
 //   POST   /submissions/:id/reject              (Einbau ID) { reason } -> rejected
 //   GET    /projects                            (Einbau ID) cached active-project list
@@ -83,6 +85,22 @@ const FALLBACK_TAX_RATES = {
   AB: 5, BC: 12, MB: 12, NB: 15, NL: 15, NS: 15, NT: 5,
   NU: 5, ON: 13, PE: 15, QC: 14.975, SK: 11, YT: 5,
 };
+
+// province -> Procore tax_code_id, from the PROCORE_TAX_CODE_IDS var (JSON
+// object string). CONFIRMED (Ben, 2026-09-16) off the Direct Cost line item's
+// own Tax Code select options — all 13 provinces/territories mapped. A
+// province missing from the map just means TALLY omits tax_code_id for it and
+// flags the submission, not a guess at the id.
+function taxCodeIdForProvince(env, province) {
+  if (!province) return null;
+  let map;
+  try {
+    map = JSON.parse(env.PROCORE_TAX_CODE_IDS || "{}");
+  } catch {
+    map = {};
+  }
+  return map[province] || null;
+}
 
 // ---------------------------------------------------------------------------
 // HTTP plumbing
@@ -247,9 +265,10 @@ Return ONLY a JSON object, no prose, no markdown fences:
 {
   "form": {
     "expense_id": string | null,        // the "Expense ID" field, format DDMMYY-JJJJJ-EEEE
-    "employee_name": string | null,
+    "employee_name": string | null,     // the "Name" field — the EMPLOYEE this expense belongs to, not whoever emailed/forwarded it
     "project_number": string | null,    // format YYYY_NNNN
     "province": string | null,          // 2-letter code (ON, QC, BC, AB, ...)
+    "date_authorized": "YYYY-MM-DD" | null, // the "For Office Use Only" block's "Date Authorized" field, only if actually filled in
     "line_items": [
       { "row": number,                  // 1-based row order on the form
         "date": "YYYY-MM-DD" | null,
@@ -441,6 +460,32 @@ async function projectForSubmission(sub, sql) {
     return p || null;
   }
   return null;
+}
+
+const normalizeName = (s) => String(s || "").toLowerCase().replace(/\s+/g, " ").trim();
+
+// Resolve the Procore user the Direct Cost should be tagged with. Deliberately
+// searches by the EMPLOYEE NAME AS READ OFF THE FORM, never by the email's
+// From address — an employee's report forwarded by someone else (a PM relaying
+// a report on their behalf) has a From address that names the forwarder, not
+// the employee, and matching on it silently tags the wrong person. Better to
+// tag nobody than tag the wrong one, so this only returns an id when the match
+// is unambiguous.
+async function resolveEmployeeId(env, token, employeeName) {
+  if (!employeeName) return { id: null, reason: "No employee name on the form to search Procore with." };
+  const results = await procoreFetch(
+    env, token,
+    `/rest/v1.0/companies/${env.PROCORE_COMPANY_ID}/users?filters[search]=${encodeURIComponent(employeeName)}`
+  ).catch(() => []);
+  const list = Array.isArray(results) ? results : [];
+  if (!list.length) return { id: null, reason: `No Procore user found matching "${employeeName}".` };
+
+  const target = normalizeName(employeeName);
+  const nameOf = (u) => u.name || `${u.first_name || ""} ${u.last_name || ""}`;
+  const exact = list.filter((u) => normalizeName(nameOf(u)) === target);
+  if (exact.length === 1) return { id: exact[0].id, reason: null };
+  if (list.length === 1) return { id: list[0].id, reason: null };
+  return { id: null, reason: `"${employeeName}" matched ${list.length} Procore users — too ambiguous to tag automatically.` };
 }
 
 // ---------------------------------------------------------------------------
@@ -805,8 +850,10 @@ async function parseSubmission(env, sql, submissionId, { formAtt, receiptAtts, b
   }
   const province = ((form.province || sub.province || "") + "").toUpperCase().slice(0, 2) || null;
   const employeeName = form.employee_name || sub.employee_name || null;
+  const dateAuthorized = /^\d{4}-\d{2}-\d{2}$/.test(form.date_authorized || "") ? form.date_authorized : sub.date_authorized || null;
   await sql`
     update submissions set employee_name = ${employeeName}, province = ${province}, project_number = ${projectNumber},
+      date_authorized = ${dateAuthorized},
       project_procore_id = ${project?.procore_id || null}, project_name = ${project?.name || null}, project_stage = ${project?.stage || null},
       updated_at = now()
     where id = ${submissionId}`;
@@ -1229,13 +1276,19 @@ async function handleApprove(subId, url, request, env, sql, user) {
 
   const token = await getProcoreToken(env);
 
-  let employeeId = null;
-  try {
-    if (sub.employee_email) {
-      const users = await procoreFetch(env, token, `/rest/v1.0/companies/${env.PROCORE_COMPANY_ID}/users?filters[search]=${encodeURIComponent(sub.employee_email)}`);
-      employeeId = Array.isArray(users) && users[0] ? users[0].id : null;
-    }
-  } catch { /* omit */ }
+  const employeeResolution = await resolveEmployeeId(env, token, sub.employee_name);
+  const employeeId = employeeResolution.id;
+
+  // Tax code: the form's own province, falling back to the project's cached
+  // province (Ben: "match the form, or project as well").
+  const project = await projectForSubmission(sub, sql);
+  const taxProvince = (sub.province || project?.province || "").toUpperCase().slice(0, 2) || null;
+  const taxCodeId = taxCodeIdForProvince(env, taxProvince);
+  const taxCodeReason = taxCodeId
+    ? null
+    : taxProvince
+      ? `No Procore tax code configured for province "${taxProvince}" (PROCORE_TAX_CODE_IDS).`
+      : "No province on the form or its project — can't pick a tax code.";
 
   const resolved = [];
   for (const l of lines) {
@@ -1247,13 +1300,21 @@ async function handleApprove(subId, url, request, env, sql, user) {
     }
   }
 
-  const headerDate = lines.map((l) => l.line_date).filter(Boolean).sort()[0] || new Date().toISOString().slice(0, 10);
-  const header = buildDirectCostHeader({ ...sub, header_date: headerDate }, { employeeId });
-  const lineItems = resolved.map(({ line, wbs }) => buildDirectCostLineItem(line, wbs, sub.expense_id));
+  // Date Authorized (from the form) if we have one; otherwise the earliest
+  // expense date on the form; today only as a last resort.
+  const headerDate = sub.date_authorized || lines.map((l) => l.line_date).filter(Boolean).sort()[0] || new Date().toISOString().slice(0, 10);
+  let header;
+  try {
+    header = buildDirectCostHeader({ ...sub, header_date: headerDate }, { employeeId, env });
+  } catch (e) {
+    return json({ error: "vendor_not_configured", detail: e.message }, 500);
+  }
+  const lineItems = resolved.map(({ line, wbs }) => buildDirectCostLineItem(line, wbs, sub.expense_id, taxCodeId));
 
   if (dryRun) {
     return json({
-      dryRun: true, direct_cost_verified: DIRECTCOST_VERIFIED, employeeId, header,
+      dryRun: true, direct_cost_verified: DIRECTCOST_VERIFIED, employeeId, employeeIdReason: employeeResolution.reason,
+      taxCodeId, taxCodeReason, header,
       line_items: lineItems.map((li, i) => ({ ...li, wbs_code_id: resolved[i].wbs, row: resolved[i].line.row_index })),
     });
   }
@@ -1307,21 +1368,91 @@ async function handleApprove(subId, url, request, env, sql, user) {
   if (attachFailures.length) {
     hist.push(historyEvent(
       "attachments_failed",
-      `${attachFailures.length}/${receiptRows.length} file(s) didn't attach to the Direct Cost — attach by hand in Procore: ${attachFailures.map((a) => a.key.split("/").pop()).join(", ")}`
+      `${attachFailures.length}/${receiptRows.length} file(s) didn't attach to the Direct Cost — attach by hand in Procore. ` +
+      `First error (${attachFailures[0].key.split("/").pop()}): ${attachFailures[0].error}`
     ));
+  }
+  if (!employeeId && employeeResolution.reason) {
+    hist.push(historyEvent("employee_not_tagged", employeeResolution.reason));
+  }
+  if (!taxCodeId && taxCodeReason) {
+    hist.push(historyEvent("tax_code_unmapped", taxCodeReason));
   }
 
   // Keep whatever advisory flags the form already had (e.g. tax_estimated) —
-  // approving doesn't erase that history — just add the attachment failure if any.
-  const flags = attachFailures.length
-    ? [...(sub.flags || []), { code: "attachments_failed", severity: "medium", detail: `${attachFailures.length} of ${receiptRows.length} file(s) didn't attach to the Procore Direct Cost — attach them by hand.` }]
-    : (sub.flags || []);
+  // approving doesn't erase that history — just add anything that happened at approve time.
+  const flags = [...(sub.flags || [])];
+  if (attachFailures.length) {
+    flags.push({
+      code: "attachments_failed", severity: "medium",
+      detail: `${attachFailures.length} of ${receiptRows.length} file(s) didn't attach to the Procore Direct Cost — attach them by hand. First error: ${attachFailures[0].error}`,
+    });
+  }
+  if (!employeeId && employeeResolution.reason) {
+    flags.push({ code: "employee_not_tagged", severity: "low", detail: employeeResolution.reason });
+  }
+  if (!taxCodeId && taxCodeReason) {
+    flags.push({ code: "tax_code_unmapped", severity: "low", detail: taxCodeReason });
+  }
 
   const [row] = await sql`
     update submissions set status = 'approved', procore_direct_cost_id = ${dcId}, flags = ${JSON.stringify(flags)}::jsonb,
       reviewed_by = ${user.username}, reviewed_at = now(), history = ${JSON.stringify(hist)}::jsonb, updated_at = now()
     where id = ${subId} returning id, status, procore_direct_cost_id, flags`;
   return json({ approved: true, submission: row, procore: { header: headerResult, line_items: posted, attachments: attachResults } });
+}
+
+// Retry attaching the stored form + receipts to an already-created Direct
+// Cost — for when the approve-time upload failed (attachments_failed flag)
+// and whatever caused it has since been fixed or was just transient.
+async function handleRetryAttachments(subId, env, sql, user) {
+  const [sub] = await sql`select * from submissions where id = ${subId}`;
+  if (!sub) return json({ error: "not_found" }, 404);
+  if (!sub.procore_direct_cost_id) return json({ error: "not_approved", detail: "This form hasn't been approved yet — nothing to attach to." }, 422);
+
+  const token = await getProcoreToken(env);
+  const receiptRows = await sql`select * from receipts where submission_id = ${subId} order by (kind = 'form') desc, created_at asc`;
+
+  const attachResults = [];
+  for (const r of receiptRows) {
+    try {
+      const obj = await env.RECEIPTS.get(r.r2_key);
+      if (!obj) throw new Error("object missing from R2");
+      const bytes = new Uint8Array(await obj.arrayBuffer());
+      await procoreUploadAttachment(env, token, sub.project_procore_id, sub.procore_direct_cost_id, {
+        bytes, contentType: obj.httpMetadata?.contentType, filename: r.r2_key.split("/").pop(),
+      });
+      attachResults.push({ key: r.r2_key, ok: true });
+    } catch (e) {
+      attachResults.push({ key: r.r2_key, ok: false, error: e.message });
+    }
+  }
+  const attachFailures = attachResults.filter((a) => !a.ok);
+
+  const hist = [
+    ...(sub.history || []),
+    historyEvent(
+      "attachments_retried",
+      attachFailures.length
+        ? `${user.username} retried attachments: ${attachFailures.length}/${receiptRows.length} still failed. First error (${attachFailures[0].key.split("/").pop()}): ${attachFailures[0].error}`
+        : `${user.username} retried attachments: all ${receiptRows.length} attached successfully.`
+    ),
+  ];
+
+  // Drop the old attachments_failed flag either way — either it's fixed, or
+  // this retry's own failure (visible in history above) replaces it.
+  const flags = (sub.flags || []).filter((f) => f.code !== "attachments_failed");
+  if (attachFailures.length) {
+    flags.push({
+      code: "attachments_failed", severity: "medium",
+      detail: `${attachFailures.length} of ${receiptRows.length} file(s) still didn't attach — attach them by hand. First error: ${attachFailures[0].error}`,
+    });
+  }
+
+  const [row] = await sql`
+    update submissions set flags = ${JSON.stringify(flags)}::jsonb, history = ${JSON.stringify(hist)}::jsonb, updated_at = now()
+    where id = ${subId} returning id, status, flags`;
+  return json({ submission: row, attachments: attachResults });
 }
 
 async function handleRequestRevision(subId, request, sql, user) {
@@ -1406,6 +1537,40 @@ async function handleReparse(subId, env, sql, user) {
   return json({ submission: freshSub, line_items });
 }
 
+// Remove a single attachment (not the whole submission) — someone photographed
+// a personal item by mistake, a duplicate shot, etc. Unmatches it from any
+// line(s) it backed first (and resyncs whoever else shared it), then deletes
+// the R2 object and the row. The form document can't be removed this way —
+// only kind='receipt'.
+async function handleReceiptDelete(subId, receiptId, env, sql, user) {
+  const [receipt] = await sql`select * from receipts where id = ${receiptId} and submission_id = ${subId}`;
+  if (!receipt) return json({ error: "not_found" }, 404);
+  if (receipt.kind !== "receipt") return json({ error: "cannot_delete_form", detail: "The form document can't be removed here." }, 400);
+
+  const [sub] = await sql`select * from submissions where id = ${subId}`;
+  const project = await projectForSubmission(sub, sql);
+
+  const affected = await sql`select * from line_items where submission_id = ${subId} and receipt_id = ${receiptId}`;
+  for (const l of affected) {
+    const lf = computeLineFlags({ ...l, receipt_id: null, net_amount: null, tax_amount: null, tax_source: "none" }, null, sub.province, project);
+    await sql`
+      update line_items set receipt_id = null, match_method = 'none', match_confidence = null,
+        net_amount = null, tax_amount = null, tax_source = 'none', flags = ${JSON.stringify(lf)}::jsonb, updated_at = now()
+      where id = ${l.id}`;
+  }
+
+  await env.RECEIPTS.delete(receipt.r2_key).catch(() => {});
+  await sql`delete from receipts where id = ${receiptId}`;
+
+  await bumpForm(sql, subId, historyEvent(
+    "receipt_deleted",
+    `${user.username} removed an attachment${affected.length ? ` (unmatched from ${affected.length} line${affected.length > 1 ? "s" : ""})` : ""}`
+  ));
+  const form_flags = await recomputeFormFlags(sql, subId);
+  const line_items = await sql`select * from line_items where submission_id = ${subId} order by row_index asc nulls last, created_at asc`;
+  return json({ deleted: true, form_flags, line_items });
+}
+
 // Hard delete — the row, its lines/receipts (cascade), and the R2 objects. For
 // spam / garbage / a test you want to recycle. Reject keeps the record; this
 // removes it and frees the Expense ID.
@@ -1487,7 +1652,14 @@ export default {
           if (!seg && request.method === "PATCH") return withRefresh(await handleSubmissionPatch(subId, request, sql, auth.user));
           if (!seg && request.method === "DELETE") return withRefresh(await handleSubmissionDelete(subId, env, sql, auth.user));
           if (seg === "reparse" && request.method === "POST") return withRefresh(await handleReparse(subId, env, sql, auth.user));
+          if (seg === "retry-attachments" && request.method === "POST") return withRefresh(await handleRetryAttachments(subId, env, sql, auth.user));
           if (seg === "receipt" && request.method === "GET") return await handleReceipt(subId, url, env, sql);
+          if (seg === "receipts") {
+            const receiptId = parts[3];
+            if (receiptId && isUuid(receiptId) && !parts[4] && request.method === "DELETE") {
+              return withRefresh(await handleReceiptDelete(subId, receiptId, env, sql, auth.user));
+            }
+          }
           if (seg === "cost-codes" && request.method === "GET") return withRefresh(await handleCostCodes(subId, env, sql));
           if (seg === "approve" && request.method === "POST") return withRefresh(await handleApprove(subId, url, request, env, sql, auth.user));
           if (seg === "request-revision" && request.method === "POST") return withRefresh(await handleRequestRevision(subId, request, sql, auth.user));

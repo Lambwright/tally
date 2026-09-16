@@ -34,6 +34,11 @@ create table submissions (
   project_name       text,
   project_stage      text,
 
+  -- The form's own "Date Authorized" field (For Office Use Only block), when
+  -- Claude can read one off it. Preferred Direct Cost date over the earliest
+  -- line date — see migration_001.sql for adding this to an existing database.
+  date_authorized date,
+
   status text not null default 'needs_review' check (status in
     ('needs_review', 'needs_revision', 'approved', 'rejected')),
 

@@ -345,6 +345,23 @@ body {
 .receipt-thumb-label { font-family: 'JetBrains Mono', monospace; }
 .receipt-chip-img { border: none; background: none; padding: 0; cursor: pointer; display: inline-flex; }
 
+.receipt-thumb-wrap { position: relative; }
+.receipt-thumb-delete {
+  position: absolute; top: -6px; right: -6px; width: 18px; height: 18px; z-index: 1;
+  border-radius: 50%; border: 1px solid var(--border-color); background: var(--bg-card);
+  color: var(--text-tertiary); cursor: pointer; font-size: 12px; line-height: 1; padding: 0;
+  display: flex; align-items: center; justify-content: center;
+}
+.receipt-thumb-delete:hover { color: var(--red); border-color: var(--red-border); }
+
+.bulk-action-bar {
+  display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+  margin-bottom: 10px; padding: 8px 10px;
+  background: var(--bg-input); border: 1px solid var(--border-color); border-radius: var(--radius-sm);
+}
+.bulk-action-bar input { font-size: 12px; padding: 6px 9px; border: 1px solid var(--border-input);
+  border-radius: var(--radius-sm); background: var(--bg-card); color: var(--text-primary); font-family: inherit; }
+
 /* click-to-edit inline fields */
 .expense-id-heading {
   font-family: 'Oswald', sans-serif; font-weight: 700; font-size: 26px;

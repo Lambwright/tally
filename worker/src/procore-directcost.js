@@ -32,7 +32,14 @@
 export const DIRECTCOST_VERIFIED = true;
 
 export const PROCORE_COMPANY_ID = "562949953508586";
-export const EINBAU_VENDOR_ID = 562949959021641; // CONFIRMED (payroll flow)
+export const EINBAU_VENDOR_ID = 562949959021641; // CONFIRMED (payroll flow) — used for payroll-type DCs, not these
+
+// CONFIRMED (Ben, 2026-09-16): expense Direct Costs go against the "MISC EMP
+// Expenses" vendor (id 562949966381888), not Einbau itself — set via the
+// MISC_EMP_VENDOR_ID var in wrangler.jsonc. buildDirectCostHeader still throws
+// if that var is ever unset rather than silently falling back to
+// EINBAU_VENDOR_ID — posting to the wrong vendor is exactly the class of
+// silent-wrong-data bug this file exists to avoid.
 
 // CONFIRMED (Ben): invoice-type, so the existing Procore -> NetSuite invoice sync
 // picks these up.
@@ -120,8 +127,21 @@ export async function resolveWbsCodeId(env, token, procoreFetch, projectId, cate
   return hit.id;
 }
 
+// CONFIRMED (Ben, 2026-09-16): payment terms is a plain `terms` string field
+// on the Direct Cost header itself — seen on a live DC read back from Procore
+// as "Net 10". NOT vendor-inherited (Ben confirmed), so TALLY has to send it.
+const PAYMENT_TERMS = "Net 10";
+
 // One header per emailed expense form. The amounts live on the line items.
-export function buildDirectCostHeader(submission, { employeeId = null } = {}) {
+// `env` supplies MISC_EMP_VENDOR_ID — see the note above on why this isn't
+// allowed to silently fall back to EINBAU_VENDOR_ID.
+export function buildDirectCostHeader(submission, { employeeId = null, env } = {}) {
+  const vendorId = env?.MISC_EMP_VENDOR_ID;
+  if (!vendorId) {
+    throw new Error(
+      "MISC_EMP_VENDOR_ID isn't configured — set that secret/var to the 'MISC EMP Expenses' vendor's Procore id before approving."
+    );
+  }
   const date =
     submission.header_date || submission.receipt_date || new Date().toISOString().slice(0, 10);
   const item = {
@@ -130,7 +150,8 @@ export function buildDirectCostHeader(submission, { employeeId = null } = {}) {
     direct_cost_date: date,
     received_date: date,
     invoice_number: submission.expense_id, // CONFIRMED (Ben): the form's Expense ID
-    vendor_id: EINBAU_VENDOR_ID,
+    vendor_id: Number(vendorId),
+    terms: PAYMENT_TERMS,
     description: `TALLY expense form ${submission.expense_id} — ${submission.employee_name || submission.employee_email || "employee"}`,
   };
   if (employeeId) item.employee_id = String(employeeId); // string, no int cast (payroll flow)
@@ -144,25 +165,29 @@ export function buildDirectCostHeader(submission, { employeeId = null } = {}) {
 
 // One line item per expense row on the form. `line` is a line_items row (carries
 // its own project_procore_id, denormalized). Amount posted is the NET.
-export function buildDirectCostLineItem(line, wbsCodeId, expenseId) {
+// `taxCodeId` (optional) — CONFIRMED (Ben, 2026-09-16) field name `tax_code_id`
+// from a live line item; the id->province mapping lives in
+// PROCORE_TAX_CODE_IDS (index.js resolves it before calling this). Omitted
+// entirely when the submission's province has no configured mapping.
+export function buildDirectCostLineItem(line, wbsCodeId, expenseId, taxCodeId = null) {
   const net = Number(line.net_amount);
   if (!Number.isFinite(net) || net <= 0) {
     throw new Error(`Refusing to build a line item with net_amount=${line.net_amount}`);
   }
   const label = (line.description || line.category || "expense").toString().slice(0, 120);
+  const item = {
+    wbs_code_id: String(wbsCodeId),
+    description: `${label} ${dedupToken({ expense_id: expenseId })}`,
+    quantity: 1,
+    unit_cost: net.toFixed(2),
+    uom: "each", // TODO(ben): payroll uses "hours"; confirm the unit for a lump expense
+  };
+  if (taxCodeId) item.tax_code_id = Number(taxCodeId);
   return {
     method: "POST",
     // caller substitutes {dc_id}
     pathTemplate: `/rest/v1.0/projects/${line.project_procore_id}/direct_costs/{dc_id}/line_items`,
-    data: {
-      line_item: {
-        wbs_code_id: String(wbsCodeId),
-        description: `${label} ${dedupToken({ expense_id: expenseId })}`,
-        quantity: 1,
-        unit_cost: net.toFixed(2),
-        uom: "each", // TODO(ben): payroll uses "hours"; confirm the unit for a lump expense
-      },
-    },
+    data: { line_item: item },
   };
 }
 

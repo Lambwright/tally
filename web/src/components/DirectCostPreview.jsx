@@ -1,6 +1,6 @@
 // A human-readable mockup of the Direct Cost approve would create — the raw
 // dryRun payload is still available underneath for debugging, just collapsed.
-const EINBAU_VENDOR_NAME = "Einbau Services Ltd.";
+const MISC_EMP_VENDOR_NAME = "MISC EMP Expenses";
 
 function money(n, currency = "CAD") {
   const num = Number(n);
@@ -35,10 +35,23 @@ export default function DirectCostPreview({ dryRun, sub, costCodes }) {
         <div className="kv"><span className="kv-label">Project</span><span className="kv-value">{sub.project_name || sub.project_number || "—"}</span></div>
         <div className="kv"><span className="kv-label">Invoice #</span><span className="kv-value mono">{header.invoice_number}</span></div>
         <div className="kv"><span className="kv-label">Date</span><span className="kv-value">{header.direct_cost_date}</span></div>
-        <div className="kv"><span className="kv-label">Vendor</span><span className="kv-value">{EINBAU_VENDOR_NAME}</span></div>
-        <div className="kv"><span className="kv-label">Employee</span><span className="kv-value">{sub.employee_name || "—"}</span></div>
+        <div className="kv"><span className="kv-label">Vendor</span><span className="kv-value">{MISC_EMP_VENDOR_NAME}</span></div>
+        <div className="kv"><span className="kv-label">Terms</span><span className="kv-value">{header.terms || "—"}</span></div>
+        <div className="kv"><span className="kv-label">Employee</span>
+          <span className="kv-value">{sub.employee_name || "—"}{!dryRun.employeeId && dryRun.employeeIdReason ? " ⚠" : ""}</span>
+        </div>
         <div className="kv"><span className="kv-label">Type</span><span className="kv-value" style={{ textTransform: "capitalize" }}>{header.direct_cost_type}</span></div>
+        <div className="kv"><span className="kv-label">Tax code</span>
+          <span className="kv-value">{dryRun.taxCodeId || "— (none)"}</span>
+        </div>
       </div>
+
+      {(dryRun.employeeIdReason || dryRun.taxCodeReason) && (
+        <div className="row-secondary" style={{ color: "var(--yellow)", marginBottom: 8 }}>
+          {dryRun.employeeIdReason && <div>⚠ {dryRun.employeeIdReason}</div>}
+          {dryRun.taxCodeReason && <div>⚠ {dryRun.taxCodeReason}</div>}
+        </div>
+      )}
 
       <table className="dc-preview-table">
         <thead>

@@ -26,7 +26,18 @@
 		// just a fallback when ALLOWED_USERS is unset.
 		"ALLOWED_USERS": "ben,josh@einbau.ca",
 		"ALLOWED_ROLES": "admin,user",
-		"CURRENT_APP": "tally"
+		"CURRENT_APP": "tally",
+		// The "MISC EMP Expenses" vendor's numeric Procore id -- expense Direct
+		// Costs post against this vendor, not Einbau itself. CONFIRMED (Ben,
+		// 2026-09-16) against a live Direct Cost's vendor.id.
+		"MISC_EMP_VENDOR_ID": "562949966381888",
+		// province -> Procore tax_code_id, JSON object string. Direct Cost line
+		// items post with this so tax matches the form's (or project's) province.
+		// CONFIRMED (Ben, 2026-09-16) off the Direct Cost line item's own Tax Code
+		// select options. BC also has a "BRITISH COLUMBIA - MATERIALS" variant
+		// (id 562949953932528) that isn't used here -- every category gets the
+		// general BC code for now; flag it if materials need the other one.
+		"PROCORE_TAX_CODE_IDS": "{\"AB\":22824,\"BC\":22825,\"MB\":28398,\"NB\":28400,\"NL\":28401,\"NS\":28403,\"NT\":28405,\"NU\":28406,\"ON\":22822,\"PE\":28402,\"QC\":28399,\"SK\":28397,\"YT\":28404}"
 	},
 	// One schedule: refresh the cached active-project list from Procore every 6h.
 	// There is deliberately NO mail-polling cron — Power Automate pushes each email

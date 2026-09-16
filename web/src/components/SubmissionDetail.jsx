@@ -29,6 +29,8 @@ const FLAG_LABELS = {
   geo_mismatch: "Location doesn't match the project",
   attachments_failed: "Some files didn't attach in Procore — attach by hand",
   receipt_shared: "Receipt also backs another line",
+  tax_code_unmapped: "No Procore tax code for this province — added without one",
+  employee_not_tagged: "Employee not tagged on the Direct Cost",
 };
 
 const PARSE_FAILURE_FLAGS = new Set(["parse_failed", "claude_failed", "form_parse_failed"]);
@@ -75,6 +77,8 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
   const [dryRun, setDryRun] = useState(null);
   const [lightboxIdx, setLightboxIdx] = useState(null);
   const [newLine, setNewLine] = useState({ line_date: "", description: "", category: "materials", gross_amount: "" });
+  const [selectedLineIds, setSelectedLineIds] = useState(new Set());
+  const [bulkCostCodeText, setBulkCostCodeText] = useState("");
 
   const load = useCallback(() => {
     setLoading(true);
@@ -115,6 +119,27 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
     ).then((pairs) => { if (!cancelled) setReceiptUrls(Object.fromEntries(pairs)); });
     return () => { cancelled = true; made.forEach((u) => u && URL.revokeObjectURL(u)); };
   }, [id, data?.receipts?.map((r) => r.r2_key).join(",")]);
+
+  // drop selections for lines that no longer exist (deleted, or a fresh load)
+  useEffect(() => {
+    setSelectedLineIds((prev) => {
+      const next = new Set([...prev].filter((lid) => lines.some((l) => l.id === lid)));
+      return next.size === prev.size ? prev : next;
+    });
+  }, [lines]);
+
+  // "code" or "code — description" -> the cost-code entry, for the searchable inputs
+  const findCodeByText = useCallback((text) => {
+    const norm = String(text || "").trim().toLowerCase();
+    if (!norm) return null;
+    return (costCodes?.codes || []).find(
+      (c) => c.code.toLowerCase() === norm || `${c.code} — ${c.description}`.toLowerCase() === norm
+    ) || null;
+  }, [costCodes]);
+  const codeLabelById = useMemo(
+    () => Object.fromEntries((costCodes?.codes || []).map((c) => [c.id, c.code])),
+    [costCodes]
+  );
 
   const receiptById = useMemo(() => Object.fromEntries(receipts.map((r) => [r.id, r])), [receipts]);
   // A receipt can legitimately back more than one line (one photo of several
@@ -227,6 +252,61 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
     setNewLine({ line_date: "", description: "", category: "materials", gross_amount: "" });
     setBusy(false);
   }
+  async function handleRetryAttachments() {
+    setBusy(true);
+    setActionError(null);
+    try {
+      await api.retryAttachments(id);
+      onChanged?.();
+      load();
+    } catch (e) {
+      setActionError(e.data?.detail || e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function handleDeleteReceipt(receiptId) {
+    if (!window.confirm("Remove this attachment? Any line matched to it goes back to unmatched.")) return;
+    setBusy(true);
+    setActionError(null);
+    try {
+      await api.deleteReceipt(id, receiptId);
+      onChanged?.();
+      load();
+    } catch (e) {
+      setActionError(e.data?.detail || e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const toggleLineSelected = (lineId) =>
+    setSelectedLineIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(lineId)) next.delete(lineId); else next.add(lineId);
+      return next;
+    });
+  const allLinesSelected = lines.length > 0 && selectedLineIds.size === lines.length;
+  const toggleSelectAllLines = () =>
+    setSelectedLineIds(allLinesSelected ? new Set() : new Set(lines.map((l) => l.id)));
+
+  async function handleBulkApplyCostCode() {
+    const match = findCodeByText(bulkCostCodeText);
+    if (!match) { setActionError(`"${bulkCostCodeText}" doesn't match a cost code for this project.`); return; }
+    setBusy(true);
+    setActionError(null);
+    try {
+      await Promise.all([...selectedLineIds].map((lid) => api.patchLine(id, lid, { cost_code: match.id })));
+      setSelectedLineIds(new Set());
+      setBulkCostCodeText("");
+      onChanged?.();
+      load();
+    } catch (e) {
+      setActionError(e.data?.detail || e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
 
   if (loading) return <div className="empty-state">Loading…</div>;
   if (error)
@@ -293,12 +373,37 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
         </div>
       )}
 
+      {costCodes && !costCodes.error && (
+        <datalist id="cost-code-options">
+          {(costCodes.codes || []).map((c) => (
+            <option key={c.id} value={c.code}>{c.description}</option>
+          ))}
+        </datalist>
+      )}
+
       <div className="card">
         <div className="card-title">Lines</div>
+
+        {actionable && selectedLineIds.size > 0 && (
+          <div className="bulk-action-bar">
+            <span className="row-secondary">{selectedLineIds.size} selected</span>
+            <input list="cost-code-options" placeholder="Cost code…" value={bulkCostCodeText}
+              onChange={(e) => setBulkCostCodeText(e.target.value)} style={{ minWidth: 220 }} />
+            <button className="btn btn-ghost btn-sm" disabled={busy || !bulkCostCodeText.trim()} onClick={handleBulkApplyCostCode}>
+              Apply to {selectedLineIds.size} selected
+            </button>
+            <button className="btn btn-ghost btn-sm" onClick={() => setSelectedLineIds(new Set())}>Clear</button>
+          </div>
+        )}
+
         <div style={{ overflowX: "auto" }}>
           <table className="lines-table">
             <thead>
               <tr>
+                <th>{actionable && (
+                  <input type="checkbox" checked={allLinesSelected} onChange={toggleSelectAllLines}
+                    aria-label="Select all lines" />
+                )}</th>
                 <th>Date</th><th>Description</th><th>Category</th><th>Gross</th>
                 <th>Receipt</th><th>Net</th><th>Cost code</th><th>Flags</th><th></th>
               </tr>
@@ -308,8 +413,15 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
                 const flat = FLAT_CATEGORIES.has(l.category);
                 const matched = l.receipt_id ? receiptById[l.receipt_id] : null;
                 const codeDefault = costCodes && !costCodes.error ? costCodes.defaults?.[l.category]?.wbs_code_id || "" : "";
+                const codeText = codeLabelById[l.cost_code] || codeLabelById[codeDefault] || "";
                 return (
                   <tr key={l.id} className={busyLine === l.id ? "row-busy" : ""}>
+                    <td>
+                      {actionable && (
+                        <input type="checkbox" checked={selectedLineIds.has(l.id)}
+                          onChange={() => toggleLineSelected(l.id)} aria-label={`Select line ${l.row_index ?? ""}`} />
+                      )}
+                    </td>
                     <td>
                       <input type="date" defaultValue={dateOnly(l.line_date)} disabled={!actionable}
                         onBlur={(e) => e.target.value !== dateOnly(l.line_date) && patchLine(l.id, { line_date: e.target.value })} />
@@ -368,13 +480,14 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
                       {costCodes && costCodes.error ? (
                         <span className="row-secondary" style={{ color: "var(--yellow)" }}>codes unavailable</span>
                       ) : (
-                        <select value={l.cost_code || codeDefault || ""} disabled={!actionable}
-                          onChange={(e) => patchLine(l.id, { cost_code: e.target.value })}>
-                          <option value="">{codeDefault ? "" : "— pick —"}</option>
-                          {(costCodes?.codes || []).map((c) => (
-                            <option key={c.id} value={c.id}>{c.code}{c.description ? ` — ${c.description}` : ""}</option>
-                          ))}
-                        </select>
+                        <input list="cost-code-options" defaultValue={codeText} disabled={!actionable}
+                          placeholder="Search codes…"
+                          onBlur={(e) => {
+                            const text = e.target.value.trim();
+                            if (!text) { if (l.cost_code) patchLine(l.id, { cost_code: "" }); return; }
+                            const match = findCodeByText(text);
+                            if (match && match.id !== (l.cost_code || codeDefault)) patchLine(l.id, { cost_code: match.id });
+                          }} />
                       )}
                     </td>
                     <td className="line-flags-cell">
@@ -393,7 +506,7 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
                 );
               })}
               {lines.length === 0 && (
-                <tr><td colSpan={9} className="row-secondary" style={{ padding: 12 }}>No lines yet — add them below.</td></tr>
+                <tr><td colSpan={10} className="row-secondary" style={{ padding: 12 }}>No lines yet — add them below.</td></tr>
               )}
             </tbody>
           </table>
@@ -429,16 +542,24 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
                 {money(r.gross)}{forLines.length ? ` → line ${forLines.map((l) => l.row_index).join(", ")}` : ""}
               </span>
             );
-            return receiptUrls[r.r2_key]?.url ? (
-              <button type="button" className={`receipt-thumb ${forLines.length ? "is-matched" : "is-unmatched"}`} key={r.id}
-                onClick={() => openLightbox(r.id)} title={r.vendor || "Open receipt"}>
-                <img src={receiptUrls[r.r2_key].url} alt="" />
-                {label}
-              </button>
-            ) : (
-              <div className={`receipt-thumb ${forLines.length ? "is-matched" : "is-unmatched"}`} key={r.id} title={`${r.vendor || "receipt"} — didn't load`}>
-                <span>?</span>
-                {label}
+            return (
+              <div className="receipt-thumb-wrap" key={r.id}>
+                {receiptUrls[r.r2_key]?.url ? (
+                  <button type="button" className={`receipt-thumb ${forLines.length ? "is-matched" : "is-unmatched"}`}
+                    onClick={() => openLightbox(r.id)} title={r.vendor || "Open receipt"}>
+                    <img src={receiptUrls[r.r2_key].url} alt="" />
+                    {label}
+                  </button>
+                ) : (
+                  <div className={`receipt-thumb ${forLines.length ? "is-matched" : "is-unmatched"}`} title={`${r.vendor || "receipt"} — didn't load`}>
+                    <span>?</span>
+                    {label}
+                  </div>
+                )}
+                {actionable && (
+                  <button type="button" className="receipt-thumb-delete" title="Remove this attachment"
+                    onClick={() => handleDeleteReceipt(r.id)}>×</button>
+                )}
               </div>
             );
           })}
@@ -473,7 +594,19 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
       {dryRun && <DirectCostPreview dryRun={dryRun} sub={sub} costCodes={costCodes} />}
 
       {sub.procore_direct_cost_id && (
-        <div className="row-secondary" style={{ marginTop: 12 }}>Procore Direct Cost: {sub.procore_direct_cost_id}</div>
+        <div className="row-secondary" style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+          <span>
+            Procore Direct Cost: {sub.procore_direct_cost_id}
+            {" · "}
+            <a href={`https://us02.procore.com/${sub.project_procore_id}/project/direct_costs/${sub.procore_direct_cost_id}/edit`}
+              target="_blank" rel="noreferrer">open in Procore ↗</a>
+          </span>
+          {sub.flags?.some((f) => f.code === "attachments_failed") && (
+            <button className="btn btn-ghost btn-sm" disabled={busy} onClick={handleRetryAttachments}>
+              {busy ? "Retrying…" : "↻ Retry attachments"}
+            </button>
+          )}
+        </div>
       )}
 
       {showRevision && (
