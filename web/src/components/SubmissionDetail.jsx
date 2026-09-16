@@ -2,6 +2,7 @@ import { Suspense, lazy, useCallback, useEffect, useMemo, useState } from "react
 import { api, fetchReceiptObjectUrl } from "../api.js";
 import RevisionModal from "./RevisionModal.jsx";
 import EditableText from "./EditableText.jsx";
+import DirectCostPreview from "./DirectCostPreview.jsx";
 
 // pdf-lib is bulky and only needed once someone opens an attachment.
 const Lightbox = lazy(() => import("./Lightbox.jsx"));
@@ -454,16 +455,7 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
         )}
       </div>
 
-      {dryRun && (
-        <div className="card">
-          <div className="card-title">
-            Dry-run payload {dryRun.direct_cost_verified ? "" : "— DIRECTCOST_VERIFIED is off, nothing is sent"}
-          </div>
-          <pre style={{ overflowX: "auto", fontSize: 11, color: "var(--text-secondary)", whiteSpace: "pre-wrap" }}>
-            {JSON.stringify(dryRun, null, 2)}
-          </pre>
-        </div>
-      )}
+      {dryRun && <DirectCostPreview dryRun={dryRun} sub={sub} costCodes={costCodes} />}
 
       {sub.procore_direct_cost_id && (
         <div className="row-secondary" style={{ marginTop: 12 }}>Procore Direct Cost: {sub.procore_direct_cost_id}</div>

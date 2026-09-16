@@ -387,3 +387,17 @@ body {
 .lightbox-nav:hover { background: rgba(0,0,0,0.75); }
 .lightbox-nav.prev { left: 12px; }
 .lightbox-nav.next { right: 12px; }
+
+/* human-readable Direct Cost preview */
+.dc-preview-head {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 12px; margin-bottom: 16px; padding-bottom: 16px; border-bottom: 1px solid var(--border-color);
+}
+.dc-preview-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.dc-preview-table th {
+  text-align: left; font-family: 'JetBrains Mono', monospace; font-size: 9px;
+  text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-tertiary);
+  padding: 6px 8px; border-bottom: 1px solid var(--border-color);
+}
+.dc-preview-table td { padding: 8px; border-bottom: 1px solid var(--border-color); }
+.dc-preview-table tfoot td { border-bottom: none; padding-top: 10px; }
