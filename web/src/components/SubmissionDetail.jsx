@@ -27,6 +27,7 @@ const FLAG_LABELS = {
   amount_mismatch: "Numbers don't reconcile",
   low_confidence: "Low extraction confidence",
   geo_mismatch: "Location doesn't match the project",
+  attachments_failed: "Some files didn't attach in Procore — attach by hand",
 };
 
 const PARSE_FAILURE_FLAGS = new Set(["parse_failed", "claude_failed", "form_parse_failed"]);

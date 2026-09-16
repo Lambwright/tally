@@ -364,6 +364,33 @@ async function procoreFetch(env, token, path, { method = "GET", body } = {}) {
   return parsed;
 }
 
+// Attach a file to a Direct Cost. TODO(ben): endpoint + field name unverified
+// against live Procore — this follows the same "/attachments" multipart pattern
+// Procore uses for RFIs/Submittals/etc, but hasn't been confirmed for Direct
+// Costs specifically. Report back what happens on the first real approve so
+// this can be corrected if the shape is off.
+async function procoreUploadAttachment(env, token, projectId, directCostId, { bytes, contentType, filename }) {
+  const form = new FormData();
+  form.append("attachment[file]", new Blob([bytes], { type: contentType || "application/octet-stream" }), filename);
+  const res = await fetch(`${env.PROCORE_API_BASE}/rest/v1.0/projects/${projectId}/direct_costs/${directCostId}/attachments`, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      Authorization: `Bearer ${token}`,
+      "Procore-Company-Id": env.PROCORE_COMPANY_ID,
+      // no Content-Type — the runtime sets the multipart boundary for a FormData body
+    },
+    body: form,
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    const err = new Error(`Procore attachment POST -> ${res.status}: ${text.slice(0, 300)}`);
+    err.status = res.status;
+    throw err;
+  }
+  return text ? JSON.parse(text) : {};
+}
+
 async function fetchProcoreProjects(env, token) {
   const projects = [];
   let page = 1;
@@ -1191,12 +1218,49 @@ async function handleApprove(subId, url, request, env, sql, user) {
     posted.push(await procoreFetch(env, token, li.pathTemplate.replace("{dc_id}", dcId), { method: "POST", body: li.data }));
   }
 
-  const hist = [...(sub.history || []), historyEvent("approved", `Approved by ${user.username}; Procore Direct Cost ${dcId} with ${lineItems.length} line item(s).`)];
+  // Attach the form + every receipt so the Direct Cost carries its backup, not
+  // just a description. Best-effort: a failure here doesn't undo the (already
+  // correctly created) financial record — it's flagged instead so it can be
+  // attached by hand if needed.
+  const receiptRows = await sql`select * from receipts where submission_id = ${subId} order by (kind = 'form') desc, created_at asc`;
+  const attachResults = [];
+  for (const r of receiptRows) {
+    try {
+      const obj = await env.RECEIPTS.get(r.r2_key);
+      if (!obj) throw new Error("object missing from R2");
+      const bytes = new Uint8Array(await obj.arrayBuffer());
+      await procoreUploadAttachment(env, token, sub.project_procore_id, dcId, {
+        bytes, contentType: obj.httpMetadata?.contentType, filename: r.r2_key.split("/").pop(),
+      });
+      attachResults.push({ key: r.r2_key, ok: true });
+    } catch (e) {
+      attachResults.push({ key: r.r2_key, ok: false, error: e.message });
+    }
+  }
+  const attachFailures = attachResults.filter((a) => !a.ok);
+
+  const hist = [
+    ...(sub.history || []),
+    historyEvent("approved", `Approved by ${user.username}; Procore Direct Cost ${dcId} with ${lineItems.length} line item(s).`),
+  ];
+  if (attachFailures.length) {
+    hist.push(historyEvent(
+      "attachments_failed",
+      `${attachFailures.length}/${receiptRows.length} file(s) didn't attach to the Direct Cost — attach by hand in Procore: ${attachFailures.map((a) => a.key.split("/").pop()).join(", ")}`
+    ));
+  }
+
+  // Keep whatever advisory flags the form already had (e.g. tax_estimated) —
+  // approving doesn't erase that history — just add the attachment failure if any.
+  const flags = attachFailures.length
+    ? [...(sub.flags || []), { code: "attachments_failed", severity: "medium", detail: `${attachFailures.length} of ${receiptRows.length} file(s) didn't attach to the Procore Direct Cost — attach them by hand.` }]
+    : (sub.flags || []);
+
   const [row] = await sql`
-    update submissions set status = 'approved', procore_direct_cost_id = ${dcId},
+    update submissions set status = 'approved', procore_direct_cost_id = ${dcId}, flags = ${JSON.stringify(flags)}::jsonb,
       reviewed_by = ${user.username}, reviewed_at = now(), history = ${JSON.stringify(hist)}::jsonb, updated_at = now()
-    where id = ${subId} returning id, status, procore_direct_cost_id`;
-  return json({ approved: true, submission: row, procore: { header: headerResult, line_items: posted } });
+    where id = ${subId} returning id, status, procore_direct_cost_id, flags`;
+  return json({ approved: true, submission: row, procore: { header: headerResult, line_items: posted, attachments: attachResults } });
 }
 
 async function handleRequestRevision(subId, request, sql, user) {
