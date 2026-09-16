@@ -114,7 +114,10 @@ create table line_items (
   match_method     text not null default 'none' check (match_method in ('auto', 'manual', 'none')),
   match_confidence numeric(4, 3),
 
-  cost_code text,                        -- chosen WBS flat code; blank = category default
+  cost_code text,                        -- chosen WBS code id; blank = category default
+  -- chosen Procore tax_code_id override; blank = auto from the form/project
+  -- province. See migration_002.sql for adding this to an existing database.
+  tax_code text,
 
   -- per-line deterministic checks: [{ code, severity, detail }]
   flags jsonb not null default '[]'::jsonb,

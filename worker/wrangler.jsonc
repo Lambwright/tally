@@ -37,7 +37,12 @@
 		// select options. BC also has a "BRITISH COLUMBIA - MATERIALS" variant
 		// (id 562949953932528) that isn't used here -- every category gets the
 		// general BC code for now; flag it if materials need the other one.
-		"PROCORE_TAX_CODE_IDS": "{\"AB\":22824,\"BC\":22825,\"MB\":28398,\"NB\":28400,\"NL\":28401,\"NS\":28403,\"NT\":28405,\"NU\":28406,\"ON\":22822,\"PE\":28402,\"QC\":28399,\"SK\":28397,\"YT\":28404}"
+		"PROCORE_TAX_CODE_IDS": "{\"AB\":22824,\"BC\":22825,\"MB\":28398,\"NB\":28400,\"NL\":28401,\"NS\":28403,\"NT\":28405,\"NU\":28406,\"ON\":22822,\"PE\":28402,\"QC\":28399,\"SK\":28397,\"YT\":28404}",
+		// Every Tax Code option on a Direct Cost line item, JSON array string --
+		// [{id,name}]. Powers the per-line searchable tax-code picker in the app
+		// (the reviewer can override the auto-picked province default per line).
+		// CONFIRMED (Ben, 2026-09-16/17) off the line items own select options.
+		"PROCORE_TAX_CODES": "[{\"id\":22824,\"name\":\"ALBERTA\"},{\"id\":22825,\"name\":\"BRITISH COLUMBIA\"},{\"id\":562949953932528,\"name\":\"BRITISH COLUMBIA - MATERIALS\"},{\"id\":28398,\"name\":\"MANITOBA\"},{\"id\":28400,\"name\":\"NEW BRUNSWICK\"},{\"id\":28401,\"name\":\"NEWFOUNDLAND\"},{\"id\":28405,\"name\":\"NORTHWEST TERRITORIES\"},{\"id\":22823,\"name\":\"NO TAX\"},{\"id\":28403,\"name\":\"NOVA SCOTIA\"},{\"id\":28406,\"name\":\"NUNAVUT\"},{\"id\":22822,\"name\":\"ONTARIO\"},{\"id\":28402,\"name\":\"PRINCE EDWARD ISLAND\"},{\"id\":28399,\"name\":\"QUEBEC\"},{\"id\":28397,\"name\":\"SASKATCHEWAN\"},{\"id\":28404,\"name\":\"YUKON\"}]"
 	},
 	// One schedule: refresh the cached active-project list from Procore every 6h.
 	// There is deliberately NO mail-polling cron — Power Automate pushes each email

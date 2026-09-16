@@ -18,7 +18,7 @@
 //   GET    /submissions/:id/receipt?key=        (Einbau ID) stream an attachment from R2 (private bucket)
 //   GET    /submissions/:id/cost-codes          (Einbau ID) project WBS codes + per-category defaults
 //   POST   /submissions/:id/lines               (Einbau ID) add a line by hand
-//   PATCH  /submissions/:id/lines/:lineId       (Einbau ID) edit a line { line_date?, description?, category?, gross_amount?, net_amount?, cost_code? }
+//   PATCH  /submissions/:id/lines/:lineId       (Einbau ID) edit a line { line_date?, description?, category?, gross_amount?, net_amount?, cost_code?, tax_code? }
 //   DELETE /submissions/:id/lines/:lineId       (Einbau ID) remove a line
 //   POST   /submissions/:id/lines/:lineId/match (Einbau ID) { receipt_id } -> attach a receipt, recompute net
 //   POST   /submissions/:id/lines/:lineId/unmatch (Einbau ID) detach the receipt
@@ -85,6 +85,18 @@ const FALLBACK_TAX_RATES = {
   AB: 5, BC: 12, MB: 12, NB: 15, NL: 15, NS: 15, NT: 5,
   NU: 5, ON: 13, PE: 15, QC: 14.975, SK: 11, YT: 5,
 };
+
+// Category-specific exceptions to the blanket province rate above — CONFIRMED
+// (Ben, 2026-09-17): BC exempts fuel from PST, so only GST (5%) applies there,
+// not the province's combined 12%.
+const FALLBACK_TAX_RATE_OVERRIDES = {
+  BC: { fuel: 5 },
+};
+
+function fallbackTaxRate(province, category) {
+  const override = FALLBACK_TAX_RATE_OVERRIDES[province]?.[category];
+  return override != null ? override : FALLBACK_TAX_RATES[province] ?? null;
+}
 
 // province -> Procore tax_code_id, from the PROCORE_TAX_CODE_IDS var (JSON
 // object string). CONFIRMED (Ben, 2026-09-16) off the Direct Cost line item's
@@ -383,31 +395,104 @@ async function procoreFetch(env, token, path, { method = "GET", body } = {}) {
   return parsed;
 }
 
-// Attach a file to a Direct Cost. TODO(ben): endpoint + field name unverified
-// against live Procore — this follows the same "/attachments" multipart pattern
-// Procore uses for RFIs/Submittals/etc, but hasn't been confirmed for Direct
-// Costs specifically. Report back what happens on the first real approve so
-// this can be corrected if the shape is off.
-async function procoreUploadAttachment(env, token, projectId, directCostId, { bytes, contentType, filename }) {
-  const form = new FormData();
-  form.append("attachment[file]", new Blob([bytes], { type: contentType || "application/octet-stream" }), filename);
-  const res = await fetch(`${env.PROCORE_API_BASE}/rest/v1.0/projects/${projectId}/direct_costs/${directCostId}/attachments`, {
+// Attach files to a Direct Cost — CHANGED 2026-09-17 after the old single-POST
+// "/direct_costs/{id}/attachments" endpoint 404'd on live Procore. Replaced with
+// Procore's documented two-step Uploads flow (developers.procore.com/documentation/
+// tutorial-uploads): create an upload record, PUT the bytes to the storage URL it
+// hands back, then reference the resulting uuid(s). The create-upload and
+// storage-PUT steps are confirmed from Procore's own docs; what's NOT yet
+// confirmed against a live Direct Cost is the final association step — Procore's
+// example for this is a different resource (meeting_topics, `item.upload_ids`),
+// so if THIS step throws, that's the one to probe/report back on.
+async function procoreCreateAndUploadFile(env, token, projectId, { bytes, contentType, filename }) {
+  const createRes = await fetch(`${env.PROCORE_API_BASE}/rest/v1.1/projects/${projectId}/uploads`, {
     method: "POST",
     headers: {
       Accept: "application/json",
+      "Content-Type": "application/json",
       Authorization: `Bearer ${token}`,
       "Procore-Company-Id": env.PROCORE_COMPANY_ID,
-      // no Content-Type — the runtime sets the multipart boundary for a FormData body
     },
-    body: form,
+    body: JSON.stringify({ response_filename: filename, response_content_type: contentType || "application/octet-stream" }),
+  });
+  const createText = await createRes.text();
+  if (!createRes.ok) {
+    const err = new Error(`Procore create-upload POST -> ${createRes.status}: ${createText.slice(0, 300)}`);
+    err.status = createRes.status;
+    throw err;
+  }
+  const upload = createText ? JSON.parse(createText) : {};
+  if (!upload.url || !upload.uuid) {
+    throw new Error(`Procore create-upload returned no url/uuid: ${createText.slice(0, 300)}`);
+  }
+
+  // Storage-service leg — no Procore auth, whatever fields it hands back.
+  const storageForm = new FormData();
+  for (const [k, v] of Object.entries(upload.fields || {})) storageForm.append(k, v);
+  storageForm.append("file", new Blob([bytes], { type: contentType || "application/octet-stream" }), filename);
+  const storageRes = await fetch(upload.url, { method: "POST", body: storageForm });
+  if (!storageRes.ok) {
+    const text = await storageRes.text().catch(() => "");
+    const err = new Error(`Procore storage upload -> ${storageRes.status}: ${text.slice(0, 300)}`);
+    err.status = storageRes.status;
+    throw err;
+  }
+  return upload.uuid;
+}
+
+// Associate already-uploaded file(s) with a Direct Cost in ONE call — batched
+// so a second file's association doesn't blow away the first (upload_ids reads
+// as a set-the-list field on PATCH, not an append).
+async function procoreAttachUploadsToDirectCost(env, token, projectId, directCostId, uploadIds) {
+  const res = await fetch(`${env.PROCORE_API_BASE}/rest/v1.0/projects/${projectId}/direct_costs/${directCostId}`, {
+    method: "PATCH",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+      "Procore-Company-Id": env.PROCORE_COMPANY_ID,
+    },
+    body: JSON.stringify({ item: { upload_ids: uploadIds } }),
   });
   const text = await res.text();
   if (!res.ok) {
-    const err = new Error(`Procore attachment POST -> ${res.status}: ${text.slice(0, 300)}`);
+    const err = new Error(`Procore attach-uploads PATCH -> ${res.status}: ${text.slice(0, 300)}`);
     err.status = res.status;
     throw err;
   }
   return text ? JSON.parse(text) : {};
+}
+
+// Upload every stored file for a submission and attach them to its Direct
+// Cost, batched into one association call. Per-file create/upload failures
+// don't block the others; if the final association call itself fails, every
+// otherwise-successful file is marked failed too since none of them actually
+// ended up on the Direct Cost.
+async function attachSubmissionFiles(env, token, projectId, directCostId, receiptRows) {
+  const attachResults = [];
+  const uploaded = []; // { key, uuid }
+  for (const r of receiptRows) {
+    try {
+      const obj = await env.RECEIPTS.get(r.r2_key);
+      if (!obj) throw new Error("object missing from R2");
+      const bytes = new Uint8Array(await obj.arrayBuffer());
+      const uuid = await procoreCreateAndUploadFile(env, token, projectId, {
+        bytes, contentType: obj.httpMetadata?.contentType, filename: r.r2_key.split("/").pop(),
+      });
+      uploaded.push({ key: r.r2_key, uuid });
+    } catch (e) {
+      attachResults.push({ key: r.r2_key, ok: false, error: e.message });
+    }
+  }
+  if (uploaded.length) {
+    try {
+      await procoreAttachUploadsToDirectCost(env, token, projectId, directCostId, uploaded.map((u) => u.uuid));
+      uploaded.forEach((u) => attachResults.push({ key: u.key, ok: true }));
+    } catch (e) {
+      uploaded.forEach((u) => attachResults.push({ key: u.key, ok: false, error: `Uploaded but not attached — ${e.message}` }));
+    }
+  }
+  return attachResults;
 }
 
 async function fetchProcoreProjects(env, token) {
@@ -660,8 +745,9 @@ function deriveLineNet(line, receipt, province, { shared = false } = {}) {
     const net = rSub != null ? rSub : rGross != null ? round2(rGross - taxRead) : null;
     return { net, tax: taxRead, tax_source: "read" };
   }
-  if (rGross != null && province && FALLBACK_TAX_RATES[province] != null) {
-    const rate = FALLBACK_TAX_RATES[province] / 100;
+  const fallbackRate = province ? fallbackTaxRate(province, line.category) : null;
+  if (rGross != null && fallbackRate != null) {
+    const rate = fallbackRate / 100;
     const net = round2(rGross / (1 + rate));
     return { net, tax: round2(rGross - net), tax_source: "fallback_table" };
   }
@@ -898,10 +984,10 @@ async function parseSubmission(env, sql, submissionId, { formAtt, receiptAtts, b
     return sql`
       insert into line_items
         (submission_id, row_index, line_date, description, category, is_flat_claim, gross_amount, tax_amount, net_amount, tax_source,
-         receipt_id, match_method, match_confidence, cost_code, flags, employee_name, project_number, project_procore_id)
+         receipt_id, match_method, match_confidence, cost_code, tax_code, flags, employee_name, project_number, project_procore_id)
       values
         (${submissionId}, ${l.row_index}, ${l.line_date}, ${l.description}, ${l.category}, ${l.is_flat_claim}, ${l.gross_amount}, ${d.tax}, ${d.net}, ${d.tax_source},
-         ${receiptId}, ${mm?.method || "none"}, ${mm?.confidence ?? null}, ${""}, ${JSON.stringify(lf)}::jsonb, ${employeeName}, ${projectNumber}, ${project?.procore_id || null})`;
+         ${receiptId}, ${mm?.method || "none"}, ${mm?.confidence ?? null}, ${""}, ${""}, ${JSON.stringify(lf)}::jsonb, ${employeeName}, ${projectNumber}, ${project?.procore_id || null})`;
   });
   if (lineInserts.length) await sql.transaction(lineInserts);
 
@@ -1026,7 +1112,7 @@ async function handleReceipt(id, url, env, sql) {
 // Project WBS codes for the review UI's per-line cost-code pickers, plus the
 // resolved default for each category so a line pre-selects the right one.
 async function handleCostCodes(id, env, sql) {
-  const [sub] = await sql`select project_procore_id from submissions where id = ${id}`;
+  const [sub] = await sql`select * from submissions where id = ${id}`;
   if (!sub) return json({ error: "not_found" }, 404);
   if (!sub.project_procore_id) return json({ error: "no_project", detail: "Form isn't linked to a Procore project." }, 422);
 
@@ -1045,7 +1131,18 @@ async function handleCostCodes(id, env, sql) {
                 codes.find((c) => norm(c.code).startsWith(norm(flat).split(".")[0]));
     defaults[cat] = { flat_code: flat, wbs_code_id: hit?.id || null };
   }
-  return json({ codes, defaults });
+
+  let taxCodes = [];
+  try {
+    taxCodes = JSON.parse(env.PROCORE_TAX_CODES || "[]");
+  } catch {
+    taxCodes = [];
+  }
+  const project = await projectForSubmission(sub, sql);
+  const province = (sub.province || project?.province || "").toUpperCase().slice(0, 2) || null;
+  const defaultTaxCodeId = taxCodeIdForProvince(env, province);
+
+  return json({ codes, defaults, tax_codes: taxCodes, default_tax_code_id: defaultTaxCodeId });
 }
 
 // ---------------------------------------------------------------------------
@@ -1118,10 +1215,10 @@ async function handleLineAdd(subId, request, sql, user) {
   const [row] = await sql`
     insert into line_items
       (submission_id, row_index, line_date, description, category, is_flat_claim, gross_amount, tax_amount, net_amount, tax_source,
-       match_method, cost_code, flags, employee_name, project_number, project_procore_id)
+       match_method, cost_code, tax_code, flags, employee_name, project_number, project_procore_id)
     values
       (${subId}, ${Number(max) + 1}, ${line.line_date}, ${line.description}, ${category}, ${isFlat}, ${gross}, ${d.tax}, ${d.net}, ${d.tax_source},
-       'none', ${""}, ${JSON.stringify(lf)}::jsonb, ${sub.employee_name}, ${sub.project_number}, ${sub.project_procore_id})
+       'none', ${""}, ${""}, ${JSON.stringify(lf)}::jsonb, ${sub.employee_name}, ${sub.project_number}, ${sub.project_procore_id})
     returning *`;
   await bumpForm(sql, subId, historyEvent("line_added", `${user.username} added a ${category} line`));
   const form_flags = await recomputeFormFlags(sql, subId);
@@ -1143,6 +1240,7 @@ async function handleLinePatch(subId, lineId, request, sql, user) {
   }
   if (body.gross_amount !== undefined) next.gross_amount = money(body.gross_amount);
   if (body.cost_code !== undefined) next.cost_code = (body.cost_code || "").toString();
+  if (body.tax_code !== undefined) next.tax_code = (body.tax_code || "").toString();
 
   let receipt = null, shared = false;
   if (next.is_flat_claim) {
@@ -1167,7 +1265,7 @@ async function handleLinePatch(subId, lineId, request, sql, user) {
       line_date = ${next.line_date}, description = ${next.description}, category = ${next.category},
       is_flat_claim = ${next.is_flat_claim}, gross_amount = ${next.gross_amount}, tax_amount = ${next.tax_amount},
       net_amount = ${next.net_amount}, tax_source = ${next.tax_source}, receipt_id = ${next.receipt_id},
-      cost_code = ${next.cost_code}, flags = ${JSON.stringify(lf)}::jsonb, updated_at = now()
+      cost_code = ${next.cost_code}, tax_code = ${next.tax_code}, flags = ${JSON.stringify(lf)}::jsonb, updated_at = now()
     where id = ${lineId} returning *`;
   // Switching to a flat-claim category frees this line's receipt — resync
   // whoever's left on it in case that un-shares it.
@@ -1279,16 +1377,18 @@ async function handleApprove(subId, url, request, env, sql, user) {
   const employeeResolution = await resolveEmployeeId(env, token, sub.employee_name);
   const employeeId = employeeResolution.id;
 
-  // Tax code: the form's own province, falling back to the project's cached
-  // province (Ben: "match the form, or project as well").
+  // Tax code: whatever the reviewer picked per-line, else the form's own
+  // province, falling back to the project's cached province (Ben: "match the
+  // form, or project as well").
   const project = await projectForSubmission(sub, sql);
   const taxProvince = (sub.province || project?.province || "").toUpperCase().slice(0, 2) || null;
   const taxCodeId = taxCodeIdForProvince(env, taxProvince);
-  const taxCodeReason = taxCodeId
+  const linesMissingTax = lines.filter((l) => !(l.tax_code || taxCodeId));
+  const taxCodeReason = !linesMissingTax.length
     ? null
     : taxProvince
-      ? `No Procore tax code configured for province "${taxProvince}" (PROCORE_TAX_CODE_IDS).`
-      : "No province on the form or its project — can't pick a tax code.";
+      ? `No Procore tax code configured for province "${taxProvince}" (PROCORE_TAX_CODE_IDS) and ${linesMissingTax.length} line(s) have no manual override.`
+      : `No province on the form or its project, and ${linesMissingTax.length} line(s) have no manual tax code override.`;
 
   const resolved = [];
   for (const l of lines) {
@@ -1309,7 +1409,7 @@ async function handleApprove(subId, url, request, env, sql, user) {
   } catch (e) {
     return json({ error: "vendor_not_configured", detail: e.message }, 500);
   }
-  const lineItems = resolved.map(({ line, wbs }) => buildDirectCostLineItem(line, wbs, sub.expense_id, taxCodeId));
+  const lineItems = resolved.map(({ line, wbs }) => buildDirectCostLineItem(line, wbs, sub.expense_id, line.tax_code || taxCodeId));
 
   if (dryRun) {
     return json({
@@ -1345,20 +1445,7 @@ async function handleApprove(subId, url, request, env, sql, user) {
   // correctly created) financial record — it's flagged instead so it can be
   // attached by hand if needed.
   const receiptRows = await sql`select * from receipts where submission_id = ${subId} order by (kind = 'form') desc, created_at asc`;
-  const attachResults = [];
-  for (const r of receiptRows) {
-    try {
-      const obj = await env.RECEIPTS.get(r.r2_key);
-      if (!obj) throw new Error("object missing from R2");
-      const bytes = new Uint8Array(await obj.arrayBuffer());
-      await procoreUploadAttachment(env, token, sub.project_procore_id, dcId, {
-        bytes, contentType: obj.httpMetadata?.contentType, filename: r.r2_key.split("/").pop(),
-      });
-      attachResults.push({ key: r.r2_key, ok: true });
-    } catch (e) {
-      attachResults.push({ key: r.r2_key, ok: false, error: e.message });
-    }
-  }
+  const attachResults = await attachSubmissionFiles(env, token, sub.project_procore_id, dcId, receiptRows);
   const attachFailures = attachResults.filter((a) => !a.ok);
 
   const hist = [
@@ -1413,20 +1500,7 @@ async function handleRetryAttachments(subId, env, sql, user) {
   const token = await getProcoreToken(env);
   const receiptRows = await sql`select * from receipts where submission_id = ${subId} order by (kind = 'form') desc, created_at asc`;
 
-  const attachResults = [];
-  for (const r of receiptRows) {
-    try {
-      const obj = await env.RECEIPTS.get(r.r2_key);
-      if (!obj) throw new Error("object missing from R2");
-      const bytes = new Uint8Array(await obj.arrayBuffer());
-      await procoreUploadAttachment(env, token, sub.project_procore_id, sub.procore_direct_cost_id, {
-        bytes, contentType: obj.httpMetadata?.contentType, filename: r.r2_key.split("/").pop(),
-      });
-      attachResults.push({ key: r.r2_key, ok: true });
-    } catch (e) {
-      attachResults.push({ key: r.r2_key, ok: false, error: e.message });
-    }
-  }
+  const attachResults = await attachSubmissionFiles(env, token, sub.project_procore_id, sub.procore_direct_cost_id, receiptRows);
   const attachFailures = attachResults.filter((a) => !a.ok);
 
   const hist = [

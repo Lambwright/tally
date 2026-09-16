@@ -23,6 +23,11 @@ export default function DirectCostPreview({ dryRun, sub, costCodes }) {
     const c = costCodes?.codes?.find((c) => c.id === wbsId);
     return c ? `${c.code}${c.description ? ` — ${c.description}` : ""}` : `(code ${wbsId})`;
   };
+  const taxCodeLabel = (id) => {
+    if (!id) return "— (none)";
+    const c = costCodes?.tax_codes?.find((c) => String(c.id) === String(id));
+    return c ? c.name : `(code ${id})`;
+  };
   const total = items.reduce((s, li) => s + (Number(li.data?.line_item?.unit_cost) || 0), 0);
 
   return (
@@ -41,8 +46,8 @@ export default function DirectCostPreview({ dryRun, sub, costCodes }) {
           <span className="kv-value">{sub.employee_name || "—"}{!dryRun.employeeId && dryRun.employeeIdReason ? " ⚠" : ""}</span>
         </div>
         <div className="kv"><span className="kv-label">Type</span><span className="kv-value" style={{ textTransform: "capitalize" }}>{header.direct_cost_type}</span></div>
-        <div className="kv"><span className="kv-label">Tax code</span>
-          <span className="kv-value">{dryRun.taxCodeId || "— (none)"}</span>
+        <div className="kv"><span className="kv-label">Tax code (default)</span>
+          <span className="kv-value">{taxCodeLabel(dryRun.taxCodeId)}</span>
         </div>
       </div>
 
@@ -55,7 +60,7 @@ export default function DirectCostPreview({ dryRun, sub, costCodes }) {
 
       <table className="dc-preview-table">
         <thead>
-          <tr><th>#</th><th>Description</th><th>Cost code</th><th style={{ textAlign: "right" }}>Net amount</th></tr>
+          <tr><th>#</th><th>Description</th><th>Cost code</th><th>Tax code</th><th style={{ textAlign: "right" }}>Net amount</th></tr>
         </thead>
         <tbody>
           {items.map((li, i) => {
@@ -65,6 +70,7 @@ export default function DirectCostPreview({ dryRun, sub, costCodes }) {
                 <td>{li.row}</td>
                 <td>{stripTag(d.description)}</td>
                 <td>{codeLabel(li.wbs_code_id)}</td>
+                <td>{taxCodeLabel(d.tax_code_id)}</td>
                 <td style={{ textAlign: "right" }} className="mono">{money(d.unit_cost, sub.currency)}</td>
               </tr>
             );
@@ -72,7 +78,7 @@ export default function DirectCostPreview({ dryRun, sub, costCodes }) {
         </tbody>
         <tfoot>
           <tr>
-            <td colSpan={3} style={{ textAlign: "right", fontWeight: 700 }}>Total</td>
+            <td colSpan={4} style={{ textAlign: "right", fontWeight: 700 }}>Total</td>
             <td style={{ textAlign: "right", fontWeight: 700 }} className="mono">{money(total, sub.currency)}</td>
           </tr>
         </tfoot>

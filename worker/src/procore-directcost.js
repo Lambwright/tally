@@ -174,10 +174,13 @@ export function buildDirectCostLineItem(line, wbsCodeId, expenseId, taxCodeId = 
   if (!Number.isFinite(net) || net <= 0) {
     throw new Error(`Refusing to build a line item with net_amount=${line.net_amount}`);
   }
+  // No separate date field on a Direct Cost line item (confirmed off a live
+  // one) — the expense's own date goes into the description text instead.
   const label = (line.description || line.category || "expense").toString().slice(0, 120);
+  const dateTag = line.line_date ? `${line.line_date} — ` : "";
   const item = {
     wbs_code_id: String(wbsCodeId),
-    description: `${label} ${dedupToken({ expense_id: expenseId })}`,
+    description: `${dateTag}${label} ${dedupToken({ expense_id: expenseId })}`,
     quantity: 1,
     unit_cost: net.toFixed(2),
     uom: "each", // TODO(ben): payroll uses "hours"; confirm the unit for a lump expense

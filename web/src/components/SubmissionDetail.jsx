@@ -141,6 +141,17 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
     [costCodes]
   );
 
+  // same idea for tax codes — matched by name, e.g. "ONTARIO"
+  const findTaxCodeByText = useCallback((text) => {
+    const norm = String(text || "").trim().toLowerCase();
+    if (!norm) return null;
+    return (costCodes?.tax_codes || []).find((c) => c.name.toLowerCase() === norm) || null;
+  }, [costCodes]);
+  const taxCodeLabelById = useMemo(
+    () => Object.fromEntries((costCodes?.tax_codes || []).map((c) => [String(c.id), c.name])),
+    [costCodes]
+  );
+
   const receiptById = useMemo(() => Object.fromEntries(receipts.map((r) => [r.id, r])), [receipts]);
   // A receipt can legitimately back more than one line (one photo of several
   // receipts) — so "used" only means "at least one line", not "spoken for".
@@ -380,6 +391,13 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
           ))}
         </datalist>
       )}
+      {costCodes && !costCodes.error && (
+        <datalist id="tax-code-options">
+          {(costCodes.tax_codes || []).map((c) => (
+            <option key={c.id} value={c.name} />
+          ))}
+        </datalist>
+      )}
 
       <div className="card">
         <div className="card-title">Lines</div>
@@ -405,7 +423,7 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
                     aria-label="Select all lines" />
                 )}</th>
                 <th>Date</th><th>Description</th><th>Category</th><th>Gross</th>
-                <th>Receipt</th><th>Net</th><th>Cost code</th><th>Flags</th><th></th>
+                <th>Receipt</th><th>Net</th><th>Cost code</th><th>Tax code</th><th>Flags</th><th></th>
               </tr>
             </thead>
             <tbody>
@@ -414,6 +432,8 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
                 const matched = l.receipt_id ? receiptById[l.receipt_id] : null;
                 const codeDefault = costCodes && !costCodes.error ? costCodes.defaults?.[l.category]?.wbs_code_id || "" : "";
                 const codeText = codeLabelById[l.cost_code] || codeLabelById[codeDefault] || "";
+                const taxCodeDefault = costCodes?.default_tax_code_id ? String(costCodes.default_tax_code_id) : "";
+                const taxCodeText = taxCodeLabelById[l.tax_code] || taxCodeLabelById[taxCodeDefault] || "";
                 return (
                   <tr key={l.id} className={busyLine === l.id ? "row-busy" : ""}>
                     <td>
@@ -490,6 +510,16 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
                           }} />
                       )}
                     </td>
+                    <td>
+                      <input list="tax-code-options" defaultValue={taxCodeText} disabled={!actionable}
+                        placeholder="Auto (province)"
+                        onBlur={(e) => {
+                          const text = e.target.value.trim();
+                          if (!text) { if (l.tax_code) patchLine(l.id, { tax_code: "" }); return; }
+                          const match = findTaxCodeByText(text);
+                          if (match && String(match.id) !== (l.tax_code || taxCodeDefault)) patchLine(l.id, { tax_code: String(match.id) });
+                        }} />
+                    </td>
                     <td className="line-flags-cell">
                       {(l.flags || []).map((f, i) => (
                         <span key={i} className={`flag-pill flag-${f.severity || "low"}`} title={f.detail}>
@@ -506,7 +536,7 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
                 );
               })}
               {lines.length === 0 && (
-                <tr><td colSpan={10} className="row-secondary" style={{ padding: 12 }}>No lines yet — add them below.</td></tr>
+                <tr><td colSpan={11} className="row-secondary" style={{ padding: 12 }}>No lines yet — add them below.</td></tr>
               )}
             </tbody>
           </table>
