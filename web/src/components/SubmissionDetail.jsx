@@ -28,6 +28,8 @@ const FLAG_LABELS = {
   geo_mismatch: "Location doesn't match the project",
 };
 
+const PARSE_FAILURE_FLAGS = new Set(["parse_failed", "claude_failed", "form_parse_failed"]);
+
 const dateOnly = (s) => (s ? String(s).slice(0, 10) : "");
 
 function money(n, currency = "CAD") {
@@ -199,6 +201,19 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
       setBusy(false);
     }
   }
+  async function handleRetryParse() {
+    setBusy(true);
+    setActionError(null);
+    try {
+      await api.reparseSubmission(id);
+      onChanged?.();
+      load();
+    } catch (e) {
+      setActionError(e.data?.detail || e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
   async function handleAddLine() {
     if (!newLine.category) return;
     setBusy(true);
@@ -253,6 +268,15 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
       {sub.flags?.some((f) => f.code === "parsing") && (
         <div className="card" style={{ color: "var(--yellow)" }}>
           Still reading the form and receipts in the background — <button className="btn btn-ghost btn-sm" onClick={load}>refresh</button> in a minute to see the lines.
+        </div>
+      )}
+
+      {sub.flags?.some((f) => PARSE_FAILURE_FLAGS.has(f.code)) && (
+        <div className="card" style={{ color: "var(--red)", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
+          <span>Automatic parsing didn't finish (often a temporary API issue) — the original form and receipts are still saved.</span>
+          <button className="btn btn-ghost btn-sm" onClick={handleRetryParse} disabled={busy}>
+            {busy ? "Retrying…" : "↻ Retry parse"}
+          </button>
         </div>
       )}
 

@@ -10,6 +10,8 @@
 //   POST   /intake                              (X-Tally-Service-Key) PA forwards one email + attachments;
 //                                               returns 201 fast, parses the form + receipts in the background
 //   PATCH  /submissions/:id                     (Einbau ID) { expense_id?, employee_name?, project_number? } header corrections
+//   DELETE /submissions/:id                     (Einbau ID) hard-delete (cascade + R2 cleanup) — frees the Expense ID
+//   POST   /submissions/:id/reparse             (Einbau ID) re-run the Claude parse against the already-stored attachments
 //   GET    /submissions?status=                 (Einbau ID) queue list — per-form summary
 //   GET    /submissions/:id                     (Einbau ID) { submission, line_items[], receipts[] }
 //   GET    /submissions/:id/receipt?key=        (Einbau ID) stream an attachment from R2 (private bucket)
@@ -437,6 +439,15 @@ function base64ToBytes(b64) {
   const bytes = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
   return bytes;
+}
+
+function bytesToBase64(bytes) {
+  let binary = "";
+  const chunk = 0x8000; // avoid a call-stack blowup on String.fromCharCode(...bigArray)
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
 }
 
 function normalizeAttachments(body) {
@@ -1208,6 +1219,47 @@ async function handleReject(subId, request, sql, user) {
   return json({ rejected: true, submission: row });
 }
 
+// Re-run the parse on a submission whose attachments are already in R2 (Claude
+// failed the first time — API credits, a transient error, whatever). Reads the
+// stored files back, clears the (empty/partial) line_items so nothing duplicates,
+// and reruns the same extraction + matching against the SAME row. Synchronous —
+// this is a manual retry from the UI, not PA, so there's no 2-minute deadline to
+// dodge; the caller just waits for the result.
+async function handleReparse(subId, env, sql, user) {
+  const [sub] = await sql`select * from submissions where id = ${subId}`;
+  if (!sub) return json({ error: "not_found" }, 404);
+
+  const receiptRows = await sql`select * from receipts where submission_id = ${subId} order by (kind = 'form') desc, created_at asc`;
+  if (!receiptRows.length) return json({ error: "no_attachments", detail: "Nothing stored to re-parse." }, 422);
+
+  const atts = [];
+  for (const r of receiptRows) {
+    const obj = await env.RECEIPTS.get(r.r2_key);
+    if (!obj) continue;
+    const bytes = new Uint8Array(await obj.arrayBuffer());
+    atts.push({
+      kind: r.kind,
+      contentType: obj.httpMetadata?.contentType || (r.kind === "form" ? "application/pdf" : "image/jpeg"),
+      base64: bytesToBase64(bytes),
+    });
+  }
+  const formAtt = atts.find((a) => a.kind === "form") || null;
+  const receiptAtts = atts.filter((a) => a.kind === "receipt");
+  if (!formAtt && receiptAtts.length === 0) {
+    return json({ error: "attachments_missing", detail: "Stored files couldn't be read back from R2." }, 502);
+  }
+
+  await sql`delete from line_items where submission_id = ${subId}`;
+  await sql`update submissions set flags = ${JSON.stringify([{ code: "parsing", severity: "low", detail: "Re-parsing…" }])}::jsonb, updated_at = now() where id = ${subId}`;
+  await bumpForm(sql, subId, historyEvent("reparse", `${user.username} triggered a re-parse`));
+
+  await parseSubmission(env, sql, subId, { formAtt, receiptAtts, body: {} });
+
+  const [freshSub] = await sql`select * from submissions where id = ${subId}`;
+  const line_items = await sql`select * from line_items where submission_id = ${subId} order by row_index asc nulls last, created_at asc`;
+  return json({ submission: freshSub, line_items });
+}
+
 // Hard delete — the row, its lines/receipts (cascade), and the R2 objects. For
 // spam / garbage / a test you want to recycle. Reject keeps the record; this
 // removes it and frees the Expense ID.
@@ -1288,6 +1340,7 @@ export default {
           if (!seg && request.method === "GET") return withRefresh(await handleDetail(subId, sql));
           if (!seg && request.method === "PATCH") return withRefresh(await handleSubmissionPatch(subId, request, sql, auth.user));
           if (!seg && request.method === "DELETE") return withRefresh(await handleSubmissionDelete(subId, env, sql, auth.user));
+          if (seg === "reparse" && request.method === "POST") return withRefresh(await handleReparse(subId, env, sql, auth.user));
           if (seg === "receipt" && request.method === "GET") return await handleReceipt(subId, url, env, sql);
           if (seg === "cost-codes" && request.method === "GET") return withRefresh(await handleCostCodes(subId, env, sql));
           if (seg === "approve" && request.method === "POST") return withRefresh(await handleApprove(subId, url, request, env, sql, auth.user));
