@@ -28,6 +28,7 @@ const FLAG_LABELS = {
   low_confidence: "Low extraction confidence",
   geo_mismatch: "Location doesn't match the project",
   attachments_failed: "Some files didn't attach in Procore — attach by hand",
+  receipt_shared: "Receipt also backs another line",
 };
 
 const PARSE_FAILURE_FLAGS = new Set(["parse_failed", "claude_failed", "form_parse_failed"]);
@@ -116,8 +117,11 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
   }, [id, data?.receipts?.map((r) => r.r2_key).join(",")]);
 
   const receiptById = useMemo(() => Object.fromEntries(receipts.map((r) => [r.id, r])), [receipts]);
-  const usedReceiptIds = useMemo(() => new Set(lines.map((l) => l.receipt_id).filter(Boolean)), [lines]);
-  const unmatchedReceipts = receipts.filter((r) => r.kind === "receipt" && !usedReceiptIds.has(r.id));
+  // A receipt can legitimately back more than one line (one photo of several
+  // receipts) — so "used" only means "at least one line", not "spoken for".
+  // Every receipt stays pickable for every line.
+  const linesForReceipt = (receiptId) => lines.filter((l) => l.receipt_id === receiptId);
+  const pickableReceipts = receipts.filter((r) => r.kind === "receipt");
   const formDoc = receipts.find((r) => r.kind === "form");
 
   // ordered attachment list for the lightbox: form first, then receipts
@@ -127,12 +131,12 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
       .map((r) => {
         const res = receiptUrls[r.r2_key];
         if (!res) return null;
-        const line = lines.find((l) => l.receipt_id === r.id);
+        const forLines = linesForReceipt(r.id);
         return {
           url: res.url,
           type: res.type,
           name: r.r2_key.split("/").pop(),
-          label: r.kind === "form" ? "Expense form" : `${r.vendor || "Receipt"}${line ? ` → line ${line.row_index}` : ""}`,
+          label: r.kind === "form" ? "Expense form" : `${r.vendor || "Receipt"}${forLines.length ? ` → line ${forLines.map((l) => l.row_index).join(", ")}` : ""}`,
           receiptId: r.id,
         };
       })
@@ -344,9 +348,15 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
                         <select defaultValue="" disabled={!actionable}
                           onChange={(e) => e.target.value && mutate(() => api.matchLine(id, l.id, e.target.value))}>
                           <option value="">— match a receipt —</option>
-                          {unmatchedReceipts.map((r) => (
-                            <option key={r.id} value={r.id}>{r.vendor || "receipt"} · {money(r.gross)}</option>
-                          ))}
+                          {pickableReceipts.map((r) => {
+                            const usedOn = linesForReceipt(r.id);
+                            return (
+                              <option key={r.id} value={r.id}>
+                                {r.vendor || "receipt"} · {money(r.gross)}
+                                {usedOn.length ? ` (also line ${usedOn.map((x) => x.row_index).join(", ")})` : ""}
+                              </option>
+                            );
+                          })}
                         </select>
                       )}
                     </td>
@@ -413,16 +423,20 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
             </button>
           )}
           {receipts.filter((r) => r.kind === "receipt").map((r) => {
-            const line = lines.find((l) => l.receipt_id === r.id);
-            const label = <span className="receipt-thumb-label">{money(r.gross)}{line ? ` → line ${line.row_index}` : ""}</span>;
+            const forLines = linesForReceipt(r.id);
+            const label = (
+              <span className="receipt-thumb-label">
+                {money(r.gross)}{forLines.length ? ` → line ${forLines.map((l) => l.row_index).join(", ")}` : ""}
+              </span>
+            );
             return receiptUrls[r.r2_key]?.url ? (
-              <button type="button" className={`receipt-thumb ${line ? "is-matched" : "is-unmatched"}`} key={r.id}
+              <button type="button" className={`receipt-thumb ${forLines.length ? "is-matched" : "is-unmatched"}`} key={r.id}
                 onClick={() => openLightbox(r.id)} title={r.vendor || "Open receipt"}>
                 <img src={receiptUrls[r.r2_key].url} alt="" />
                 {label}
               </button>
             ) : (
-              <div className={`receipt-thumb ${line ? "is-matched" : "is-unmatched"}`} key={r.id} title={`${r.vendor || "receipt"} — didn't load`}>
+              <div className={`receipt-thumb ${forLines.length ? "is-matched" : "is-unmatched"}`} key={r.id} title={`${r.vendor || "receipt"} — didn't load`}>
                 <span>?</span>
                 {label}
               </div>

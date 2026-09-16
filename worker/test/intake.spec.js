@@ -185,6 +185,23 @@ describe("deriveLineNet", () => {
     const d = deriveLineNet({ is_flat_claim: false, gross_amount: 50 }, { gross: null, subtotal: null, tax_json: [] }, null);
     expect(d).toEqual({ net: null, tax: null, tax_source: "none" });
   });
+
+  it("shared receipt: ignores the receipt's combined total, estimates from this line's own amount", () => {
+    // One photo of $66.50 gas + $16.81 parking (combined receipt total $83.31,
+    // $10.81 tax) backing two different lines — neither line's own amount
+    // equals the receipt's total, and trusting the receipt's read tax/subtotal
+    // for both would double count it.
+    const receipt = { gross: 83.31, subtotal: 72.5, tax_json: [{ label: "HST", amount: 10.81 }] };
+    const gasLine = deriveLineNet({ is_flat_claim: false, gross_amount: 66.5 }, receipt, "ON", { shared: true });
+    const parkingLine = deriveLineNet({ is_flat_claim: false, gross_amount: 16.81 }, receipt, "ON", { shared: true });
+    expect(gasLine.tax_source).toBe("fallback_table");
+    expect(parkingLine.tax_source).toBe("fallback_table");
+    expect(gasLine.net).toBeLessThan(66.5);
+    expect(parkingLine.net).toBeLessThan(16.81);
+    // Not shared -> the old (wrong) behaviour of applying the whole receipt to one line.
+    const solo = deriveLineNet({ is_flat_claim: false, gross_amount: 66.5 }, receipt, "ON", { shared: false });
+    expect(solo.net).toBe(72.5);
+  });
 });
 
 describe("computeLineFlags", () => {
@@ -218,6 +235,14 @@ describe("computeLineFlags", () => {
     const codes = computeLineFlags(line, null, "ON", project).map((f) => f.code);
     expect(codes).not.toContain("receipt_unmatched");
     expect(codes).not.toContain("tax_unknown");
+  });
+
+  it("shared receipt gets an informational flag, not receipt_unmatched", () => {
+    const line = { category: "fuel", is_flat_claim: false, receipt_id: "r1", tax_source: "fallback_table", gross_amount: 66.5, net_amount: 58, tax_amount: 8.5 };
+    const codes = computeLineFlags(line, { gross: 83.31 }, "ON", project, { shared: true }).map((f) => f.code);
+    expect(codes).toContain("receipt_shared");
+    expect(codes).toContain("tax_estimated");
+    expect(codes).not.toContain("receipt_unmatched");
   });
 });
 

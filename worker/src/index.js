@@ -594,7 +594,12 @@ function matchLinesToReceipts(lines, receipts, claudeMatches = []) {
 }
 
 // receipt: a receipts row (tax_json) OR a claude receipt object (tax_lines). Either.
-function deriveLineNet(line, receipt, province) {
+// `shared` = this receipt is also matched to at least one other line (someone
+// photographed several receipts in one shot and it backs more than one row).
+// In that case the receipt's single parsed gross/subtotal/tax is a COMBINED
+// total across lines — applying it to this line too would double-count it.
+// Fall back to the province rate on THIS line's own claimed amount instead.
+function deriveLineNet(line, receipt, province, { shared = false } = {}) {
   if (line.is_flat_claim) {
     const g = money(line.gross_amount);
     return { net: g, tax: g == null ? null : 0, tax_source: "none" };
@@ -603,10 +608,10 @@ function deriveLineNet(line, receipt, province) {
 
   const taxLines = receipt.tax_json || receipt.tax_lines;
   const taxRead = sumTaxLines(taxLines);
-  const rGross = money(receipt.gross) ?? money(line.gross_amount);
-  const rSub = money(receipt.subtotal);
+  const rGross = shared ? money(line.gross_amount) : money(receipt.gross) ?? money(line.gross_amount);
+  const rSub = shared ? null : money(receipt.subtotal);
 
-  if (Array.isArray(taxLines) && taxLines.length > 0 && taxRead > 0) {
+  if (!shared && Array.isArray(taxLines) && taxLines.length > 0 && taxRead > 0) {
     const net = rSub != null ? rSub : rGross != null ? round2(rGross - taxRead) : null;
     return { net, tax: taxRead, tax_source: "read" };
   }
@@ -643,25 +648,34 @@ function computeFormFlags(sub, project, receipts, lines) {
   return flags;
 }
 
-function computeLineFlags(line, receipt, formProvince, project) {
+function computeLineFlags(line, receipt, formProvince, project, { shared = false } = {}) {
   const flags = [];
   const add = (code, severity, detail) => flags.push({ code, severity, detail });
   const flat = line.is_flat_claim;
 
   if (!flat && !line.receipt_id) add("receipt_unmatched", "high", "No receipt matched to this line.");
   if (!flat && line.receipt_id) {
-    if (line.tax_source === "fallback_table") add("tax_estimated", "high", "Net is a province-rate estimate — the receipt didn't itemize tax.");
+    if (shared) add("receipt_shared", "low", "This photo also backs another line — net is a province-rate estimate, not read off it directly.");
+    if (line.tax_source === "fallback_table") {
+      add("tax_estimated", "high", shared
+        ? "Net is a province-rate estimate — can't isolate this line's tax from a receipt shared with another line."
+        : "Net is a province-rate estimate — the receipt didn't itemize tax.");
+    }
     if (line.tax_source === "none") add("tax_unknown", "high", "Receipt matched but no tax figure could be read.");
   }
 
   if (receipt) {
+    // A shared receipt's total is the combined total of everything in the photo
+    // by design — comparing it to any one line's own amount is meaningless, so
+    // skip that check when shared (the net-vs-gross-vs-tax self-consistency
+    // check below still applies — it's about THIS line's own numbers).
     const lg = money(line.gross_amount), rg = money(receipt.gross);
-    if (lg !== null && rg !== null && Math.abs(lg - rg) > 0.02)
+    if (!shared && lg !== null && rg !== null && Math.abs(lg - rg) > 0.02)
       add("amount_mismatch", "medium", `Form line ${lg} vs receipt total ${rg}.`);
     const ln = money(line.net_amount), lt = money(line.tax_amount);
     if (lg !== null && ln !== null && lt !== null && Math.abs(ln + lt - lg) > 0.02)
       add("amount_mismatch", "low", `net ${ln} + tax ${lt} != gross ${lg}.`);
-    const conf = receipt.confidence;
+    const conf = receipt.confidence; // still meaningful when shared — a blurry photo is blurry either way
     if (conf != null && Number(conf) < LOW_CONFIDENCE_THRESHOLD)
       add("low_confidence", "medium", `Receipt read confidence ${conf}.`);
   }
@@ -1004,6 +1018,27 @@ async function recomputeFormFlags(sql, submissionId) {
   return flags;
 }
 
+// Recompute net/tax/flags for every line currently pointing at `receiptId`,
+// given its CURRENT sharing membership. Call this after any match/unmatch/
+// delete that could change how many lines a receipt backs — a line matched
+// while it was the receipt's only user needs to drop back to an estimate the
+// moment a second line claims the same photo, and vice versa when un-shared.
+async function resyncLinesForReceipt(sql, subId, receiptId, province, project) {
+  if (!receiptId) return;
+  const [receipt] = await sql`select * from receipts where id = ${receiptId}`;
+  if (!receipt) return;
+  const siblings = await sql`select * from line_items where submission_id = ${subId} and receipt_id = ${receiptId}`;
+  const shared = siblings.length > 1;
+  for (const l of siblings) {
+    const d = deriveLineNet(l, receipt, province, { shared });
+    const lf = computeLineFlags({ ...l, net_amount: d.net, tax_amount: d.tax, tax_source: d.tax_source }, receipt, province, project, { shared });
+    await sql`
+      update line_items set net_amount = ${d.net}, tax_amount = ${d.tax}, tax_source = ${d.tax_source},
+        flags = ${JSON.stringify(lf)}::jsonb, updated_at = now()
+      where id = ${l.id}`;
+  }
+}
+
 async function bumpForm(sql, submissionId, event) {
   await sql`
     update submissions
@@ -1062,22 +1097,24 @@ async function handleLinePatch(subId, lineId, request, sql, user) {
   if (body.gross_amount !== undefined) next.gross_amount = money(body.gross_amount);
   if (body.cost_code !== undefined) next.cost_code = (body.cost_code || "").toString();
 
-  let receipt = null;
+  let receipt = null, shared = false;
   if (next.is_flat_claim) {
     next.receipt_id = null;
   } else if (next.receipt_id) {
     [receipt] = await sql`select * from receipts where id = ${next.receipt_id}`;
+    const [{ count }] = await sql`select count(*)::int as count from line_items where submission_id = ${subId} and receipt_id = ${next.receipt_id} and id != ${lineId}`;
+    shared = count > 0;
   }
 
   if (body.net_amount !== undefined) {
     next.net_amount = money(body.net_amount); // manual override, keep tax_source as-is
   } else {
-    const d = deriveLineNet(next, receipt, sub.province);
+    const d = deriveLineNet(next, receipt, sub.province, { shared });
     next.net_amount = d.net; next.tax_amount = d.tax; next.tax_source = d.tax_source;
   }
 
   const project = await projectForSubmission(sub, sql);
-  const lf = computeLineFlags(next, receipt, sub.province, project);
+  const lf = computeLineFlags(next, receipt, sub.province, project, { shared });
   const [row] = await sql`
     update line_items set
       line_date = ${next.line_date}, description = ${next.description}, category = ${next.category},
@@ -1085,14 +1122,25 @@ async function handleLinePatch(subId, lineId, request, sql, user) {
       net_amount = ${next.net_amount}, tax_source = ${next.tax_source}, receipt_id = ${next.receipt_id},
       cost_code = ${next.cost_code}, flags = ${JSON.stringify(lf)}::jsonb, updated_at = now()
     where id = ${lineId} returning *`;
+  // Switching to a flat-claim category frees this line's receipt — resync
+  // whoever's left on it in case that un-shares it.
+  if (line.receipt_id && next.receipt_id !== line.receipt_id) {
+    await resyncLinesForReceipt(sql, subId, line.receipt_id, sub.province, project);
+  }
   await bumpForm(sql, subId, historyEvent("line_edited", `${user.username} edited line ${line.row_index}`));
   const form_flags = await recomputeFormFlags(sql, subId);
   return json({ line: row, form_flags });
 }
 
 async function handleLineDelete(subId, lineId, sql, user) {
+  const [line] = await sql`select receipt_id from line_items where id = ${lineId} and submission_id = ${subId}`;
   const rows = await sql`delete from line_items where id = ${lineId} and submission_id = ${subId} returning id`;
   if (!rows.length) return json({ error: "not_found" }, 404);
+  if (line?.receipt_id) {
+    const [sub] = await sql`select * from submissions where id = ${subId}`;
+    const project = await projectForSubmission(sub, sql);
+    await resyncLinesForReceipt(sql, subId, line.receipt_id, sub.province, project); // may un-share it
+  }
   await bumpForm(sql, subId, historyEvent("line_deleted", `${user.username} deleted a line`));
   const form_flags = await recomputeFormFlags(sql, subId);
   return json({ deleted: true, form_flags });
@@ -1108,15 +1156,27 @@ async function handleLineMatch(subId, lineId, request, sql, user) {
   if (!receipt) return json({ error: "receipt_not_found" }, 404);
   const [sub] = await sql`select * from submissions where id = ${subId}`;
 
-  const d = deriveLineNet({ ...line, receipt_id: receipt.id }, receipt, sub.province);
+  // Someone can photograph several receipts in one shot — a receipt is allowed
+  // to back more than one line. When it does, its single combined total can't
+  // be trusted as any one line's exact net (see deriveLineNet's `shared` note).
+  const [{ count }] = await sql`select count(*)::int as count from line_items where submission_id = ${subId} and receipt_id = ${receipt.id} and id != ${lineId}`;
+  const shared = count > 0;
+
+  const d = deriveLineNet({ ...line, receipt_id: receipt.id }, receipt, sub.province, { shared });
   const project = await projectForSubmission(sub, sql);
-  const lf = computeLineFlags({ ...line, receipt_id: receipt.id, net_amount: d.net, tax_amount: d.tax, tax_source: d.tax_source }, receipt, sub.province, project);
+  const lf = computeLineFlags({ ...line, receipt_id: receipt.id, net_amount: d.net, tax_amount: d.tax, tax_source: d.tax_source }, receipt, sub.province, project, { shared });
   const [row] = await sql`
     update line_items set receipt_id = ${receipt.id}, match_method = 'manual', match_confidence = 1,
       net_amount = ${d.net}, tax_amount = ${d.tax}, tax_source = ${d.tax_source},
       flags = ${JSON.stringify(lf)}::jsonb, updated_at = now()
     where id = ${lineId} returning *`;
-  await bumpForm(sql, subId, historyEvent("line_matched", `${user.username} matched line ${line.row_index} to a receipt`));
+  // Resync everyone else sharing the new receipt (this line joining may newly
+  // share it), and whoever was left on the old one (this line leaving may un-share it).
+  await resyncLinesForReceipt(sql, subId, receipt.id, sub.province, project);
+  if (line.receipt_id && line.receipt_id !== receipt.id) {
+    await resyncLinesForReceipt(sql, subId, line.receipt_id, sub.province, project);
+  }
+  await bumpForm(sql, subId, historyEvent("line_matched", `${user.username} matched line ${line.row_index} to a receipt${shared ? " (shared with another line)" : ""}`));
   const form_flags = await recomputeFormFlags(sql, subId);
   return json({ line: row, form_flags });
 }
@@ -1132,6 +1192,7 @@ async function handleLineUnmatch(subId, lineId, sql, user) {
       net_amount = null, tax_amount = null, tax_source = 'none',
       flags = ${JSON.stringify(lf)}::jsonb, updated_at = now()
     where id = ${lineId} returning *`;
+  if (line.receipt_id) await resyncLinesForReceipt(sql, subId, line.receipt_id, sub.province, project); // may un-share it
   await bumpForm(sql, subId, historyEvent("line_unmatched", `${user.username} cleared the receipt on line ${line.row_index}`));
   const form_flags = await recomputeFormFlags(sql, subId);
   return json({ line: row, form_flags });
