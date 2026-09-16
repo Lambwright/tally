@@ -450,6 +450,25 @@ function bytesToBase64(bytes) {
   return btoa(binary);
 }
 
+// Outlook embeds signature logos / "sent from" graphics as ordinary attachments,
+// and every reply in a thread re-embeds the whole thread's images again — left
+// unfiltered they pile up (worse with every back-and-forth) and can crowd real
+// receipts out of MAX_RECEIPTS. `isInline`/`contentId` is the reliable signal
+// Outlook actually provides, but PA has to be told to pass it through in its
+// Select step; until/unless that happens, fall back to how these things look:
+// Outlook's own auto-generated inline-image name, or just small.
+function isDecorativeAttachment(att) {
+  if (att.isInline) return true;
+  if (!/^image\//i.test(att.contentType || "")) return false; // only ever filters images — never the form PDF etc.
+  const sizeBytes = Math.floor((att.base64.length * 3) / 4);
+  const name = att.name.toLowerCase();
+  const isPng = /png/i.test(att.contentType);
+  if (/^image\d{2,5}(\.\w+)?$/i.test(name) && sizeBytes < 150 * 1024) return true; // Outlook's own naming for pasted graphics
+  if (sizeBytes < 8 * 1024) return true; // nowhere near a phone photo
+  if (isPng && sizeBytes < 100 * 1024) return true; // receipts are ~always JPEG; small PNGs are logos
+  return false;
+}
+
 function normalizeAttachments(body) {
   const list = body.attachments || body.attachment || [];
   const arr = Array.isArray(list) ? list : [list];
@@ -459,8 +478,10 @@ function normalizeAttachments(body) {
       name: (a.name || a.fileName || `attachment-${i}`).replace(/[^\w.\- ]+/g, "_"),
       contentType: a.contentType || a.contentBytesType || "application/octet-stream",
       base64: a.contentBytes || a.content || a.$content || a.data || "",
+      isInline: a.isInline === true || a.IsInline === true || Boolean(a.contentId || a.ContentId || a.contentID),
     }))
-    .filter((a) => a.base64);
+    .filter((a) => a.base64)
+    .filter((a) => !isDecorativeAttachment(a));
 }
 
 function money(v) {

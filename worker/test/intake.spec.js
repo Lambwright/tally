@@ -74,6 +74,38 @@ describe("normalizeAttachments", () => {
   it("drops empty attachments", () => {
     expect(normalizeAttachments({ attachment: { name: "x", contentBytes: "" } })).toHaveLength(0);
   });
+
+  // ~N bytes of base64 — exact count doesn't matter, just clearly above/below a threshold.
+  const fakeB64 = (bytes) => "A".repeat(Math.ceil(bytes / 3) * 4);
+
+  it("drops Outlook's auto-named inline signature/logo graphics", () => {
+    const out = normalizeAttachments({
+      attachments: [
+        { name: "image001.png", contentType: "image/png", contentBytes: fakeB64(5 * 1024) },
+        { name: "IMG_20260908_171117.jpg", contentType: "image/jpeg", contentBytes: fakeB64(500 * 1024) },
+      ],
+    });
+    expect(out).toHaveLength(1);
+    expect(out[0].name).toBe("IMG_20260908_171117.jpg");
+  });
+
+  it("drops anything explicitly flagged inline, regardless of size", () => {
+    const out = normalizeAttachments({
+      attachments: [{ name: "receipt.jpg", contentType: "image/jpeg", contentBytes: fakeB64(500 * 1024), isInline: true }],
+    });
+    expect(out).toHaveLength(0);
+  });
+
+  it("drops tiny images outright and small PNGs, keeps a real form PDF near that size", () => {
+    const out = normalizeAttachments({
+      attachments: [
+        { name: "tiny.jpg", contentType: "image/jpeg", contentBytes: fakeB64(2 * 1024) },
+        { name: "logo.png", contentType: "image/png", contentBytes: fakeB64(40 * 1024) },
+        { name: "expense-form.pdf", contentType: "application/pdf", contentBytes: fakeB64(175 * 1024) },
+      ],
+    });
+    expect(out.map((a) => a.name)).toEqual(["expense-form.pdf"]);
+  });
 });
 
 describe("matchLinesToReceipts", () => {
