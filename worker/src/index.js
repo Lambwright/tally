@@ -228,6 +228,18 @@ async function requireLogin(request, env) {
     if (!data.valid) return { ok: false, reason: "Session is invalid or expired — please log in again." };
     if (!data.user) return { ok: false, reason: "auth-worker returned no user for this session." };
 
+    // Per-app access list from HELM (auth-worker/README.md, "The user object,
+    // and the apps field"). Absent apps = unrestricted (every user today) —
+    // only deny when it's a present array that doesn't include "TALLY".
+    // Additive alongside the ALLOWED_USERS/ALLOWED_ROLES check below, not a
+    // replacement for it.
+    if (data.user.apps !== undefined) {
+      const apps = Array.isArray(data.user.apps) ? data.user.apps : [];
+      if (!apps.includes("TALLY")) {
+        return { ok: false, reason: `"${data.user.username}" doesn't have TALLY access (HELM apps list).` };
+      }
+    }
+
     // TALLY is used by a named few (Ben + Josh). ALLOWED_USERS is the real gate —
     // a comma list of Einbau ID usernames. ALLOWED_ROLES stays as a coarser
     // fallback when ALLOWED_USERS isn't set.
