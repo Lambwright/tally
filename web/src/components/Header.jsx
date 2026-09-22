@@ -10,6 +10,7 @@ function appLinks(user) {
     { name: "SCOUT", url: "https://lambwright.github.io/scout-addin/app.html" },
     { name: "INTAKE", url: "https://lambwright.github.io/scout-intake/" },
     { name: "TALLY", url: "https://lambwright.github.io/tally/", current: true },
+    { name: "HELM", url: "https://lambwright.github.io/helm/" },
   ];
 }
 
