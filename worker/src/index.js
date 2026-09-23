@@ -9,6 +9,7 @@
 // Routes:
 //   POST   /intake                              (X-Tally-Service-Key) PA forwards one email + attachments;
 //                                               returns 201 fast, parses the form + receipts in the background
+//   POST   /submissions/upload                  (Einbau ID) same pipeline as /intake, for files dropped in the app
 //   PATCH  /submissions/:id                     (Einbau ID) { expense_id?, employee_name?, project_number? } header corrections
 //   DELETE /submissions/:id                     (Einbau ID) hard-delete (cascade + R2 cleanup) — frees the Expense ID
 //   DELETE /submissions/:id/receipts/:receiptId (Einbau ID) remove one attachment (unmatches any line it backed)
@@ -838,10 +839,62 @@ function computeLineFlags(line, receipt, formProvince, project, { shared = false
 // /intake
 // ---------------------------------------------------------------------------
 
-// /intake returns FAST: store the attachments, create a skeleton submission,
-// respond 201, then do the (slow) Claude parse + matching in the background via
-// ctx.waitUntil. This is what stops Power Automate from timing out at ~2min and
-// retrying the whole thing 7 times.
+// Shared by /intake (PA, service key) and /submissions/upload (Einbau ID, the
+// app's own drag-and-drop). Stores the attachments, creates a skeleton
+// submission, kicks off the (slow) Claude parse in the background via
+// ctx.waitUntil, and returns fast — for /intake that's what stops Power
+// Automate from timing out at ~2min and retrying the whole thing 7 times; for
+// the app it's what lets the UI navigate to the review page immediately.
+async function createSubmissionFromAttachments(env, sql, ctx, {
+  atts, employeeName = null, employeeEmail = null, province = null, projectNumber = null,
+  rawEmail = null, expenseIdHint = null, historyText,
+}) {
+  const formAtt = atts.find((a) => (a.contentType || "").toLowerCase().includes("pdf")) || null;
+  const receiptAtts = atts.filter((a) => a !== formAtt).slice(0, MAX_RECEIPTS);
+  const storeAtts = formAtt ? [formAtt, ...receiptAtts] : [...receiptAtts];
+
+  // R2 keys are opaque — a UUID prefix, unrelated to the Expense ID (which we may
+  // not know yet). Sequential puts keep the subrequest peak low.
+  const keyPrefix = crypto.randomUUID();
+  const stored = [];
+  for (const a of storeAtts) {
+    const key = `${keyPrefix}/${a.name}`;
+    await env.RECEIPTS.put(key, base64ToBytes(a.base64), { httpMetadata: { contentType: a.contentType } });
+    stored.push({ key, kind: a === formAtt ? "form" : "receipt" });
+  }
+
+  const expenseId = expenseIdHint || `pending-${keyPrefix}`;
+  let project = null;
+  if (projectNumber) {
+    const [p] = await sql`select * from projects_cache where project_number = ${projectNumber} limit 1`;
+    project = p || null;
+  }
+
+  const history = [historyEvent("intake", historyText)];
+  const [sub] = await sql`
+    insert into submissions
+      (expense_id, employee_name, employee_email, province, project_number, project_procore_id, project_name, project_stage,
+       status, flags, raw_email, history, submitted_at)
+    values
+      (${expenseId}, ${employeeName}, ${employeeEmail}, ${(province || "").toUpperCase().slice(0, 2) || null},
+       ${projectNumber}, ${project?.procore_id || null}, ${project?.name || null}, ${project?.stage || null},
+       'needs_review', ${JSON.stringify([{ code: "parsing", severity: "low", detail: "Reading the form and receipts — refresh in a minute." }])}::jsonb,
+       ${rawEmail}, ${JSON.stringify(history)}::jsonb, now())
+    returning *`;
+
+  await sql.transaction(
+    stored.map((s) => sql`insert into receipts (submission_id, r2_key, kind) values (${sub.id}, ${s.key}, ${s.kind})`)
+  );
+
+  // The slow part — off the request path.
+  ctx.waitUntil(
+    parseSubmission(env, sql, sub.id, { formAtt, receiptAtts })
+      .catch((err) => console.error("background parse failed for", sub.id, err && err.message))
+  );
+
+  return sub;
+}
+
 async function handleIntake(request, env, sql, ctx) {
   const body = await parseBody(request);
   const rawEmail = body.body || null;
@@ -869,55 +922,41 @@ async function handleIntake(request, env, sql, ctx) {
   const atts = normalizeAttachments(body);
   if (atts.length === 0) return json({ error: "no_attachments", detail: "No form or receipts on the email." }, 422);
 
-  const formAtt = atts.find((a) => (a.contentType || "").toLowerCase().includes("pdf")) || null;
-  const receiptAtts = atts.filter((a) => a !== formAtt).slice(0, MAX_RECEIPTS);
-  const storeAtts = formAtt ? [formAtt, ...receiptAtts] : [...receiptAtts];
+  const sub = await createSubmissionFromAttachments(env, sql, ctx, {
+    atts,
+    employeeName: body.employee_name || null,
+    employeeEmail: fromEmail,
+    province: body.province,
+    projectNumber: (body.project_number && String(body.project_number).trim()) || null,
+    rawEmail,
+    expenseIdHint: cheapId,
+    historyText: `Received from ${fromEmail || "(unknown)"}.`,
+  });
 
-  // R2 keys are opaque — a UUID prefix, unrelated to the Expense ID (which we may
-  // not know yet). Sequential puts keep the subrequest peak low.
-  const keyPrefix = crypto.randomUUID();
-  const stored = [];
-  for (const a of storeAtts) {
-    const key = `${keyPrefix}/${a.name}`;
-    await env.RECEIPTS.put(key, base64ToBytes(a.base64), { httpMetadata: { contentType: a.contentType } });
-    stored.push({ key, kind: a === formAtt ? "form" : "receipt" });
-  }
+  return json({ created: true, submission: { id: sub.id, expense_id: sub.expense_id, status: "needs_review", parsing: true } }, 201);
+}
 
-  const expenseId = cheapId || `pending-${keyPrefix}`;
-  const projectNumber = (body.project_number && String(body.project_number).trim()) || null;
-  let project = null;
-  if (projectNumber) {
-    const [p] = await sql`select * from projects_cache where project_number = ${projectNumber} limit 1`;
-    project = p || null;
-  }
+// POST /submissions/upload (Einbau ID) — upload the form + receipts straight
+// from the app instead of emailing them in. Same background-parse pipeline as
+// /intake; the response comes back as soon as the files are stored, so the UI
+// can navigate straight to the review page while Claude reads it.
+async function handleUpload(request, env, sql, ctx, user) {
+  const body = await parseBody(request);
+  const atts = normalizeAttachments(body);
+  if (atts.length === 0) return json({ error: "no_attachments", detail: "No files were uploaded." }, 422);
 
-  const history = [historyEvent("intake", `Received from ${fromEmail || "(unknown)"}.`)];
-  const [sub] = await sql`
-    insert into submissions
-      (expense_id, employee_name, employee_email, province, project_number, project_procore_id, project_name, project_stage,
-       status, flags, raw_email, history, submitted_at)
-    values
-      (${expenseId}, ${body.employee_name || null}, ${fromEmail}, ${(body.province || "").toUpperCase().slice(0, 2) || null},
-       ${projectNumber}, ${project?.procore_id || null}, ${project?.name || null}, ${project?.stage || null},
-       'needs_review', ${JSON.stringify([{ code: "parsing", severity: "low", detail: "Reading the form and receipts — refresh in a minute." }])}::jsonb,
-       ${rawEmail}, ${JSON.stringify(history)}::jsonb, now())
-    returning *`;
+  const sub = await createSubmissionFromAttachments(env, sql, ctx, {
+    atts,
+    employeeName: (body.employee_name || "").toString().trim() || null,
+    projectNumber: (body.project_number && String(body.project_number).trim()) || null,
+    historyText: `Uploaded by ${user.username} in the app.`,
+  });
 
-  await sql.transaction(
-    stored.map((s) => sql`insert into receipts (submission_id, r2_key, kind) values (${sub.id}, ${s.key}, ${s.kind})`)
-  );
-
-  // The slow part — off the request path.
-  ctx.waitUntil(
-    parseSubmission(env, sql, sub.id, { formAtt, receiptAtts, body })
-      .catch((err) => console.error("background parse failed for", sub.id, err && err.message))
-  );
-
-  return json({ created: true, submission: { id: sub.id, expense_id: expenseId, status: "needs_review", parsing: true } }, 201);
+  return json({ created: true, submission: { id: sub.id, expense_id: sub.expense_id, status: "needs_review", parsing: true } }, 201);
 }
 
 // Background: the Claude call, matching, line inserts, receipt enrichment, flags.
-async function parseSubmission(env, sql, submissionId, { formAtt, receiptAtts, body }) {
+async function parseSubmission(env, sql, submissionId, { formAtt, receiptAtts }) {
   let claude = null, claudeError = null;
   try {
     claude = await parseFormAndReceipts(env, formAtt, receiptAtts);
@@ -1749,6 +1788,9 @@ export default {
 
       if (parts[0] === "submissions") {
         if (parts.length === 1 && request.method === "GET") return withRefresh(await handleList(url, sql));
+        if (parts[1] === "upload" && parts.length === 2 && request.method === "POST") {
+          return withRefresh(await handleUpload(request, env, sql, ctx, auth.user));
+        }
 
         if (parts.length >= 2 && isUuid(parts[1])) {
           const subId = parts[1];

@@ -563,27 +563,30 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
         <div className="receipt-strip">
           {formDoc && (
             <button type="button" className="receipt-thumb is-form" onClick={() => openLightbox(formDoc.id)}
-              disabled={!receiptUrls[formDoc.r2_key]?.url}>
+              disabled={!receiptUrls[formDoc.r2_key]?.url} title={formDoc.r2_key.split("/").pop()}>
               FORM
+              <span className="receipt-thumb-filename">{formDoc.r2_key.split("/").pop()}</span>
             </button>
           )}
           {receipts.filter((r) => r.kind === "receipt").map((r) => {
             const forLines = linesForReceipt(r.id);
+            const filename = r.r2_key.split("/").pop();
             const label = (
               <span className="receipt-thumb-label">
                 {money(r.gross)}{forLines.length ? ` → line ${forLines.map((l) => l.row_index).join(", ")}` : ""}
+                <span className="receipt-thumb-filename">{filename}</span>
               </span>
             );
             return (
               <div className="receipt-thumb-wrap" key={r.id}>
                 {receiptUrls[r.r2_key]?.url ? (
                   <button type="button" className={`receipt-thumb ${forLines.length ? "is-matched" : "is-unmatched"}`}
-                    onClick={() => openLightbox(r.id)} title={r.vendor || "Open receipt"}>
+                    onClick={() => openLightbox(r.id)} title={r.vendor ? `${r.vendor} — ${filename}` : filename}>
                     <img src={receiptUrls[r.r2_key].url} alt="" />
                     {label}
                   </button>
                 ) : (
-                  <div className={`receipt-thumb ${forLines.length ? "is-matched" : "is-unmatched"}`} title={`${r.vendor || "receipt"} — didn't load`}>
+                  <div className={`receipt-thumb ${forLines.length ? "is-matched" : "is-unmatched"}`} title={`${r.vendor || "receipt"} (${filename}) — didn't load`}>
                     <span>?</span>
                     {label}
                   </div>

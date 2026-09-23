@@ -6,6 +6,7 @@ import Header from "./components/Header.jsx";
 import LoginScreen from "./components/LoginScreen.jsx";
 import QueueList from "./components/QueueList.jsx";
 import SubmissionDetail from "./components/SubmissionDetail.jsx";
+import UploadSubmission from "./components/UploadSubmission.jsx";
 import Cameo from "./components/Cameo.jsx";
 
 const CAMEO_USER = "josh@einbau.ca";
@@ -34,6 +35,7 @@ export default function App() {
   const [listError, setListError] = useState(null);
   const [selectedId, setSelectedId] = useState(getHashId());
   const [cameo, setCameo] = useState(0);
+  const [showUpload, setShowUpload] = useState(false);
 
   useEffect(() => {
     const token = getStoredToken();
@@ -141,12 +143,19 @@ export default function App() {
               <button className="tab" onClick={loadList} disabled={loadingList} style={{ marginLeft: "auto" }} title="Refresh">
                 {loadingList ? "↻ …" : "↻ Refresh"}
               </button>
+              <button className="btn btn-orange btn-sm" onClick={() => setShowUpload(true)}>+ New expense</button>
             </div>
             {listError && <div className="card" style={{ color: "var(--red)" }}>{listError}</div>}
             <QueueList submissions={submissions} loading={loadingList} onSelect={selectSubmission} />
           </>
         )}
       </div>
+      {showUpload && (
+        <UploadSubmission
+          onClose={() => setShowUpload(false)}
+          onCreated={(id) => { setShowUpload(false); loadList(); selectSubmission(id); }}
+        />
+      )}
     </>
   );
 }
