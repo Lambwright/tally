@@ -66,7 +66,7 @@ export default function App() {
       .listSubmissions(status)
       .then((data) => setSubmissions(data.submissions || []))
       .catch((e) => {
-        if (e.unauthorized) setAuthState("out");
+        if (e.unauthorized) handleLogout();
         else setListError(e.message);
       })
       .finally(() => setLoadingList(false));
@@ -96,6 +96,11 @@ export default function App() {
       }
     }
   }
+  // The ONLY function allowed to clear a session — the logout button and
+  // every "the server just told us this token is dead" catch block (401 from
+  // any api.* call) both route through here, specifically so nothing can
+  // forget to reset the accent override when a session ends outside a normal
+  // click on Log out. See auth-worker/README.md's themeAccent section.
   function handleLogout() {
     doLogout();
     applyAccentPreset(null);
