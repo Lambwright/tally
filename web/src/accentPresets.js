@@ -9,6 +9,10 @@ export const ACCENT_PRESETS = [
   { id: "crimson", label: "Crimson", accent: "#D14343", accentDark: "#A63333", rgb: "209, 67, 67" },
   { id: "forest", label: "Forest", accent: "#6FB35C", accentDark: "#559244", rgb: "111, 179, 92" },
   { id: "violet", label: "Violet", accent: "#9B7ED1", accentDark: "#7C5FA8", rgb: "155, 126, 209" },
+  { id: "teal", label: "Teal", accent: "#3F9EA0", accentDark: "#2F7B7D", rgb: "63, 158, 160" },
+  { id: "rose", label: "Rose", accent: "#D1618F", accentDark: "#A64A70", rgb: "209, 97, 143" },
+  { id: "indigo", label: "Indigo", accent: "#6C7BD1", accentDark: "#55639F", rgb: "108, 123, 209" },
+  { id: "copper", label: "Copper", accent: "#C97D4F", accentDark: "#A2623C", rgb: "201, 125, 79" },
 ];
 
 export function applyAccentPreset(presetId) {

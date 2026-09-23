@@ -44,7 +44,7 @@ export default function App() {
     verify(token).then((data) => {
       if (data.valid) {
         setUser(data.user);
-        if (data.user.themeAccent) applyAccentPreset(data.user.themeAccent);
+        if (data.user.themeAccent?.TALLY) applyAccentPreset(data.user.themeAccent.TALLY);
         setAuthState("in");
       } else {
         setAuthState("out");
@@ -84,7 +84,7 @@ export default function App() {
 
   function handleLoggedIn(u) {
     setUser(u);
-    if (u.themeAccent) applyAccentPreset(u.themeAccent);
+    if (u.themeAccent?.TALLY) applyAccentPreset(u.themeAccent.TALLY);
     setAuthState("in");
     if (u && String(u.username).toLowerCase() === CAMEO_USER) {
       try {
