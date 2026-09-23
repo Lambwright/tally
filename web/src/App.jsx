@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { getStoredToken, verify, logout as doLogout } from "./auth.js";
 import { api } from "./api.js";
+import { applyAccentPreset } from "./accentPresets.js";
 import Header from "./components/Header.jsx";
 import LoginScreen from "./components/LoginScreen.jsx";
 import QueueList from "./components/QueueList.jsx";
@@ -43,6 +44,7 @@ export default function App() {
     verify(token).then((data) => {
       if (data.valid) {
         setUser(data.user);
+        if (data.user.themeAccent) applyAccentPreset(data.user.themeAccent);
         setAuthState("in");
       } else {
         setAuthState("out");
@@ -82,6 +84,7 @@ export default function App() {
 
   function handleLoggedIn(u) {
     setUser(u);
+    if (u.themeAccent) applyAccentPreset(u.themeAccent);
     setAuthState("in");
     if (u && String(u.username).toLowerCase() === CAMEO_USER) {
       try {
@@ -95,6 +98,7 @@ export default function App() {
   }
   function handleLogout() {
     doLogout();
+    applyAccentPreset(null);
     setUser(null);
     setAuthState("out");
   }
