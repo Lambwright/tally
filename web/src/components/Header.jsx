@@ -12,6 +12,7 @@ function appLinks() {
     { name: "INTAKE", url: "https://lambwright.github.io/scout-intake/" },
     { name: "TALLY", url: "https://lambwright.github.io/tally/", current: true },
     { name: "HANDOFF", url: "https://lambwright.github.io/handoff/" },
+    { name: "LEDGER", url: "https://lambwright.github.io/ledger/" },
     { name: "HELM", url: "https://lambwright.github.io/helm/" },
     { name: "CRM", url: "https://lambwright.github.io/crm/" },
   ];
