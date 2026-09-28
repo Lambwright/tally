@@ -1,21 +1,29 @@
 import { useEffect, useRef, useState } from "react";
 
-// Same suite switcher the other apps carry — click the wordmark to jump between
-// apps. PUNCH used to be Ben-only so this gated the link to him (comingSoon:
-// !isOwner) — stale now that PUNCH has real multi-user access with its own
-// backend auth and a restricted view for non-admins; the link is live for
-// everyone here, and PUNCH's own login enforces access on click-through.
-function appLinks() {
-  return [
-    { name: "PUNCH", url: "https://lambwright.github.io/PUNCH/" },
-    { name: "SCOUT", url: "https://lambwright.github.io/scout-addin/app.html" },
-    { name: "INTAKE", url: "https://lambwright.github.io/scout-intake/" },
-    { name: "TALLY", url: "https://lambwright.github.io/tally/", current: true },
-    { name: "HANDOFF", url: "https://lambwright.github.io/handoff/" },
-    { name: "LEDGER", url: "https://lambwright.github.io/ledger/" },
-    { name: "HELM", url: "https://lambwright.github.io/helm/" },
-    { name: "CRM", url: "https://lambwright.github.io/crm/" },
-  ];
+// Same suite switcher every other app carries — keep the list and the
+// visibility rule below identical across apps.
+const APP_LINKS = [
+  { name: "PUNCH", url: "https://lambwright.github.io/PUNCH/" },
+  { name: "SCOUT", url: "https://lambwright.github.io/scout-addin/app.html" },
+  { name: "INTAKE", url: "https://lambwright.github.io/scout-intake/" },
+  { name: "TALLY", url: "https://lambwright.github.io/tally/" },
+  { name: "HANDOFF", url: "https://lambwright.github.io/handoff/" },
+  { name: "LEDGER", url: "https://lambwright.github.io/ledger/" },
+  { name: "CRM", url: "https://lambwright.github.io/crm/" },
+];
+const HELM_LINK = { name: "HELM", url: "https://lambwright.github.io/helm/" };
+const CURRENT_APP = "TALLY";
+
+// Only apps this user can open, then HELM always last (it's where settings
+// live). `user.apps` absent = unrestricted, except LEDGER, which fails closed
+// and needs an explicit grant (see auth-worker/README.md).
+function appLinks(user) {
+  const apps = Array.isArray(user?.apps) ? user.apps.map((a) => String(a).toUpperCase()) : null;
+  const allowed = (name) => (apps ? apps.includes(name) : name !== "LEDGER");
+  return [...APP_LINKS.filter((a) => a.name === CURRENT_APP || allowed(a.name)), HELM_LINK].map((a) => ({
+    ...a,
+    current: a.name === CURRENT_APP,
+  }));
 }
 
 // Standalone on purpose — this component doesn't assume it owns the page, so it
@@ -47,7 +55,7 @@ export default function Header({ user, onLogout }) {
         <span className="header-brand-tag">An Einbau Product</span>
         {open && (
           <div className="app-switcher-menu">
-            {appLinks().map((app) =>
+            {appLinks(user).map((app) =>
               app.comingSoon ? (
                 <div className="app-switcher-item disabled" key={app.name}>
                   {app.name}<span className="app-switcher-soon">COMING SOON</span>
