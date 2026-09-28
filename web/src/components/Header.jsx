@@ -15,11 +15,11 @@ const HELM_LINK = { name: "HELM", url: "https://lambwright.github.io/helm/" };
 const CURRENT_APP = "TALLY";
 
 // Only apps this user can open, then HELM always last (it's where settings
-// live). `user.apps` absent = unrestricted, except LEDGER, which fails closed
-// and needs an explicit grant (see auth-worker/README.md).
+// live). No apps granted = nothing but this app and HELM (access fails
+// closed — see auth-worker/README.md).
 function appLinks(user) {
-  const apps = Array.isArray(user?.apps) ? user.apps.map((a) => String(a).toUpperCase()) : null;
-  const allowed = (name) => (apps ? apps.includes(name) : name !== "LEDGER");
+  const apps = (Array.isArray(user?.apps) ? user.apps : []).map((a) => String(a).toUpperCase());
+  const allowed = (name) => apps.includes(name);
   return [...APP_LINKS.filter((a) => a.name === CURRENT_APP || allowed(a.name)), HELM_LINK].map((a) => ({
     ...a,
     current: a.name === CURRENT_APP,
