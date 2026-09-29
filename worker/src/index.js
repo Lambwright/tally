@@ -28,6 +28,7 @@
 //   POST   /submissions/:id/request-revision    (Einbau ID) { note } -> needs_revision + a copy-ready reply
 //   POST   /submissions/:id/reject              (Einbau ID) { reason } -> rejected
 //   GET    /projects                            (Einbau ID) cached active-project list
+//   GET    /company-users                       (Einbau ID) live Procore company user list, for the employee picker
 //   POST   /admin/refresh-projects              (Einbau ID, admin) refresh projects_cache now
 //   GET    /admin/procore-probe?path=           (Einbau ID, admin) proxy an arbitrary Procore GET (diagnostic)
 //   scheduled (cron 0 */6 * * *)                refresh projects_cache from Procore
@@ -525,6 +526,30 @@ async function fetchProcoreProjects(env, token) {
   return projects;
 }
 
+// Every Einbau company user — same endpoint resolveEmployeeId searches, just
+// unfiltered + paginated. Powers the "+ New expense" employee picker; fetched
+// live each time that form opens rather than cached (low call frequency, and
+// staying current on new hires matters more here than for the 6h projects_cache).
+async function fetchProcoreCompanyUsers(env, token) {
+  const users = [];
+  let page = 1;
+  const perPage = 100;
+  while (page <= 20) {
+    const batch = await procoreFetch(
+      env, token,
+      `/rest/v1.0/companies/${env.PROCORE_COMPANY_ID}/users?page=${page}&per_page=${perPage}`
+    );
+    if (!Array.isArray(batch)) break;
+    users.push(...batch);
+    if (batch.length < perPage) break;
+    page++;
+  }
+  return users
+    .map((u) => ({ id: u.id, name: u.name || `${u.first_name || ""} ${u.last_name || ""}`.trim() }))
+    .filter((u) => u.id && u.name)
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
 async function refreshProjectsCache(env, sql) {
   const token = await getProcoreToken(env);
   const projects = await fetchProcoreProjects(env, token);
@@ -978,7 +1003,15 @@ async function parseSubmission(env, sql, submissionId, { formAtt, receiptAtts })
       await sql`update submissions set expense_id = ${formId} where id = ${submissionId}`;
       expenseId = formId;
     } catch {
-      await sql`update submissions set flags = coalesce(flags, '[]'::jsonb) || ${JSON.stringify([{ code: "duplicate_expense_id", severity: "high", detail: `Form's Expense ID "${formId}" is already used by another submission.` }])}::jsonb where id = ${submissionId}`;
+      // Someone else already holds this Expense ID — almost always the same
+      // invoice arriving twice (e.g. uploaded directly in the app AND emailed
+      // in). Flagged AND blocked from Approve below — a human has to look at
+      // both and reject/delete whichever one shouldn't post.
+      const [dupe] = await sql`select id, status from submissions where expense_id = ${formId}`;
+      const detail = dupe
+        ? `Form's Expense ID "${formId}" is already on submission ${dupe.id} (status: ${dupe.status}). Approve is blocked until this is resolved — reject or delete whichever one shouldn't post.`
+        : `Form's Expense ID "${formId}" is already used by another submission.`;
+      await sql`update submissions set flags = coalesce(flags, '[]'::jsonb) || ${JSON.stringify([{ code: "duplicate_expense_id", severity: "high", detail }])}::jsonb where id = ${submissionId}`;
     }
   }
 
@@ -1430,6 +1463,16 @@ async function handleApprove(subId, url, request, env, sql, user) {
   const dryRun = url.searchParams.get("dryRun") === "1";
   await parseBody(request).catch(() => ({})); // tolerate an empty body
 
+  // Same invoice already holds this Expense ID on another submission (see
+  // parseSubmission) — most likely the same expense arrived twice (uploaded
+  // in the app AND emailed in, or a duplicate email). Preview is still fine
+  // so the reviewer can compare, but the real write is blocked until a human
+  // rejects/deletes whichever submission shouldn't post.
+  const dupFlag = (sub.flags || []).find((f) => f.code === "duplicate_expense_id");
+  if (dupFlag && !dryRun) {
+    return json({ error: "duplicate_expense_id", detail: dupFlag.detail }, 409);
+  }
+
   const incomplete = lines.filter((l) => {
     const net = money(l.net_amount);
     const hasReceipt = l.is_flat_claim || l.receipt_id;
@@ -1765,6 +1808,16 @@ export default {
           where active = true and stage is distinct from 'On Hold' and stage is distinct from 'Completed and Invoiced'
           order by project_number desc`;
         return withRefresh(json({ projects: rows }));
+      }
+
+      if (url.pathname === "/company-users" && request.method === "GET") {
+        const token = await getProcoreToken(env);
+        try {
+          const users = await fetchProcoreCompanyUsers(env, token);
+          return withRefresh(json({ users }));
+        } catch (e) {
+          return withRefresh(json({ error: "procore_lookup_failed", detail: e.message }, 502));
+        }
       }
 
       // No role split inside TALLY for now — any allowed user (see ALLOWED_USERS)

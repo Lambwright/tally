@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../api.js";
 
 const MAX_FILES = 12;
@@ -27,7 +27,14 @@ export default function UploadSubmission({ onClose, onCreated }) {
   const [projectNumber, setProjectNumber] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
+  const [users, setUsers] = useState([]);
+  const [projects, setProjects] = useState([]);
   const inputRef = useRef(null);
+
+  useEffect(() => {
+    api.listCompanyUsers().then((d) => setUsers(d.users || [])).catch(() => setUsers([]));
+    api.listProjects().then((d) => setProjects(d.projects || [])).catch(() => setProjects([]));
+  }, []);
 
   const addFiles = useCallback((list) => {
     const incoming = Array.from(list || []);
@@ -118,11 +125,19 @@ export default function UploadSubmission({ onClose, onCreated }) {
 
         <div className="field" style={{ marginTop: 12 }}>
           <label htmlFor="upload-employee">Employee name (optional — Claude reads it off the form)</label>
-          <input id="upload-employee" value={employeeName} disabled={busy} onChange={(e) => setEmployeeName(e.target.value)} />
+          <input id="upload-employee" list="upload-employee-options" placeholder="Search Einbau employees…"
+            value={employeeName} disabled={busy} onChange={(e) => setEmployeeName(e.target.value)} />
+          <datalist id="upload-employee-options">
+            {users.map((u) => <option key={u.id} value={u.name} />)}
+          </datalist>
         </div>
         <div className="field">
           <label htmlFor="upload-project">Project number (optional — Claude reads it off the form)</label>
-          <input id="upload-project" value={projectNumber} disabled={busy} onChange={(e) => setProjectNumber(e.target.value)} />
+          <input id="upload-project" list="upload-project-options" placeholder="Search active projects…"
+            value={projectNumber} disabled={busy} onChange={(e) => setProjectNumber(e.target.value)} />
+          <datalist id="upload-project-options">
+            {projects.map((p) => <option key={p.procore_id} value={p.project_number}>{p.name}</option>)}
+          </datalist>
         </div>
 
         {error && <div className="login-error">{error}</div>}

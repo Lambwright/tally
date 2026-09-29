@@ -65,6 +65,7 @@ export const api = {
   requestRevision: (id, note) => request(`/submissions/${id}/request-revision`, { method: "POST", body: { note } }),
   reject: (id, reason) => request(`/submissions/${id}/reject`, { method: "POST", body: { reason } }),
   listProjects: () => request("/projects"),
+  listCompanyUsers: () => request("/company-users"), // { users: [{id, name}] }
   receiptUrl: (id, key) => `${API_BASE}/submissions/${id}/receipt?key=${encodeURIComponent(key)}`,
 };
 

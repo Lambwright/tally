@@ -31,6 +31,7 @@ const FLAG_LABELS = {
   receipt_shared: "Receipt also backs another line",
   tax_code_unmapped: "No Procore tax code for this province — added without one",
   employee_not_tagged: "Employee not tagged on the Direct Cost",
+  duplicate_expense_id: "Duplicate Expense ID — Approve is blocked",
 };
 
 const PARSE_FAILURE_FLAGS = new Set(["parse_failed", "claude_failed", "form_parse_failed"]);
@@ -205,6 +206,7 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
     return hasReceipt && Number.isFinite(net) && net > 0 && codeOk;
   };
   const allComplete = lines.length > 0 && lines.every(lineComplete);
+  const dupFlag = sub?.flags?.find((f) => f.code === "duplicate_expense_id");
 
   async function handleApprove() {
     setBusy(true);
@@ -607,7 +609,8 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
       <div className="modal-actions" style={{ justifyContent: "flex-start", flexWrap: "wrap" }}>
         {actionable && (
           <>
-            <button className="btn btn-orange" disabled={busy || !allComplete} onClick={handleApprove}>
+            <button className="btn btn-orange" disabled={busy || !allComplete || !!dupFlag} onClick={handleApprove}
+              title={dupFlag ? dupFlag.detail : undefined}>
               {busy ? "Working…" : "Approve"}
             </button>
             <button className="btn btn-ghost" disabled={busy} onClick={handleDryRun}>Preview payload</button>
@@ -619,7 +622,12 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
           title="Permanently remove this submission and free its Expense ID" style={{ marginLeft: "auto" }}>
           Delete
         </button>
-        {actionable && !allComplete && lines.length > 0 && (
+        {actionable && dupFlag && (
+          <span className="row-secondary" style={{ alignSelf: "center", width: "100%", color: "var(--red)" }}>
+            {dupFlag.detail}
+          </span>
+        )}
+        {actionable && !dupFlag && !allComplete && lines.length > 0 && (
           <span className="row-secondary" style={{ alignSelf: "center", width: "100%" }}>
             Every line needs a receipt (or be flat-claim), a net amount, and a cost code.
           </span>
