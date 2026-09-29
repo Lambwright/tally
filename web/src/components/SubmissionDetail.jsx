@@ -65,7 +65,7 @@ function FlagList({ flags }) {
   );
 }
 
-export default function SubmissionDetail({ id, onClose, onChanged }) {
+export default function SubmissionDetail({ id, onClose, onChanged, me }) {
   const [data, setData] = useState(null); // { submission, line_items, receipts }
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -207,6 +207,7 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
   };
   const allComplete = lines.length > 0 && lines.every(lineComplete);
   const dupFlag = sub?.flags?.find((f) => f.code === "duplicate_expense_id");
+  const needsPmApproval = sub?.origin === "pm_direct" && !me?.isPmApprover;
 
   async function handleApprove() {
     setBusy(true);
@@ -361,6 +362,7 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
             </div>
           </div>
           <span className={`badge badge-${sub.status}`}>{sub.status.replace("_", " ")}</span>
+          {sub.origin === "pm_direct" && <span className="badge" title="Submitted directly by the employee, no PDF form">PM</span>}
         </div>
       </div>
 
@@ -370,7 +372,7 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
         </div>
       )}
 
-      {sub.flags?.some((f) => PARSE_FAILURE_FLAGS.has(f.code)) && (
+      {sub.flags?.some((f) => PARSE_FAILURE_FLAGS.has(f.code) && !(sub.origin === "pm_direct" && f.code === "form_parse_failed")) && (
         <div className="card" style={{ color: "var(--red)", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
           <span>Automatic parsing didn't finish (often a temporary API issue) — the original form and receipts are still saved.</span>
           <button className="btn btn-ghost btn-sm" onClick={handleRetryParse} disabled={busy}>
@@ -609,8 +611,8 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
       <div className="modal-actions" style={{ justifyContent: "flex-start", flexWrap: "wrap" }}>
         {actionable && (
           <>
-            <button className="btn btn-orange" disabled={busy || !allComplete || !!dupFlag} onClick={handleApprove}
-              title={dupFlag ? dupFlag.detail : undefined}>
+            <button className="btn btn-orange" disabled={busy || !allComplete || !!dupFlag || needsPmApproval} onClick={handleApprove}
+              title={dupFlag ? dupFlag.detail : needsPmApproval ? "Needs approval from Leela (or another PM approver) first." : undefined}>
               {busy ? "Working…" : "Approve"}
             </button>
             <button className="btn btn-ghost" disabled={busy} onClick={handleDryRun}>Preview payload</button>
@@ -625,6 +627,11 @@ export default function SubmissionDetail({ id, onClose, onChanged }) {
         {actionable && dupFlag && (
           <span className="row-secondary" style={{ alignSelf: "center", width: "100%", color: "var(--red)" }}>
             {dupFlag.detail}
+          </span>
+        )}
+        {actionable && !dupFlag && needsPmApproval && allComplete && (
+          <span className="row-secondary" style={{ alignSelf: "center", width: "100%", color: "var(--yellow)" }}>
+            Waiting on approval from Leela (or another PM approver) before this can post to Procore.
           </span>
         )}
         {actionable && !dupFlag && !allComplete && lines.length > 0 && (

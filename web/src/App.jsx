@@ -7,6 +7,8 @@ import LoginScreen from "./components/LoginScreen.jsx";
 import QueueList from "./components/QueueList.jsx";
 import SubmissionDetail from "./components/SubmissionDetail.jsx";
 import UploadSubmission from "./components/UploadSubmission.jsx";
+import SubmitExpense from "./components/SubmitExpense.jsx";
+import ExportPanel from "./components/ExportPanel.jsx";
 import Cameo from "./components/Cameo.jsx";
 
 const CAMEO_USER = "josh@einbau.ca";
@@ -36,6 +38,9 @@ export default function App() {
   const [selectedId, setSelectedId] = useState(getHashId());
   const [cameo, setCameo] = useState(0);
   const [showUpload, setShowUpload] = useState(false);
+  const [showSubmitExpense, setShowSubmitExpense] = useState(false);
+  const [showExport, setShowExport] = useState(false);
+  const [me, setMe] = useState(null);
 
   useEffect(() => {
     const token = getStoredToken();
@@ -59,6 +64,14 @@ export default function App() {
     window.addEventListener("hashchange", onHash);
     return () => window.removeEventListener("hashchange", onHash);
   }, []);
+
+  // TALLY's own tier (reviewer / PM-submitter / PM-approver) — separate from
+  // auth-worker's user object, since ALLOWED_USERS/PM_SUBMITTERS/PM_APPROVERS
+  // are TALLY-local config the browser has no other way to learn.
+  useEffect(() => {
+    if (authState !== "in") { setMe(null); return; }
+    api.getMe().catch(() => null).then(setMe);
+  }, [authState]);
 
   const loadList = useCallback(() => {
     if (authState !== "in") return;
@@ -127,7 +140,7 @@ export default function App() {
       <Header user={user} onLogout={handleLogout} />
       <div className="container">
         {selectedId ? (
-          <SubmissionDetail id={selectedId} onClose={() => selectSubmission(null)} onChanged={loadList} />
+          <SubmissionDetail id={selectedId} onClose={() => selectSubmission(null)} onChanged={loadList} me={me} />
         ) : (
           <>
             <div className="tabs">
@@ -143,7 +156,15 @@ export default function App() {
               <button className="tab" onClick={loadList} disabled={loadingList} style={{ marginLeft: "auto" }} title="Refresh">
                 {loadingList ? "↻ …" : "↻ Refresh"}
               </button>
-              <button className="btn btn-orange btn-sm" onClick={() => setShowUpload(true)}>+ New expense</button>
+              {me?.isReviewer && (
+                <>
+                  <button className="btn btn-ghost btn-sm" onClick={() => setShowExport(true)}>Export</button>
+                  <button className="btn btn-orange btn-sm" onClick={() => setShowUpload(true)}>+ New expense</button>
+                </>
+              )}
+              {me?.isPmSubmitter && !me?.isReviewer && (
+                <button className="btn btn-orange btn-sm" onClick={() => setShowSubmitExpense(true)}>+ Submit expense</button>
+              )}
             </div>
             {listError && <div className="card" style={{ color: "var(--red)" }}>{listError}</div>}
             <QueueList submissions={submissions} loading={loadingList} onSelect={selectSubmission} />
@@ -156,6 +177,13 @@ export default function App() {
           onCreated={(id) => { setShowUpload(false); loadList(); selectSubmission(id); }}
         />
       )}
+      {showSubmitExpense && (
+        <SubmitExpense
+          onClose={() => setShowSubmitExpense(false)}
+          onCreated={(id) => { setShowSubmitExpense(false); loadList(); selectSubmission(id); }}
+        />
+      )}
+      {showExport && <ExportPanel onClose={() => setShowExport(false)} />}
     </>
   );
 }

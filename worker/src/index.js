@@ -27,8 +27,15 @@
 //   POST   /submissions/:id/retry-attachments   (Einbau ID) re-upload the form + receipts to an already-created DC
 //   POST   /submissions/:id/request-revision    (Einbau ID) { note } -> needs_revision + a copy-ready reply
 //   POST   /submissions/:id/reject              (Einbau ID) { reason } -> rejected
+//   GET    /me                                   (Einbau ID) { username, displayName, isReviewer, isPmSubmitter, isPmApprover }
 //   GET    /projects                            (Einbau ID) cached active-project list
 //   GET    /company-users                       (Einbau ID) live Procore company user list, for the employee picker
+//   GET    /export?from=&to=&status=            (Einbau ID, reviewer) CSV, one row per line item -- payroll/period export
+//
+// PM self-serve: a PM_SUBMITTERS-only user (see wrangler.jsonc) hits the same
+// /submissions/upload with no PDF form; the row gets origin='pm_direct' and
+// is scoped to their own view everywhere. Its Approve is blocked until a
+// PM_APPROVERS user (Leela) does it -- same Procore write, just gated.
 //   POST   /admin/refresh-projects              (Einbau ID, admin) refresh projects_cache now
 //   GET    /admin/procore-probe?path=           (Einbau ID, admin) proxy an arbitrary Procore GET (diagnostic)
 //   scheduled (cron 0 */6 * * *)                refresh projects_cache from Procore
@@ -242,21 +249,34 @@ async function requireLogin(request, env) {
       }
     }
 
-    // TALLY is used by a named few (Ben + Josh). ALLOWED_USERS is the real gate —
-    // a comma list of Einbau ID usernames. ALLOWED_ROLES stays as a coarser
-    // fallback when ALLOWED_USERS isn't set.
+    // TALLY is used by a named few (Ben, Josh, Leela, Devid). ALLOWED_USERS is
+    // the real gate — a comma list of Einbau ID usernames. ALLOWED_ROLES stays
+    // as a coarser fallback when ALLOWED_USERS isn't set.
+    //
+    // PM_SUBMITTERS is a second, narrower gate — a PM submitting their own
+    // expenses (see "PM self-serve" in the route list) doesn't need full
+    // reviewer access, just enough to pass this check and get scoped down to
+    // their own rows everywhere else. Being in PM_SUBMITTERS is sufficient on
+    // its own; ALLOWED_USERS membership isn't required too.
+    const username = String(data.user.username || "").toLowerCase();
+    const pmSubmitters = String(env.PM_SUBMITTERS || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+    const isPmSubmitter = pmSubmitters.includes(username);
+
     const allowedUsers = String(env.ALLOWED_USERS || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+    let isReviewer;
     if (allowedUsers.length) {
-      if (!allowedUsers.includes(String(data.user.username || "").toLowerCase())) {
+      isReviewer = allowedUsers.includes(username);
+      if (!isReviewer && !isPmSubmitter) {
         return { ok: false, reason: `TALLY is limited to specific users — "${data.user.username}" isn't one of them.` };
       }
     } else {
       const allowedRoles = String(env.ALLOWED_ROLES || "admin,user").split(",").map((r) => r.trim());
-      if (!allowedRoles.includes(data.user.role)) {
+      isReviewer = allowedRoles.includes(data.user.role);
+      if (!isReviewer && !isPmSubmitter) {
         return { ok: false, reason: `Logged in as "${data.user.username}" (role "${data.user.role}"), which isn't allowed in TALLY.` };
       }
     }
-    return { ok: true, user: data.user, refreshedToken: data.refreshedToken || null };
+    return { ok: true, user: data.user, refreshedToken: data.refreshedToken || null, isReviewer, isPmSubmitter };
   } catch (e) {
     return { ok: false, reason: `Couldn't reach auth-worker: ${e.message}` };
   }
@@ -872,7 +892,7 @@ function computeLineFlags(line, receipt, formProvince, project, { shared = false
 // the app it's what lets the UI navigate to the review page immediately.
 async function createSubmissionFromAttachments(env, sql, ctx, {
   atts, employeeName = null, employeeEmail = null, province = null, projectNumber = null,
-  rawEmail = null, expenseIdHint = null, historyText,
+  rawEmail = null, expenseIdHint = null, historyText, origin = "email", createdBy = null,
 }) {
   const formAtt = atts.find((a) => (a.contentType || "").toLowerCase().includes("pdf")) || null;
   const receiptAtts = atts.filter((a) => a !== formAtt).slice(0, MAX_RECEIPTS);
@@ -899,12 +919,12 @@ async function createSubmissionFromAttachments(env, sql, ctx, {
   const [sub] = await sql`
     insert into submissions
       (expense_id, employee_name, employee_email, province, project_number, project_procore_id, project_name, project_stage,
-       status, flags, raw_email, history, submitted_at)
+       status, flags, raw_email, history, submitted_at, origin, created_by)
     values
       (${expenseId}, ${employeeName}, ${employeeEmail}, ${(province || "").toUpperCase().slice(0, 2) || null},
        ${projectNumber}, ${project?.procore_id || null}, ${project?.name || null}, ${project?.stage || null},
        'needs_review', ${JSON.stringify([{ code: "parsing", severity: "low", detail: "Reading the form and receipts — refresh in a minute." }])}::jsonb,
-       ${rawEmail}, ${JSON.stringify(history)}::jsonb, now())
+       ${rawEmail}, ${JSON.stringify(history)}::jsonb, now(), ${origin}, ${createdBy})
     returning *`;
 
   await sql.transaction(
@@ -965,16 +985,28 @@ async function handleIntake(request, env, sql, ctx) {
 // from the app instead of emailing them in. Same background-parse pipeline as
 // /intake; the response comes back as soon as the files are stored, so the UI
 // can navigate straight to the review page while Claude reads it.
-async function handleUpload(request, env, sql, ctx, user) {
+//
+// A PM_SUBMITTERS-only caller (isReviewer false) is submitting their OWN
+// expense with no PDF form — origin/created_by/employee_name are forced
+// rather than taken from the body, so they can't claim someone else's name
+// or spoof a reviewer-style "upload" row.
+async function handleUpload(request, env, sql, ctx, auth) {
   const body = await parseBody(request);
   const atts = normalizeAttachments(body);
   if (atts.length === 0) return json({ error: "no_attachments", detail: "No files were uploaded." }, 422);
 
+  const isPmSubmission = auth.isPmSubmitter && !auth.isReviewer;
   const sub = await createSubmissionFromAttachments(env, sql, ctx, {
     atts,
-    employeeName: (body.employee_name || "").toString().trim() || null,
+    employeeName: isPmSubmission
+      ? (auth.user.displayName || auth.user.username)
+      : (body.employee_name || "").toString().trim() || null,
     projectNumber: (body.project_number && String(body.project_number).trim()) || null,
-    historyText: `Uploaded by ${user.username} in the app.`,
+    historyText: isPmSubmission
+      ? `Submitted by ${auth.user.username} for their own reimbursement.`
+      : `Uploaded by ${auth.user.username} in the app.`,
+    origin: isPmSubmission ? "pm_direct" : "upload",
+    createdBy: auth.user.username,
   });
 
   return json({ created: true, submission: { id: sub.id, expense_id: sub.expense_id, status: "needs_review", parsing: true } }, 201);
@@ -1096,33 +1128,75 @@ async function parseSubmission(env, sql, submissionId, { formAtt, receiptAtts })
 const SUB_SUMMARY = `
   s.id, s.expense_id, s.employee_name, s.employee_email, s.province,
   s.project_number, s.project_name, s.project_stage, s.status, s.flags,
+  s.origin, s.created_by,
   s.reviewed_by, s.reviewed_at, s.procore_direct_cost_id, s.submitted_at, s.created_at, s.updated_at`;
 
-async function handleList(url, sql) {
-  const status = url.searchParams.get("status");
-  const rows = status
-    ? await sql`
-        select ${sql.unsafe(SUB_SUMMARY)},
-               coalesce(li.n, 0) as line_count, coalesce(li.net_total, 0) as net_total,
-               coalesce(li.flag_count, 0) as line_flag_count
-        from submissions s
-        left join (
-          select submission_id, count(*) n, sum(net_amount) net_total, sum(jsonb_array_length(flags)) flag_count
-          from line_items group by submission_id
-        ) li on li.submission_id = s.id
-        where s.status = ${status}
-        order by s.created_at desc limit 500`
-    : await sql`
-        select ${sql.unsafe(SUB_SUMMARY)},
-               coalesce(li.n, 0) as line_count, coalesce(li.net_total, 0) as net_total,
-               coalesce(li.flag_count, 0) as line_flag_count
-        from submissions s
-        left join (
-          select submission_id, count(*) n, sum(net_amount) net_total, sum(jsonb_array_length(flags)) flag_count
-          from line_items group by submission_id
-        ) li on li.submission_id = s.id
-        order by s.created_at desc limit 500`;
+// `ownerFilter`: a username to scope the list to (PM_SUBMITTERS-only callers
+// see only their own rows), or null for full access.
+async function handleList(url, sql, ownerFilter) {
+  const status = url.searchParams.get("status") || null;
+  const rows = await sql`
+    select ${sql.unsafe(SUB_SUMMARY)},
+           coalesce(li.n, 0) as line_count, coalesce(li.net_total, 0) as net_total,
+           coalesce(li.flag_count, 0) as line_flag_count
+    from submissions s
+    left join (
+      select submission_id, count(*) n, sum(net_amount) net_total, sum(jsonb_array_length(flags)) flag_count
+      from line_items group by submission_id
+    ) li on li.submission_id = s.id
+    where (${status}::text is null or s.status = ${status})
+      and (${ownerFilter}::text is null or s.created_by = ${ownerFilter})
+    order by s.created_at desc limit 500`;
   return json({ submissions: rows });
+}
+
+// GET /export?from=YYYY-MM-DD&to=YYYY-MM-DD&status=approved (Einbau ID,
+// reviewer-only). One row per expense line, for a payroll run or a period
+// report. Filtered by reviewed_at (when it was approved -- when it actually
+// became payable), not the expense's own date. `has_form` flags the rows a
+// payroll run can no longer spot by "a PDF form exists in Procore" now that
+// pm_direct submissions skip the PDF entirely -- first-pass shape, expected
+// to be adjusted once this runs against a real payroll cycle.
+async function handleExport(url, sql) {
+  const from = url.searchParams.get("from");
+  const to = url.searchParams.get("to");
+  if (!from || !to) return json({ error: "range_required", detail: "Pass ?from=YYYY-MM-DD&to=YYYY-MM-DD." }, 400);
+  const status = url.searchParams.get("status") || "approved";
+
+  const rows = await sql`
+    select
+      s.expense_id, s.origin, s.employee_name, s.project_number, s.project_name,
+      l.category, l.line_date, l.net_amount, l.description,
+      exists (select 1 from receipts r where r.submission_id = s.id and r.kind = 'form') as has_form,
+      s.procore_direct_cost_id, s.reviewed_by, s.reviewed_at
+    from line_items l
+    join submissions s on s.id = l.submission_id
+    where s.status = ${status}
+      and s.reviewed_at >= ${from}::date and s.reviewed_at < (${to}::date + interval '1 day')
+    order by s.reviewed_at asc, s.expense_id asc, l.row_index asc nulls last`;
+
+  const header = [
+    "expense_id", "origin", "employee_name", "project_number", "project_name",
+    "category", "line_date", "net_amount", "description", "has_form",
+    "procore_direct_cost_id", "reviewed_by", "reviewed_at",
+  ];
+  const csvEscape = (v) => {
+    if (v === null || v === undefined) return "";
+    const s = String(v);
+    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const csvLines = [header.join(",")];
+  for (const r of rows) {
+    csvLines.push(header.map((h) => csvEscape(h === "has_form" ? (r[h] ? "yes" : "no") : r[h])).join(","));
+  }
+
+  return new Response(csvLines.join("\r\n"), {
+    headers: {
+      "Content-Type": "text/csv; charset=utf-8",
+      "Content-Disposition": `attachment; filename="tally-export-${from}-to-${to}.csv"`,
+      ...corsHeaders(),
+    },
+  });
 }
 
 async function handleDetail(id, sql) {
@@ -1473,6 +1547,16 @@ async function handleApprove(subId, url, request, env, sql, user) {
     return json({ error: "duplicate_expense_id", detail: dupFlag.detail }, 409);
   }
 
+  // A PM's own submission (no PDF form) needs Leela's sign-off before it can
+  // become a real Procore Direct Cost — same write, just gated to whoever's
+  // in PM_APPROVERS. Preview still works for anyone who can see the row.
+  if (sub.origin === "pm_direct" && !dryRun) {
+    const pmApprovers = String(env.PM_APPROVERS || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+    if (!pmApprovers.includes(String(user.username || "").toLowerCase())) {
+      return json({ error: "pm_approval_required", detail: "This is a PM-submitted expense — it needs approval from Leela (or another PM_APPROVERS user) before it can post to Procore." }, 409);
+    }
+  }
+
   const incomplete = lines.filter((l) => {
     const net = money(l.net_amount);
     const hasReceipt = l.is_flat_claim || l.receipt_id;
@@ -1801,6 +1885,17 @@ export default {
         return res;
       };
 
+      if (url.pathname === "/me" && request.method === "GET") {
+        const pmApprovers = String(env.PM_APPROVERS || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+        return withRefresh(json({
+          username: auth.user.username,
+          displayName: auth.user.displayName,
+          isReviewer: auth.isReviewer,
+          isPmSubmitter: auth.isPmSubmitter,
+          isPmApprover: pmApprovers.includes(String(auth.user.username || "").toLowerCase()),
+        }));
+      }
+
       if (url.pathname === "/projects" && request.method === "GET") {
         const rows = await sql`
           select procore_id, project_number, name, stage, active, region, province, refreshed_at
@@ -1808,6 +1903,11 @@ export default {
           where active = true and stage is distinct from 'On Hold' and stage is distinct from 'Completed and Invoiced'
           order by project_number desc`;
         return withRefresh(json({ projects: rows }));
+      }
+
+      if (url.pathname === "/export" && request.method === "GET") {
+        if (!auth.isReviewer) return json({ error: "forbidden" }, 403);
+        return await handleExport(url, sql);
       }
 
       if (url.pathname === "/company-users" && request.method === "GET") {
@@ -1820,14 +1920,16 @@ export default {
         }
       }
 
-      // No role split inside TALLY for now — any allowed user (see ALLOWED_USERS)
-      // has full control, ops routes included. Fine-grained permissions come with
-      // the suite-wide settings dashboard.
+      // No role split among reviewers for now — any ALLOWED_USERS user has full
+      // control, ops routes included. PM_SUBMITTERS-only callers never reach
+      // these — admin/probe tooling stays reviewer-only.
       if (url.pathname === "/admin/refresh-projects" && request.method === "POST") {
+        if (!auth.isReviewer) return json({ error: "forbidden" }, 403);
         return withRefresh(json({ refreshed: await refreshProjectsCache(env, sql) }));
       }
 
       if (url.pathname === "/admin/procore-probe" && request.method === "GET") {
+        if (!auth.isReviewer) return json({ error: "forbidden" }, 403);
         const path = url.searchParams.get("path");
         if (!path || !path.startsWith("/rest/")) return json({ error: "bad_path", detail: "pass ?path=/rest/..." }, 400);
         const token = await getProcoreToken(env);
@@ -1840,14 +1942,29 @@ export default {
       }
 
       if (parts[0] === "submissions") {
-        if (parts.length === 1 && request.method === "GET") return withRefresh(await handleList(url, sql));
+        const pmScoped = auth.isPmSubmitter && !auth.isReviewer;
+
+        if (parts.length === 1 && request.method === "GET") {
+          return withRefresh(await handleList(url, sql, pmScoped ? auth.user.username : null));
+        }
         if (parts[1] === "upload" && parts.length === 2 && request.method === "POST") {
-          return withRefresh(await handleUpload(request, env, sql, ctx, auth.user));
+          return withRefresh(await handleUpload(request, env, sql, ctx, auth));
         }
 
         if (parts.length >= 2 && isUuid(parts[1])) {
           const subId = parts[1];
           const seg = parts[2];
+
+          // PM_SUBMITTERS-only callers only ever get to their own rows —
+          // everything past this point (view, edit, approve-attempt, delete,
+          // line CRUD, receipts) is scoped by this one check.
+          if (pmScoped) {
+            const [owned] = await sql`select created_by from submissions where id = ${subId}`;
+            if (!owned) return json({ error: "not_found" }, 404);
+            if ((owned.created_by || "").toLowerCase() !== auth.user.username.toLowerCase()) {
+              return json({ error: "forbidden", reason: "Not your submission." }, 403);
+            }
+          }
 
           if (!seg && request.method === "GET") return withRefresh(await handleDetail(subId, sql));
           if (!seg && request.method === "PATCH") return withRefresh(await handleSubmissionPatch(subId, request, sql, auth.user));

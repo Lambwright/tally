@@ -66,6 +66,7 @@ export const api = {
   reject: (id, reason) => request(`/submissions/${id}/reject`, { method: "POST", body: { reason } }),
   listProjects: () => request("/projects"),
   listCompanyUsers: () => request("/company-users"), // { users: [{id, name}] }
+  getMe: () => request("/me"), // { username, displayName, isReviewer, isPmSubmitter, isPmApprover }
   receiptUrl: (id, key) => `${API_BASE}/submissions/${id}/receipt?key=${encodeURIComponent(key)}`,
 };
 
@@ -79,6 +80,29 @@ export async function fetchReceiptObjectUrl(id, key) {
   if (!res.ok) throw new Error(`Couldn't load attachment (HTTP ${res.status}).`);
   const blob = await res.blob();
   return { url: URL.createObjectURL(blob), type: blob.type || "" };
+}
+
+// The export route returns a CSV file, not JSON — fetch as a blob (same authed
+// pattern as receipts) and trigger a browser download rather than navigating,
+// since the route needs the bearer token a plain <a href> can't send.
+export async function downloadExportCsv(from, to) {
+  const token = getStoredToken();
+  const res = await fetch(`${API_BASE}/export?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`, {
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.detail || data.error || `HTTP ${res.status}`);
+  }
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `tally-export-${from}-to-${to}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
 }
 
 export { UnauthorizedError };

@@ -26,6 +26,15 @@
 		// ALLOWED_ROLES is just a fallback when ALLOWED_USERS is unset.
 		"ALLOWED_USERS": "ben,josh@einbau.ca,leela@einbau.ca,devid@einbau.ca",
 		"ALLOWED_ROLES": "admin,user",
+		// PM self-serve expenses (no PDF form): who may give the final Procore
+		// approval on one -- comma list of Einbau ID usernames, same pattern as
+		// ALLOWED_USERS. Add a backup approver here, no code change needed.
+		"PM_APPROVERS": "leela@einbau.ca",
+		// Who may use the restricted "submit my own expense" tier -- comma list
+		// of Einbau ID usernames. Empty until PMs are onboarded. A username here
+		// but NOT in ALLOWED_USERS sees only their own submissions; being in both
+		// just keeps full reviewer access.
+		"PM_SUBMITTERS": "",
 		"CURRENT_APP": "tally",
 		// The "MISC EMP Expenses" vendor's numeric Procore id -- expense Direct
 		// Costs post against this vendor, not Einbau itself. CONFIRMED (Ben,

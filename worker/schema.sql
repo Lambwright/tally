@@ -42,6 +42,16 @@ create table submissions (
   status text not null default 'needs_review' check (status in
     ('needs_review', 'needs_revision', 'approved', 'rejected')),
 
+  -- Where this row came from. 'pm_direct' is a PM submitting their own cost
+  -- with no PDF form — Approve is gated to PM_APPROVERS for those (see
+  -- handleApprove). 'email' vs 'upload' is informational only; both behave
+  -- identically otherwise. See migration_004.sql for an existing database.
+  origin text not null default 'email' check (origin in ('email', 'upload', 'pm_direct')),
+  -- Einbau ID username that created this row via the app. Null for email
+  -- intake (PA has no session). Drives the "see only your own" filter for
+  -- PM_SUBMITTERS-only users.
+  created_by text,
+
   -- Form-level deterministic checks: [{ code, severity, detail }]. Advisory —
   -- they surface in the queue, they don't block. (Per-line flags live on line_items.)
   flags jsonb not null default '[]'::jsonb,
