@@ -59,6 +59,8 @@ export const api = {
   matchLine: (id, lineId, receiptId) =>
     request(`/submissions/${id}/lines/${lineId}/match`, { method: "POST", body: { receipt_id: receiptId } }),
   unmatchLine: (id, lineId) => request(`/submissions/${id}/lines/${lineId}/unmatch`, { method: "POST", body: {} }),
+  receiptOverride: (id, lineId, override) =>
+    request(`/submissions/${id}/lines/${lineId}/receipt-override`, { method: "POST", body: { override } }),
 
   approve: (id, { dryRun = false } = {}) =>
     request(`/submissions/${id}/approve${dryRun ? "?dryRun=1" : ""}`, { method: "POST", body: {} }),

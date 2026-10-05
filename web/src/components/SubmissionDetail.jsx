@@ -32,6 +32,7 @@ const FLAG_LABELS = {
   tax_code_unmapped: "No Procore tax code for this province — added without one",
   employee_not_tagged: "Employee not tagged on the Direct Cost",
   duplicate_expense_id: "Duplicate Expense ID — Approve is blocked",
+  receipt_override: "Posting without a receipt (waived)",
 };
 
 const PARSE_FAILURE_FLAGS = new Set(["parse_failed", "claude_failed", "form_parse_failed"]);
@@ -200,7 +201,7 @@ export default function SubmissionDetail({ id, onClose, onChanged, me }) {
     mutate(async () => { setBusyLine(lineId); try { await api.patchLine(id, lineId, fields); } finally { setBusyLine(null); } });
 
   const lineComplete = (l) => {
-    const hasReceipt = FLAT_CATEGORIES.has(l.category) || l.receipt_id;
+    const hasReceipt = FLAT_CATEGORIES.has(l.category) || l.receipt_id || l.receipt_override_by;
     const net = Number(l.net_amount);
     const codeOk = l.cost_code || (costCodes && !costCodes.error && costCodes.defaults?.[l.category]?.wbs_code_id);
     return hasReceipt && Number.isFinite(net) && net > 0 && codeOk;
@@ -278,6 +279,14 @@ export default function SubmissionDetail({ id, onClose, onChanged, me }) {
     } finally {
       setBusy(false);
     }
+  }
+  async function handleReceiptOverride(line, enable) {
+    if (enable && !window.confirm(
+      `Post line ${line.row_index ?? ""} to Procore WITHOUT a receipt?
+
+This is recorded under your name, and the net is estimated from the claimed amount at the province tax rate.`
+    )) return;
+    await mutate(() => api.receiptOverride(id, line.id, enable));
   }
   async function handleDeleteReceipt(receiptId) {
     if (!window.confirm("Remove this attachment? Any line matched to it goes back to unmatched.")) return;
@@ -481,19 +490,33 @@ export default function SubmissionDetail({ id, onClose, onChanged, me }) {
                           )}
                         </span>
                       ) : (
-                        <select defaultValue="" disabled={!actionable}
-                          onChange={(e) => e.target.value && mutate(() => api.matchLine(id, l.id, e.target.value))}>
-                          <option value="">— match a receipt —</option>
-                          {pickableReceipts.map((r) => {
-                            const usedOn = linesForReceipt(r.id);
-                            return (
-                              <option key={r.id} value={r.id}>
-                                {r.vendor || "receipt"} · {money(r.gross)}
-                                {usedOn.length ? ` (also line ${usedOn.map((x) => x.row_index).join(", ")})` : ""}
-                              </option>
-                            );
-                          })}
-                        </select>
+                        <>
+                          <select defaultValue="" disabled={!actionable}
+                            onChange={(e) => e.target.value && mutate(() => api.matchLine(id, l.id, e.target.value))}>
+                            <option value="">— match a receipt —</option>
+                            {pickableReceipts.map((r) => {
+                              const usedOn = linesForReceipt(r.id);
+                              return (
+                                <option key={r.id} value={r.id}>
+                                  {r.vendor || "receipt"} · {money(r.gross)}
+                                  {usedOn.length ? ` (also line ${usedOn.map((x) => x.row_index).join(", ")})` : ""}
+                                </option>
+                              );
+                            })}
+                          </select>
+                          {l.receipt_override_by ? (
+                            <div className="row-secondary" style={{ color: "var(--yellow)", marginTop: 4 }}>
+                              No receipt — waived by {l.receipt_override_by}
+                              {actionable && me?.canOverrideReceipt && (
+                                <button className="chip-x" title="Require a receipt again"
+                                  onClick={() => handleReceiptOverride(l, false)}>×</button>
+                              )}
+                            </div>
+                          ) : actionable && me?.canOverrideReceipt ? (
+                            <button className="btn btn-ghost btn-sm" style={{ marginTop: 4 }}
+                              onClick={() => handleReceiptOverride(l, true)}>Post without receipt</button>
+                          ) : null}
+                        </>
                       )}
                     </td>
                     <td>
@@ -636,7 +659,7 @@ export default function SubmissionDetail({ id, onClose, onChanged, me }) {
         )}
         {actionable && !dupFlag && !allComplete && lines.length > 0 && (
           <span className="row-secondary" style={{ alignSelf: "center", width: "100%" }}>
-            Every line needs a receipt (or be flat-claim), a net amount, and a cost code.
+            Every line needs a receipt (or be flat-claim, or waived), a net amount, and a cost code.
           </span>
         )}
       </div>

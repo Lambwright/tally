@@ -164,6 +164,16 @@ describe("deriveLineNet", () => {
   it("no receipt: net null", () => {
     expect(deriveLineNet({ is_flat_claim: false, gross_amount: 100 }, null, "ON")).toEqual({ net: null, tax: null, tax_source: "none" });
   });
+  it("no receipt but waived by an override user: province-rate estimate off the claimed gross", () => {
+    const d = deriveLineNet({ is_flat_claim: false, gross_amount: 113, category: "materials", receipt_override_by: "leela@einbau.ca" }, null, "ON");
+    expect(d.tax_source).toBe("fallback_table");
+    expect(d.net).toBeCloseTo(100, 1);
+    expect(d.tax).toBeCloseTo(13, 1);
+  });
+  it("waived line with no province or no gross: still null, never a guess", () => {
+    expect(deriveLineNet({ is_flat_claim: false, gross_amount: 113, receipt_override_by: "leela@einbau.ca" }, null, null).net).toBeNull();
+    expect(deriveLineNet({ is_flat_claim: false, gross_amount: null, receipt_override_by: "leela@einbau.ca" }, null, "ON").net).toBeNull();
+  });
   it("receipt with printed tax: net = subtotal, source read", () => {
     const d = deriveLineNet(
       { is_flat_claim: false, gross_amount: 113 },
@@ -215,6 +225,13 @@ describe("computeLineFlags", () => {
   it("unmatched non-flat line -> receipt_unmatched", () => {
     const line = { category: "materials", is_flat_claim: false, receipt_id: null };
     expect(computeLineFlags(line, null, "ON", project).map((f) => f.code)).toContain("receipt_unmatched");
+  });
+  it("waived line: receipt_override instead of receipt_unmatched, plus tax_estimated", () => {
+    const line = { category: "materials", is_flat_claim: false, receipt_id: null, receipt_override_by: "leela@einbau.ca", tax_source: "fallback_table", gross_amount: 113, net_amount: 100, tax_amount: 13 };
+    const codes = computeLineFlags(line, null, "ON", project).map((f) => f.code);
+    expect(codes).toContain("receipt_override");
+    expect(codes).toContain("tax_estimated");
+    expect(codes).not.toContain("receipt_unmatched");
   });
   it("fallback tax -> tax_estimated", () => {
     const line = { category: "materials", is_flat_claim: false, receipt_id: "r1", tax_source: "fallback_table", gross_amount: 113, net_amount: 100, tax_amount: 13 };

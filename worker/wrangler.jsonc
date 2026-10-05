@@ -35,6 +35,11 @@
 		// but NOT in ALLOWED_USERS sees only their own submissions; being in both
 		// just keeps full reviewer access.
 		"PM_SUBMITTERS": "",
+		// Who may waive the receipt requirement on a line (so it can still post to
+		// Procore with no receipt attached) -- Leela only, at her discretion. Comma
+		// list of Einbau ID usernames. Narrower than approving: others can approve a
+		// line she has waived, but cannot waive one themselves.
+		"RECEIPT_OVERRIDE_USERS": "leela@einbau.ca",
 		"CURRENT_APP": "tally",
 		// The "MISC EMP Expenses" vendor's numeric Procore id -- expense Direct
 		// Costs post against this vendor, not Einbau itself. CONFIRMED (Ben,

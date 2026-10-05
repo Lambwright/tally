@@ -169,6 +169,42 @@ links a reply to its form by hand. `POST /submissions/:id/request-revision`
 already produces a copy-ready reply carrying the Expense ID; `/intake`'s dedup
 picks up threading automatically once it reliably lands in the subject.
 
+## Coming change: Einbau ID role matrix
+
+Einbau ID permissions are moving from ALLOWED_USERS-style username lists to
+company job roles plus a per-app matrix, edited in HELM by the Super Admin
+only. `auth-worker` will add `user.appRoles` (e.g. `{ TALLY: "submitter" }`,
+computed from the matrix) and `user.jobRole` (informational) alongside the
+existing `user.apps`; `user.role` becomes legacy and only ever `"admin"` for
+the Super Admin after the switch. **Not built yet — this is a heads-up, no
+code has changed.**
+
+TALLY's two levels, as proposed:
+- **admin** — final push of inbound-email expenses to Procore, approve
+  manually-loaded expenses and push them to Procore, run bulk exports.
+  Today: Ben, Leela (Josh is job-role Admin but overridden to Project Manager
+  in TALLY, so he'd be a submitter; where Devid lands isn't settled yet).
+- **submitter** — submit your own expenses, see only your own. Everyone else.
+
+This replaces `ALLOWED_USERS` / `ALLOWED_ROLES` / `PM_APPROVERS` /
+`PM_SUBMITTERS` in `wrangler.jsonc` with one `appRoles.TALLY` read.
+
+**Doesn't fit admin/submitter — needs a home in the matrix:** the receipt
+override. Leela (only) can waive the receipt requirement on a single line so
+it still posts to Procore, at her discretion (`RECEIPT_OVERRIDE_USERS` in
+`wrangler.jsonc`, recorded per line in `line_items.receipt_override_by/_at`
+and in the submission history). It's narrower than "admin" — Ben can approve a
+line she's waived but can't waive one himself — so the matrix will either need
+a third TALLY level for it or this stays a TALLY-local list.
+
+Also part of the plan: nobody approves their own expenses — not built today
+(`handleApprove` has no self-approval check at all, for any submission
+origin). Open question once this lands: for an **email**-sourced submission
+there's no Einbau ID `created_by` to compare against (Power Automate has no
+session) — self-approval would need to match on `employee_name`/
+`employee_email` instead for that path, which is fuzzier than the exact
+`created_by` match the app-created paths (`upload`, `pm_direct`) already have.
+
 ## Verification
 
 - `cd worker && npm test` — pure-logic unit tests (expense-id parsing,

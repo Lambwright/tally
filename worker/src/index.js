@@ -23,11 +23,12 @@
 //   DELETE /submissions/:id/lines/:lineId       (Einbau ID) remove a line
 //   POST   /submissions/:id/lines/:lineId/match (Einbau ID) { receipt_id } -> attach a receipt, recompute net
 //   POST   /submissions/:id/lines/:lineId/unmatch (Einbau ID) detach the receipt
+//   POST   /submissions/:id/lines/:lineId/receipt-override (RECEIPT_OVERRIDE_USERS only) { override } waive the receipt requirement on one line
 //   POST   /submissions/:id/approve[?dryRun=1]  (Einbau ID) build 1 DC header + N line items, post at net
 //   POST   /submissions/:id/retry-attachments   (Einbau ID) re-upload the form + receipts to an already-created DC
 //   POST   /submissions/:id/request-revision    (Einbau ID) { note } -> needs_revision + a copy-ready reply
 //   POST   /submissions/:id/reject              (Einbau ID) { reason } -> rejected
-//   GET    /me                                   (Einbau ID) { username, displayName, isReviewer, isPmSubmitter, isPmApprover }
+//   GET    /me                                   (Einbau ID) { username, displayName, isReviewer, isPmSubmitter, isPmApprover, canOverrideReceipt }
 //   GET    /projects                            (Einbau ID) cached active-project list
 //   GET    /company-users                       (Einbau ID) live Procore company user list, for the employee picker
 //   GET    /export?from=&to=&status=            (Einbau ID, reviewer) CSV, one row per line item -- payroll/period export
@@ -792,7 +793,19 @@ function deriveLineNet(line, receipt, province, { shared = false } = {}) {
     const g = money(line.gross_amount);
     return { net: g, tax: g == null ? null : 0, tax_source: "none" };
   }
-  if (!receipt) return { net: null, tax: null, tax_source: "none" };
+  if (!receipt) {
+    // Receipt waived by an override user: nothing to read tax off, so estimate
+    // from the claimed gross at the province rate (flagged tax_estimated).
+    if (line.receipt_override_by) {
+      const g = money(line.gross_amount);
+      const r = province ? fallbackTaxRate(province, line.category) : null;
+      if (g != null && r != null) {
+        const net = round2(g / (1 + r / 100));
+        return { net, tax: round2(g - net), tax_source: "fallback_table" };
+      }
+    }
+    return { net: null, tax: null, tax_source: "none" };
+  }
 
   const taxLines = receipt.tax_json || receipt.tax_lines;
   const taxRead = sumTaxLines(taxLines);
@@ -842,7 +855,16 @@ function computeLineFlags(line, receipt, formProvince, project, { shared = false
   const add = (code, severity, detail) => flags.push({ code, severity, detail });
   const flat = line.is_flat_claim;
 
-  if (!flat && !line.receipt_id) add("receipt_unmatched", "high", "No receipt matched to this line.");
+  if (!flat && !line.receipt_id) {
+    if (line.receipt_override_by) {
+      add("receipt_override", "medium", `Posting without a receipt — waived by ${line.receipt_override_by}.`);
+      if (line.tax_source === "fallback_table") {
+        add("tax_estimated", "medium", "Net is a province-rate estimate — there's no receipt to read tax off.");
+      }
+    } else {
+      add("receipt_unmatched", "high", "No receipt matched to this line.");
+    }
+  }
   if (!flat && line.receipt_id) {
     if (shared) {
       add("receipt_shared", "low", line.tax_source === "manual"
@@ -1166,7 +1188,7 @@ async function handleExport(url, sql) {
   const rows = await sql`
     select
       s.expense_id, s.origin, s.employee_name, s.project_number, s.project_name,
-      l.category, l.line_date, l.net_amount, l.description,
+      l.category, l.line_date, l.net_amount, l.description, l.receipt_override_by,
       exists (select 1 from receipts r where r.submission_id = s.id and r.kind = 'form') as has_form,
       s.procore_direct_cost_id, s.reviewed_by, s.reviewed_at
     from line_items l
@@ -1177,7 +1199,7 @@ async function handleExport(url, sql) {
 
   const header = [
     "expense_id", "origin", "employee_name", "project_number", "project_name",
-    "category", "line_date", "net_amount", "description", "has_form",
+    "category", "line_date", "net_amount", "description", "receipt_override_by", "has_form",
     "procore_direct_cost_id", "reviewed_by", "reviewed_at",
   ];
   const csvEscape = (v) => {
@@ -1490,6 +1512,7 @@ async function handleLineMatch(subId, lineId, request, sql, user) {
   const lf = computeLineFlags({ ...line, receipt_id: receipt.id, net_amount: d.net, tax_amount: d.tax, tax_source: d.tax_source }, receipt, sub.province, project, { shared });
   const [row] = await sql`
     update line_items set receipt_id = ${receipt.id}, match_method = 'manual', match_confidence = 1,
+      receipt_override_by = null, receipt_override_at = null,
       net_amount = ${d.net}, tax_amount = ${d.tax}, tax_source = ${d.tax_source},
       flags = ${JSON.stringify(lf)}::jsonb, updated_at = now()
     where id = ${lineId} returning *`;
@@ -1517,6 +1540,58 @@ async function handleLineUnmatch(subId, lineId, sql, user) {
     where id = ${lineId} returning *`;
   if (line.receipt_id) await resyncLinesForReceipt(sql, subId, line.receipt_id, sub.province, project); // may un-share it
   await bumpForm(sql, subId, historyEvent("line_unmatched", `${user.username} cleared the receipt on line ${line.row_index}`));
+  const form_flags = await recomputeFormFlags(sql, subId);
+  return json({ line: row, form_flags });
+}
+
+// Usernames (RECEIPT_OVERRIDE_USERS, comma list) allowed to waive the receipt
+// requirement on a line — Leela only, at her discretion. Deliberately its own
+// list: it's narrower than "can approve" (Ben can approve; only she can waive).
+function canOverrideReceipt(env, user) {
+  const allowed = String(env.RECEIPT_OVERRIDE_USERS || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+  return allowed.includes(String(user?.username || "").toLowerCase());
+}
+
+// POST /submissions/:id/lines/:lineId/receipt-override { override: true|false }
+// Waive (or restore) the receipt requirement on one line. With the waiver on,
+// the line posts to Procore with no receipt; net is a province-rate estimate off
+// the claimed gross (flagged tax_estimated) unless a net was typed by hand.
+async function handleReceiptOverride(subId, lineId, request, env, sql, user) {
+  if (!canOverrideReceipt(env, user)) {
+    return json({ error: "forbidden", detail: "Only receipt-override approvers can post a line without a receipt." }, 403);
+  }
+  const body = await parseBody(request).catch(() => ({}));
+  const enable = body.override !== false;
+
+  const [line] = await sql`select * from line_items where id = ${lineId} and submission_id = ${subId}`;
+  if (!line) return json({ error: "not_found" }, 404);
+  const [sub] = await sql`select * from submissions where id = ${subId}`;
+  if (sub.status === "approved" || sub.status === "rejected") {
+    return json({ error: "submission_closed", detail: `This submission is already ${sub.status}.` }, 409);
+  }
+  if (line.is_flat_claim) return json({ error: "flat_claim_line", detail: "Mileage / per diem lines never need a receipt." }, 422);
+  if (line.receipt_id) return json({ error: "has_receipt", detail: "This line already has a receipt matched." }, 422);
+
+  const next = { ...line, receipt_override_by: enable ? user.username : null };
+  if (line.tax_source !== "manual") {
+    const d = deriveLineNet(next, null, sub.province);
+    next.net_amount = d.net; next.tax_amount = d.tax; next.tax_source = d.tax_source;
+  }
+  const project = await projectForSubmission(sub, sql);
+  const lf = computeLineFlags(next, null, sub.province, project);
+  const [row] = await sql`
+    update line_items set
+      receipt_override_by = ${next.receipt_override_by},
+      receipt_override_at = ${enable ? new Date().toISOString() : null},
+      net_amount = ${next.net_amount}, tax_amount = ${next.tax_amount}, tax_source = ${next.tax_source},
+      flags = ${JSON.stringify(lf)}::jsonb, updated_at = now()
+    where id = ${lineId} returning *`;
+  await bumpForm(sql, subId, historyEvent(
+    enable ? "receipt_override_on" : "receipt_override_off",
+    enable
+      ? `${user.username} waived the receipt requirement on line ${line.row_index}`
+      : `${user.username} restored the receipt requirement on line ${line.row_index}`
+  ));
   const form_flags = await recomputeFormFlags(sql, subId);
   return json({ line: row, form_flags });
 }
@@ -1559,7 +1634,7 @@ async function handleApprove(subId, url, request, env, sql, user) {
 
   const incomplete = lines.filter((l) => {
     const net = money(l.net_amount);
-    const hasReceipt = l.is_flat_claim || l.receipt_id;
+    const hasReceipt = l.is_flat_claim || l.receipt_id || l.receipt_override_by;
     return !hasReceipt || net === null || net <= 0;
   });
   if (incomplete.length) {
@@ -1893,6 +1968,7 @@ export default {
           isReviewer: auth.isReviewer,
           isPmSubmitter: auth.isPmSubmitter,
           isPmApprover: pmApprovers.includes(String(auth.user.username || "").toLowerCase()),
+          canOverrideReceipt: canOverrideReceipt(env, auth.user),
         }));
       }
 
@@ -1992,6 +2068,7 @@ export default {
               if (!act && request.method === "DELETE") return withRefresh(await handleLineDelete(subId, lineId, sql, auth.user));
               if (act === "match" && request.method === "POST") return withRefresh(await handleLineMatch(subId, lineId, request, sql, auth.user));
               if (act === "unmatch" && request.method === "POST") return withRefresh(await handleLineUnmatch(subId, lineId, sql, auth.user));
+              if (act === "receipt-override" && request.method === "POST") return withRefresh(await handleReceiptOverride(subId, lineId, request, env, sql, auth.user));
             }
           }
         }

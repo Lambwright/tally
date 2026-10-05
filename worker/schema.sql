@@ -132,6 +132,12 @@ create table line_items (
   -- province. See migration_002.sql for adding this to an existing database.
   tax_code text,
 
+  -- Set when someone in RECEIPT_OVERRIDE_USERS (Leela) waives the receipt
+  -- requirement for this line, at her discretion. Non-null = overridden; the
+  -- line may then post to Procore with no receipt attached. See migration_005.sql.
+  receipt_override_by text,
+  receipt_override_at timestamptz,
+
   -- per-line deterministic checks: [{ code, severity, detail }]
   flags jsonb not null default '[]'::jsonb,
 
