@@ -207,6 +207,14 @@ and in the submission history). It's narrower than "admin" — Ben can approve a
 line she's waived but can't waive one himself — so the matrix will either need
 a third TALLY level for it or this stays a TALLY-local list.
 
+**Ben's principle (closed loop):** anyone submitting their own expense goes
+through the portal and must say who it's for at creation (a submitter is forced
+to their own name). Payment only ever goes to the named employee, so
+mislabelling someone else's expense can't pay the submitter. Emailed forms
+carry a PDF that says whom they belong to by name (the form has no email
+field), so self-approval only ever compares names — the email *sender* and any
+email address never count.
+
 Also part of the plan: nobody approves their own expenses — not built today
 (`handleApprove` has no self-approval check at all, for any submission
 origin). Open question once this lands: for an **email**-sourced submission

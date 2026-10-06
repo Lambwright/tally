@@ -14,6 +14,7 @@ const {
   normalizeAttachments,
   resolveTier,
   selfApprovalReason,
+  canOverrideReceipt,
 } = _test;
 
 describe("extractExpenseId", () => {
@@ -334,16 +335,14 @@ describe("resolveTier (appRoles.TALLY)", () => {
 describe("selfApprovalReason", () => {
   const ben = { username: "ben", displayName: "Ben Wright", firstName: "Ben", lastName: "Wright", email: "ben@einbau.ca" };
 
-  it("(a) the submission's employee email is the approver's", () => {
-    expect(selfApprovalReason(ben, { employee_email: " Ben@Einbau.ca ", employee_name: "Someone Else" })).toMatch(/email/);
+  it("an email address never blocks anyone: the sender's address (employee_email) is ignored", () => {
+    expect(selfApprovalReason(ben, { employee_email: "ben@einbau.ca", employee_name: "Mike Sefeldas" })).toBeNull();
+    expect(selfApprovalReason({ username: "leela@einbau.ca", displayName: "Leela" }, { employee_email: "leela@einbau.ca", employee_name: "Mike Sefeldas" })).toBeNull();
   });
-  it("(a) also matches when the username itself is the email", () => {
-    expect(selfApprovalReason({ username: "leela@einbau.ca", displayName: "Leela" }, { employee_email: "LEELA@einbau.ca" })).toMatch(/email/);
-  });
-  it("(b) the name Claude read off the form is the approver's, even if it was renamed since", () => {
+  it("(a) the name Claude read off the form is the approver's, even if it was renamed since", () => {
     expect(selfApprovalReason(ben, { form_employee_name: "ben  wright", employee_name: "Mike Sefeldas" })).toMatch(/form/);
   });
-  it("(c) the employee name the push would use is the approver's", () => {
+  it("(b) the employee name the push would use is the approver's", () => {
     expect(selfApprovalReason(ben, { employee_name: "BEN WRIGHT" })).toMatch(/expense/);
     // also "firstName lastName" when displayName is something else
     expect(selfApprovalReason({ ...ben, displayName: "Benny" }, { employee_name: "Ben Wright" })).toMatch(/expense/);
@@ -351,5 +350,27 @@ describe("selfApprovalReason", () => {
   it("someone else's expense is not blocked, and blanks never match blanks", () => {
     expect(selfApprovalReason(ben, { employee_name: "Mike Sefeldas", employee_email: "mike@einbau.ca", form_employee_name: "Mike Sefeldas" })).toBeNull();
     expect(selfApprovalReason({ username: "x" }, { employee_name: "", employee_email: "", form_employee_name: null })).toBeNull();
+  });
+});
+
+describe("canOverrideReceipt", () => {
+  const env = { RECEIPT_OVERRIDE_USERS: "leela@einbau.ca" };
+  const leela = { username: "Leela@Einbau.ca" };
+  it("on the list + TALLY admin: allowed", () => {
+    expect(canOverrideReceipt(env, leela, "admin")).toBe(true);
+  });
+  it("on the list but only a submitter: no waiver", () => {
+    expect(canOverrideReceipt(env, leela, "submitter")).toBe(false);
+  });
+  it("Live switch still off ('access'): the list alone, as before", () => {
+    expect(canOverrideReceipt(env, leela, "access")).toBe(true);
+  });
+  it("admin who isn't on the list: no waiver", () => {
+    expect(canOverrideReceipt(env, { username: "ben" }, "admin")).toBe(false);
+  });
+  it("no level, unknown level, empty list: no waiver", () => {
+    expect(canOverrideReceipt(env, leela, undefined)).toBe(false);
+    expect(canOverrideReceipt(env, leela, "no_access")).toBe(false);
+    expect(canOverrideReceipt({ RECEIPT_OVERRIDE_USERS: "" }, leela, "admin")).toBe(false);
   });
 });

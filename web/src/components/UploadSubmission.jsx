@@ -63,7 +63,7 @@ export default function UploadSubmission({ onClose, onCreated }) {
   }
 
   async function handleParse() {
-    if (!files.length) return;
+    if (!files.length || !employeeName.trim()) return;
     setBusy(true);
     setError(null);
     try {
@@ -124,7 +124,7 @@ export default function UploadSubmission({ onClose, onCreated }) {
         )}
 
         <div className="field" style={{ marginTop: 12 }}>
-          <label htmlFor="upload-employee">Employee name (optional — Claude reads it off the form)</label>
+          <label htmlFor="upload-employee">Employee this expense is for (required)</label>
           <input id="upload-employee" list="upload-employee-options" placeholder="Search Einbau employees…"
             value={employeeName} disabled={busy} onChange={(e) => setEmployeeName(e.target.value)} />
           <datalist id="upload-employee-options">
@@ -144,7 +144,7 @@ export default function UploadSubmission({ onClose, onCreated }) {
 
         <div className="modal-actions">
           <button type="button" className="btn btn-ghost" onClick={onClose} disabled={busy}>Cancel</button>
-          <button type="button" className="btn btn-orange" onClick={handleParse} disabled={busy || !files.length}>
+          <button type="button" className="btn btn-orange" onClick={handleParse} disabled={busy || !files.length || !employeeName.trim()}>
             {busy ? "Uploading…" : "Parse with Claude"}
           </button>
         </div>

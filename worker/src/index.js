@@ -297,26 +297,22 @@ async function requireLogin(request, env) {
 }
 
 // Ben's rule: nobody approves their own expense, admins included. Returns why
-// this approver is blocked, or null. Any one of these matching blocks it:
-//  (a) the submission's employee email is the approver's own (email intake
-//      stores the SENDER's address here, so an admin who forwards someone
-//      else's form is blocked too — errs safe; the other admin approves it),
-//  (b) the name Claude read off the form is the approver's name,
-//  (c) the employee name currently on the submission — the one the Procore
-//      push tags — is the approver's name (so renaming the employee away from
-//      yourself to dodge (b) still trips (b), via form_employee_name).
+// this approver is blocked, or null. Either of these matching blocks it:
+//  (a) the name Claude read off the form is the approver's name
+//      (form_employee_name),
+//  (b) the employee name currently on the submission — the one the Procore push
+//      tags — is the approver's name (so renaming the employee away from
+//      yourself to dodge (a) still trips (a)).
 // Names compare case- and whitespace-insensitively against displayName and
-// "firstName lastName".
+// "firstName lastName". The email sender never counts, and neither does any
+// email address: the employee form has no email field, and a forwarded form
+// says who it belongs to by name.
 function selfApprovalReason(user, sub) {
   const norm = (s) => String(s || "").toLowerCase().replace(/\s+/g, " ").trim();
   const myNames = new Set(
     [user?.displayName, `${user?.firstName || ""} ${user?.lastName || ""}`].map(norm).filter(Boolean)
   );
-  const myEmails = new Set([user?.email, String(user?.username || "").includes("@") ? user.username : ""].map(norm).filter(Boolean));
 
-  if (norm(sub?.employee_email) && myEmails.has(norm(sub.employee_email))) {
-    return "this expense's employee email is yours";
-  }
   if (norm(sub?.form_employee_name) && myNames.has(norm(sub.form_employee_name))) {
     return "the employee on the form is you";
   }
@@ -1035,7 +1031,7 @@ async function handleIntake(request, env, sql, ctx) {
   const sub = await createSubmissionFromAttachments(env, sql, ctx, {
     atts,
     employeeName: body.employee_name || null,
-    employeeEmail: fromEmail,
+    employeeEmail: fromEmail, // who sent it — shown to reviewers for context, never used for any permission check
     province: body.province,
     projectNumber: (body.project_number && String(body.project_number).trim()) || null,
     rawEmail,
@@ -1061,6 +1057,12 @@ async function handleUpload(request, env, sql, ctx, auth) {
   if (atts.length === 0) return json({ error: "no_attachments", detail: "No files were uploaded." }, 422);
 
   const isPmSubmission = auth.isPmSubmitter && !auth.isReviewer;
+  // Anyone submitting through the portal must say who the expense is for at
+  // creation (a submitter is forced to themselves below). Payment only ever
+  // goes to the named employee, so mislabelling can't pay the submitter.
+  if (!isPmSubmission && !(body.employee_name || "").toString().trim()) {
+    return json({ error: "employee_required", detail: "Say which employee this expense is for." }, 400);
+  }
   const sub = await createSubmissionFromAttachments(env, sql, ctx, {
     atts,
     employeeName: isPmSubmission
@@ -1590,8 +1592,13 @@ async function handleLineUnmatch(subId, lineId, sql, user) {
 
 // Usernames (RECEIPT_OVERRIDE_USERS, comma list) allowed to waive the receipt
 // requirement on a line — Leela only, at her discretion. Deliberately its own
-// list: it's narrower than "can approve" (Ben can approve; only she can waive).
-function canOverrideReceipt(env, user) {
+// TALLY-local list (not part of the role matrix): narrower than "can approve"
+// (Ben can approve; only she can waive). Being on the list isn't enough on its
+// own once TALLY is live on the matrix: the person must also be a TALLY admin,
+// so a submitter on the list can't waive. While the Live switch is off
+// (level 'access') it's the list alone, as before.
+function canOverrideReceipt(env, user, level) {
+  if (level !== "admin" && level !== "access") return false;
   const allowed = String(env.RECEIPT_OVERRIDE_USERS || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
   return allowed.includes(String(user?.username || "").toLowerCase());
 }
@@ -1600,8 +1607,8 @@ function canOverrideReceipt(env, user) {
 // Waive (or restore) the receipt requirement on one line. With the waiver on,
 // the line posts to Procore with no receipt; net is a province-rate estimate off
 // the claimed gross (flagged tax_estimated) unless a net was typed by hand.
-async function handleReceiptOverride(subId, lineId, request, env, sql, user) {
-  if (!canOverrideReceipt(env, user)) {
+async function handleReceiptOverride(subId, lineId, request, env, sql, user, level) {
+  if (!canOverrideReceipt(env, user, level)) {
     return json({ error: "forbidden", detail: "Only receipt-override approvers can post a line without a receipt." }, 403);
   }
   const body = await parseBody(request).catch(() => ({}));
@@ -2019,7 +2026,7 @@ export default {
           isReviewer: auth.isReviewer,
           isPmSubmitter: auth.isPmSubmitter,
           isPmApprover: auth.isPmApprover,
-          canOverrideReceipt: canOverrideReceipt(env, auth.user),
+          canOverrideReceipt: canOverrideReceipt(env, auth.user, auth.level),
         }));
       }
 
@@ -2119,7 +2126,7 @@ export default {
               if (!act && request.method === "DELETE") return withRefresh(await handleLineDelete(subId, lineId, sql, auth.user));
               if (act === "match" && request.method === "POST") return withRefresh(await handleLineMatch(subId, lineId, request, sql, auth.user));
               if (act === "unmatch" && request.method === "POST") return withRefresh(await handleLineUnmatch(subId, lineId, sql, auth.user));
-              if (act === "receipt-override" && request.method === "POST") return withRefresh(await handleReceiptOverride(subId, lineId, request, env, sql, auth.user));
+              if (act === "receipt-override" && request.method === "POST") return withRefresh(await handleReceiptOverride(subId, lineId, request, env, sql, auth.user, auth.level));
             }
           }
         }
@@ -2159,4 +2166,5 @@ export const _test = {
   NO_RECEIPT_CATEGORIES,
   resolveTier,
   selfApprovalReason,
+  canOverrideReceipt,
 };
