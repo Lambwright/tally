@@ -176,14 +176,24 @@ company job roles plus a per-app matrix, edited in HELM by the Super Admin
 only. `auth-worker` will add `user.appRoles` (e.g. `{ TALLY: "submitter" }`,
 computed from the matrix) and `user.jobRole` (informational) alongside the
 existing `user.apps`; `user.role` becomes legacy and only ever `"admin"` for
-the Super Admin after the switch. **Not built yet — this is a heads-up, no
-code has changed.**
+the Super Admin after the switch.
+
+**Status (2026-10-05): built in the worker, pending deploy + Ben flipping TALLY's
+Live switch in HELM.** `resolveTier` reads `appRoles.TALLY`: `admin` /
+`submitter` use the matrix; `access` (switch still off) keeps the old
+`ALLOWED_USERS`/`ALLOWED_ROLES`/`PM_*` lists exactly as they were; anything else,
+or `apps` missing/without TALLY, is a 403. The old lists come out in a
+follow-up once it's settled. Self-approval is enforced in `handleApprove`
+(`selfApprovalReason`: employee email, the name Claude read off the form —
+stored separately as `form_employee_name`, `migration_006.sql` — and the
+employee name the push would use).
 
 TALLY's two levels, as proposed:
 - **admin** — final push of inbound-email expenses to Procore, approve
   manually-loaded expenses and push them to Procore, run bulk exports.
-  Today: Ben, Leela (Josh is job-role Admin but overridden to Project Manager
-  in TALLY, so he'd be a submitter; where Devid lands isn't settled yet).
+  Today: Ben, Leela only (Josh is job-role Admin but overridden to Project
+  Manager in TALLY, so he's a submitter; Devid is a submitter too — Ben
+  confirmed dropping both from full reviewer access is intended).
 - **submitter** — submit your own expenses, see only your own. Everyone else.
 
 This replaces `ALLOWED_USERS` / `ALLOWED_ROLES` / `PM_APPROVERS` /

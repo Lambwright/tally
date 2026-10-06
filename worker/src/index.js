@@ -33,10 +33,15 @@
 //   GET    /company-users                       (Einbau ID) live Procore company user list, for the employee picker
 //   GET    /export?from=&to=&status=            (Einbau ID, reviewer) CSV, one row per line item -- payroll/period export
 //
-// PM self-serve: a PM_SUBMITTERS-only user (see wrangler.jsonc) hits the same
-// /submissions/upload with no PDF form; the row gets origin='pm_direct' and
-// is scoped to their own view everywhere. Its Approve is blocked until a
-// PM_APPROVERS user (Leela) does it -- same Procore write, just gated.
+// Access: user.appRoles.TALLY from auth-worker -- 'admin' (reviewer + approver),
+// 'submitter' (own expenses only), 'access' (HELM's Live switch still off: the
+// old ALLOWED_USERS/PM_* lists in wrangler.jsonc apply), anything else -> 403.
+// See resolveTier. Nobody approves their own expense (selfApprovalReason).
+//
+// PM self-serve: a submitter hits the same /submissions/upload with no PDF
+// form; the row gets origin='pm_direct' and is scoped to their own view
+// everywhere. Its Approve is blocked until an admin does it -- same Procore
+// write, just gated.
 //   POST   /admin/refresh-projects              (Einbau ID, admin) refresh projects_cache now
 //   GET    /admin/procore-probe?path=           (Einbau ID, admin) proxy an arbitrary Procore GET (diagnostic)
 //   scheduled (cron 0 */6 * * *)                refresh projects_cache from Procore
@@ -218,6 +223,51 @@ async function parseBody(request) {
 // Auth
 // ---------------------------------------------------------------------------
 
+const csv = (v) => String(v || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+
+const NO_TALLY_ACCESS = "You don't have access to TALLY, ask Ben.";
+
+// Turns an auth-worker user object (from /auth/verify) into TALLY's permission
+// flags. Pure — no I/O — so it's unit-tested. Three cases for appRoles.TALLY
+// (auth-worker/README.md, "Role matrix"):
+//   'admin'     -> reviewer + approver of everything (incl. PM-submitted expenses)
+//   'submitter' -> submits own expenses, sees only their own
+//   'access'    -> TALLY's Live switch in HELM is still off: keep the old
+//                  ALLOWED_USERS / ALLOWED_ROLES / PM_SUBMITTERS / PM_APPROVERS
+//                  checks exactly as they were. Those lists go in a follow-up
+//                  once the switch is flipped and settled.
+//   anything else (no_access, missing key, unrecognised) -> denied.
+// `apps` fails closed: missing / non-array counts as [] (no access).
+function resolveTier(user, env) {
+  const denied = (reason) => ({ ok: false, status: 403, reason });
+  const apps = Array.isArray(user?.apps) ? user.apps : [];
+  if (!apps.includes("TALLY")) return denied(NO_TALLY_ACCESS);
+
+  const level = user.appRoles && typeof user.appRoles === "object" ? user.appRoles.TALLY : undefined;
+  if (level === "admin") return { ok: true, isReviewer: true, isPmSubmitter: false, isPmApprover: true, level };
+  if (level === "submitter") return { ok: true, isReviewer: false, isPmSubmitter: true, isPmApprover: false, level };
+  if (level !== "access") return denied(NO_TALLY_ACCESS);
+
+  // --- not switched yet: today's checks, unchanged ---
+  const username = String(user.username || "").toLowerCase();
+  const isPmSubmitter = csv(env.PM_SUBMITTERS).includes(username);
+  const isPmApprover = csv(env.PM_APPROVERS).includes(username);
+
+  // ALLOWED_USERS is the real gate; ALLOWED_ROLES is a coarser fallback when
+  // it isn't set. Being in PM_SUBMITTERS is sufficient on its own.
+  const allowedUsers = csv(env.ALLOWED_USERS);
+  let isReviewer;
+  if (allowedUsers.length) {
+    isReviewer = allowedUsers.includes(username);
+    if (!isReviewer && !isPmSubmitter) return denied(`TALLY is limited to specific users — "${user.username}" isn't one of them.`);
+  } else {
+    const allowedRoles = String(env.ALLOWED_ROLES || "admin,user").split(",").map((r) => r.trim());
+    isReviewer = allowedRoles.includes(user.role);
+    if (!isReviewer && !isPmSubmitter) return denied(`Logged in as "${user.username}" (role "${user.role}"), which isn't allowed in TALLY.`);
+  }
+  return { ok: true, isReviewer, isPmSubmitter, isPmApprover, level };
+}
+
 async function requireLogin(request, env) {
   const header = request.headers.get("Authorization") || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : null;
@@ -238,49 +288,42 @@ async function requireLogin(request, env) {
     if (!data.valid) return { ok: false, reason: "Session is invalid or expired — please log in again." };
     if (!data.user) return { ok: false, reason: "auth-worker returned no user for this session." };
 
-    // Per-app access list from HELM (auth-worker/README.md, "The user object,
-    // and the apps field"). Absent apps = unrestricted (every user today) —
-    // only deny when it's a present array that doesn't include "TALLY".
-    // Additive alongside the ALLOWED_USERS/ALLOWED_ROLES check below, not a
-    // replacement for it.
-    if (data.user.apps !== undefined) {
-      const apps = Array.isArray(data.user.apps) ? data.user.apps : [];
-      if (!apps.includes("TALLY")) {
-        return { ok: false, reason: `"${data.user.username}" doesn't have TALLY access (HELM apps list).` };
-      }
-    }
-
-    // TALLY is used by a named few (Ben, Josh, Leela, Devid). ALLOWED_USERS is
-    // the real gate — a comma list of Einbau ID usernames. ALLOWED_ROLES stays
-    // as a coarser fallback when ALLOWED_USERS isn't set.
-    //
-    // PM_SUBMITTERS is a second, narrower gate — a PM submitting their own
-    // expenses (see "PM self-serve" in the route list) doesn't need full
-    // reviewer access, just enough to pass this check and get scoped down to
-    // their own rows everywhere else. Being in PM_SUBMITTERS is sufficient on
-    // its own; ALLOWED_USERS membership isn't required too.
-    const username = String(data.user.username || "").toLowerCase();
-    const pmSubmitters = String(env.PM_SUBMITTERS || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
-    const isPmSubmitter = pmSubmitters.includes(username);
-
-    const allowedUsers = String(env.ALLOWED_USERS || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
-    let isReviewer;
-    if (allowedUsers.length) {
-      isReviewer = allowedUsers.includes(username);
-      if (!isReviewer && !isPmSubmitter) {
-        return { ok: false, reason: `TALLY is limited to specific users — "${data.user.username}" isn't one of them.` };
-      }
-    } else {
-      const allowedRoles = String(env.ALLOWED_ROLES || "admin,user").split(",").map((r) => r.trim());
-      isReviewer = allowedRoles.includes(data.user.role);
-      if (!isReviewer && !isPmSubmitter) {
-        return { ok: false, reason: `Logged in as "${data.user.username}" (role "${data.user.role}"), which isn't allowed in TALLY.` };
-      }
-    }
-    return { ok: true, user: data.user, refreshedToken: data.refreshedToken || null, isReviewer, isPmSubmitter };
+    const tier = resolveTier(data.user, env);
+    if (!tier.ok) return tier;
+    return { ...tier, user: data.user, refreshedToken: data.refreshedToken || null };
   } catch (e) {
     return { ok: false, reason: `Couldn't reach auth-worker: ${e.message}` };
   }
+}
+
+// Ben's rule: nobody approves their own expense, admins included. Returns why
+// this approver is blocked, or null. Any one of these matching blocks it:
+//  (a) the submission's employee email is the approver's own (email intake
+//      stores the SENDER's address here, so an admin who forwards someone
+//      else's form is blocked too — errs safe; the other admin approves it),
+//  (b) the name Claude read off the form is the approver's name,
+//  (c) the employee name currently on the submission — the one the Procore
+//      push tags — is the approver's name (so renaming the employee away from
+//      yourself to dodge (b) still trips (b), via form_employee_name).
+// Names compare case- and whitespace-insensitively against displayName and
+// "firstName lastName".
+function selfApprovalReason(user, sub) {
+  const norm = (s) => String(s || "").toLowerCase().replace(/\s+/g, " ").trim();
+  const myNames = new Set(
+    [user?.displayName, `${user?.firstName || ""} ${user?.lastName || ""}`].map(norm).filter(Boolean)
+  );
+  const myEmails = new Set([user?.email, String(user?.username || "").includes("@") ? user.username : ""].map(norm).filter(Boolean));
+
+  if (norm(sub?.employee_email) && myEmails.has(norm(sub.employee_email))) {
+    return "this expense's employee email is yours";
+  }
+  if (norm(sub?.form_employee_name) && myNames.has(norm(sub.form_employee_name))) {
+    return "the employee on the form is you";
+  }
+  if (norm(sub?.employee_name) && myNames.has(norm(sub.employee_name))) {
+    return "the employee on this expense is you";
+  }
+  return null;
 }
 
 function isServiceCaller(request, env) {
@@ -1082,6 +1125,7 @@ async function parseSubmission(env, sql, submissionId, { formAtt, receiptAtts })
   await sql`
     update submissions set employee_name = ${employeeName}, province = ${province}, project_number = ${projectNumber},
       date_authorized = ${dateAuthorized},
+      form_employee_name = ${(form.employee_name && String(form.employee_name).trim()) || null},
       project_procore_id = ${project?.procore_id || null}, project_name = ${project?.name || null}, project_stage = ${project?.stage || null},
       updated_at = now()
     where id = ${submissionId}`;
@@ -1221,14 +1265,14 @@ async function handleExport(url, sql) {
   });
 }
 
-async function handleDetail(id, sql) {
+async function handleDetail(id, sql, user) {
   const [sub] = await sql`select * from submissions where id = ${id}`;
   if (!sub) return json({ error: "not_found" }, 404);
   const line_items = await sql`select * from line_items where submission_id = ${id} order by row_index asc nulls last, created_at asc`;
   const receipts = await sql`
     select id, submission_id, r2_key, kind, vendor, receipt_date, subtotal, tax_json, gross, currency, confidence, created_at
     from receipts where submission_id = ${id} order by (kind = 'form') desc, created_at asc`;
-  return json({ submission: sub, line_items, receipts });
+  return json({ submission: sub, line_items, receipts, self_approval: selfApprovalReason(user, sub) });
 }
 
 // Reviewer corrections to the form header — Claude misread the Expense ID, the
@@ -1600,7 +1644,7 @@ async function handleReceiptOverride(subId, lineId, request, env, sql, user) {
 // approve / revision / reject
 // ---------------------------------------------------------------------------
 
-async function handleApprove(subId, url, request, env, sql, user) {
+async function handleApprove(subId, url, request, env, sql, user, isPmApprover) {
   const [sub] = await sql`select * from submissions where id = ${subId}`;
   if (!sub) return json({ error: "not_found" }, 404);
   if (sub.status === "approved") return json({ error: "already_approved", procore_direct_cost_id: sub.procore_direct_cost_id }, 409);
@@ -1622,14 +1666,18 @@ async function handleApprove(subId, url, request, env, sql, user) {
     return json({ error: "duplicate_expense_id", detail: dupFlag.detail }, 409);
   }
 
-  // A PM's own submission (no PDF form) needs Leela's sign-off before it can
-  // become a real Procore Direct Cost — same write, just gated to whoever's
-  // in PM_APPROVERS. Preview still works for anyone who can see the row.
-  if (sub.origin === "pm_direct" && !dryRun) {
-    const pmApprovers = String(env.PM_APPROVERS || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
-    if (!pmApprovers.includes(String(user.username || "").toLowerCase())) {
-      return json({ error: "pm_approval_required", detail: "This is a PM-submitted expense — it needs approval from Leela (or another PM_APPROVERS user) before it can post to Procore." }, 409);
-    }
+  // Nobody approves their own expense, admins (Ben included) too — see
+  // selfApprovalReason. Preview is fine; the real write is what's blocked.
+  const selfReason = selfApprovalReason(user, sub);
+  if (selfReason && !dryRun) {
+    return json({ error: "self_approval", detail: `You can't approve this one — ${selfReason}. Another admin has to.` }, 409);
+  }
+
+  // A PM's own submission (no PDF form) needs an admin's sign-off before it can
+  // become a real Procore Direct Cost — same write, just gated to approvers.
+  // Preview still works for anyone who can see the row.
+  if (sub.origin === "pm_direct" && !dryRun && !isPmApprover) {
+    return json({ error: "pm_approval_required", detail: "This is a PM-submitted expense — it needs an admin's approval before it can post to Procore." }, 409);
   }
 
   const incomplete = lines.filter((l) => {
@@ -1953,7 +2001,11 @@ export default {
 
       // everything else needs an Einbau ID session
       const auth = await requireLogin(request, env);
-      if (!auth.ok) return json({ error: "unauthorized", reason: auth.reason }, 401);
+      if (!auth.ok) {
+        return auth.status === 403
+          ? json({ error: "forbidden", detail: auth.reason, reason: auth.reason }, 403)
+          : json({ error: "unauthorized", reason: auth.reason }, 401);
+      }
       const refresh = auth.refreshedToken ? { "X-Refreshed-Token": auth.refreshedToken } : {};
       const withRefresh = (res) => {
         for (const [k, v] of Object.entries(refresh)) res.headers.set(k, v);
@@ -1961,13 +2013,12 @@ export default {
       };
 
       if (url.pathname === "/me" && request.method === "GET") {
-        const pmApprovers = String(env.PM_APPROVERS || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
         return withRefresh(json({
           username: auth.user.username,
           displayName: auth.user.displayName,
           isReviewer: auth.isReviewer,
           isPmSubmitter: auth.isPmSubmitter,
-          isPmApprover: pmApprovers.includes(String(auth.user.username || "").toLowerCase()),
+          isPmApprover: auth.isPmApprover,
           canOverrideReceipt: canOverrideReceipt(env, auth.user),
         }));
       }
@@ -2042,7 +2093,7 @@ export default {
             }
           }
 
-          if (!seg && request.method === "GET") return withRefresh(await handleDetail(subId, sql));
+          if (!seg && request.method === "GET") return withRefresh(await handleDetail(subId, sql, auth.user));
           if (!seg && request.method === "PATCH") return withRefresh(await handleSubmissionPatch(subId, request, sql, auth.user));
           if (!seg && request.method === "DELETE") return withRefresh(await handleSubmissionDelete(subId, env, sql, auth.user));
           if (seg === "reparse" && request.method === "POST") return withRefresh(await handleReparse(subId, env, sql, auth.user));
@@ -2055,7 +2106,7 @@ export default {
             }
           }
           if (seg === "cost-codes" && request.method === "GET") return withRefresh(await handleCostCodes(subId, env, sql));
-          if (seg === "approve" && request.method === "POST") return withRefresh(await handleApprove(subId, url, request, env, sql, auth.user));
+          if (seg === "approve" && request.method === "POST") return withRefresh(await handleApprove(subId, url, request, env, sql, auth.user, auth.isPmApprover));
           if (seg === "request-revision" && request.method === "POST") return withRefresh(await handleRequestRevision(subId, request, sql, auth.user));
           if (seg === "reject" && request.method === "POST") return withRefresh(await handleReject(subId, request, sql, auth.user));
 
@@ -2106,4 +2157,6 @@ export const _test = {
   normalizeAttachments,
   FALLBACK_TAX_RATES,
   NO_RECEIPT_CATEGORIES,
+  resolveTier,
+  selfApprovalReason,
 };

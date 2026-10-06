@@ -26,6 +26,10 @@ create table submissions (
   expense_id text unique not null,
 
   employee_name  text,
+  -- The employee name Claude read off the form, kept as read — employee_name below
+  -- can be edited by a reviewer, and the self-approval check needs the original
+  -- too. See migration_006.sql.
+  form_employee_name text,
   employee_email text,
   province       text,                 -- 2-letter province/territory code
 

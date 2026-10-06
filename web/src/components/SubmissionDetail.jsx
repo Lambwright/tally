@@ -209,6 +209,9 @@ export default function SubmissionDetail({ id, onClose, onChanged, me }) {
   const allComplete = lines.length > 0 && lines.every(lineComplete);
   const dupFlag = sub?.flags?.find((f) => f.code === "duplicate_expense_id");
   const needsPmApproval = sub?.origin === "pm_direct" && !me?.isPmApprover;
+  // Server-computed: the viewer is the employee on this expense (or its sender),
+  // so someone else has to approve it. Enforced server-side; this just explains.
+  const selfBlock = data?.self_approval || null;
 
   async function handleApprove() {
     setBusy(true);
@@ -634,8 +637,8 @@ This is recorded under your name, and the net is estimated from the claimed amou
       <div className="modal-actions" style={{ justifyContent: "flex-start", flexWrap: "wrap" }}>
         {actionable && (
           <>
-            <button className="btn btn-orange" disabled={busy || !allComplete || !!dupFlag || needsPmApproval} onClick={handleApprove}
-              title={dupFlag ? dupFlag.detail : needsPmApproval ? "Needs approval from Leela (or another PM approver) first." : undefined}>
+            <button className="btn btn-orange" disabled={busy || !allComplete || !!dupFlag || needsPmApproval || !!selfBlock} onClick={handleApprove}
+              title={selfBlock ? `You can't approve this one — ${selfBlock}.` : dupFlag ? dupFlag.detail : needsPmApproval ? "Needs an admin's approval first." : undefined}>
               {busy ? "Working…" : "Approve"}
             </button>
             <button className="btn btn-ghost" disabled={busy} onClick={handleDryRun}>Preview payload</button>
@@ -652,9 +655,14 @@ This is recorded under your name, and the net is estimated from the claimed amou
             {dupFlag.detail}
           </span>
         )}
-        {actionable && !dupFlag && needsPmApproval && allComplete && (
+        {actionable && selfBlock && (
           <span className="row-secondary" style={{ alignSelf: "center", width: "100%", color: "var(--yellow)" }}>
-            Waiting on approval from Leela (or another PM approver) before this can post to Procore.
+            You can't approve this one — {selfBlock}. Another admin has to.
+          </span>
+        )}
+        {actionable && !dupFlag && !selfBlock && needsPmApproval && allComplete && (
+          <span className="row-secondary" style={{ alignSelf: "center", width: "100%", color: "var(--yellow)" }}>
+            Waiting on an admin's approval before this can post to Procore.
           </span>
         )}
         {actionable && !dupFlag && !allComplete && lines.length > 0 && (

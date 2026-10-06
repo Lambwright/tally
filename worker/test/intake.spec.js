@@ -12,6 +12,8 @@ const {
   sumTaxLines,
   money,
   normalizeAttachments,
+  resolveTier,
+  selfApprovalReason,
 } = _test;
 
 describe("extractExpenseId", () => {
@@ -292,5 +294,62 @@ describe("salvageByFieldBoundaries", () => {
     const out = salvageByFieldBoundaries(raw);
     expect(out.subject).toBe("Expense 020926-12345-6789");
     expect(out.from).toBe("joe@einbau.ca");
+  });
+});
+
+describe("resolveTier (appRoles.TALLY)", () => {
+  const env = { ALLOWED_USERS: "ben,leela@einbau.ca", PM_APPROVERS: "leela@einbau.ca", PM_SUBMITTERS: "pat@einbau.ca" };
+  const user = (username, appRoles, apps = ["TALLY"]) => ({ username, apps, appRoles });
+
+  it("admin: reviewer + approver, not a scoped submitter", () => {
+    expect(resolveTier(user("anyone", { TALLY: "admin" }), env)).toMatchObject({ ok: true, isReviewer: true, isPmApprover: true, isPmSubmitter: false });
+  });
+  it("submitter: scoped to own submissions, can't approve", () => {
+    expect(resolveTier(user("josh@einbau.ca", { TALLY: "submitter" }), env)).toMatchObject({ ok: true, isReviewer: false, isPmApprover: false, isPmSubmitter: true });
+  });
+  it("matrix level beats the old username lists in both directions", () => {
+    // listed in ALLOWED_USERS but submitter in the matrix -> submitter
+    expect(resolveTier(user("ben", { TALLY: "submitter" }), env).isReviewer).toBe(false);
+    // not listed anywhere but admin in the matrix -> admin
+    expect(resolveTier(user("newadmin", { TALLY: "admin" }), env).isReviewer).toBe(true);
+  });
+  it("access (Live switch still off): today's lists, unchanged", () => {
+    expect(resolveTier(user("ben", { TALLY: "access" }), env)).toMatchObject({ ok: true, isReviewer: true, isPmApprover: false });
+    expect(resolveTier(user("leela@einbau.ca", { TALLY: "access" }), env)).toMatchObject({ ok: true, isReviewer: true, isPmApprover: true });
+    expect(resolveTier(user("pat@einbau.ca", { TALLY: "access" }), env)).toMatchObject({ ok: true, isReviewer: false, isPmSubmitter: true });
+    expect(resolveTier(user("stranger", { TALLY: "access" }), env)).toMatchObject({ ok: false, status: 403 });
+  });
+  it("no_access, missing key, missing appRoles, or an unrecognised level: denied 403", () => {
+    for (const roles of [{ TALLY: "no_access" }, {}, undefined, null, { TALLY: "superuser" }, { TALLY: "" }]) {
+      expect(resolveTier(user("ben", roles), env)).toMatchObject({ ok: false, status: 403 });
+    }
+  });
+  it("apps fails closed: missing / non-array / without TALLY is denied even with an admin level", () => {
+    expect(resolveTier({ username: "ben", appRoles: { TALLY: "admin" } }, env).ok).toBe(false);
+    expect(resolveTier({ username: "ben", apps: "TALLY", appRoles: { TALLY: "admin" } }, env).ok).toBe(false);
+    expect(resolveTier(user("ben", { TALLY: "admin" }, ["HANDOFF"]), env).ok).toBe(false);
+  });
+});
+
+describe("selfApprovalReason", () => {
+  const ben = { username: "ben", displayName: "Ben Wright", firstName: "Ben", lastName: "Wright", email: "ben@einbau.ca" };
+
+  it("(a) the submission's employee email is the approver's", () => {
+    expect(selfApprovalReason(ben, { employee_email: " Ben@Einbau.ca ", employee_name: "Someone Else" })).toMatch(/email/);
+  });
+  it("(a) also matches when the username itself is the email", () => {
+    expect(selfApprovalReason({ username: "leela@einbau.ca", displayName: "Leela" }, { employee_email: "LEELA@einbau.ca" })).toMatch(/email/);
+  });
+  it("(b) the name Claude read off the form is the approver's, even if it was renamed since", () => {
+    expect(selfApprovalReason(ben, { form_employee_name: "ben  wright", employee_name: "Mike Sefeldas" })).toMatch(/form/);
+  });
+  it("(c) the employee name the push would use is the approver's", () => {
+    expect(selfApprovalReason(ben, { employee_name: "BEN WRIGHT" })).toMatch(/expense/);
+    // also "firstName lastName" when displayName is something else
+    expect(selfApprovalReason({ ...ben, displayName: "Benny" }, { employee_name: "Ben Wright" })).toMatch(/expense/);
+  });
+  it("someone else's expense is not blocked, and blanks never match blanks", () => {
+    expect(selfApprovalReason(ben, { employee_name: "Mike Sefeldas", employee_email: "mike@einbau.ca", form_employee_name: "Mike Sefeldas" })).toBeNull();
+    expect(selfApprovalReason({ username: "x" }, { employee_name: "", employee_email: "", form_employee_name: null })).toBeNull();
   });
 });
