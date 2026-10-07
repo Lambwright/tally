@@ -35,6 +35,14 @@ const FLAG_LABELS = {
   receipt_override: "Posting without a receipt (waived)",
 };
 
+// What a submitter sees instead of the review-queue status names.
+const SUBMITTER_STATUS = {
+  needs_review: "waiting on approval",
+  needs_revision: "sent back",
+  approved: "approved",
+  rejected: "rejected",
+};
+
 const PARSE_FAILURE_FLAGS = new Set(["parse_failed", "claude_failed", "form_parse_failed"]);
 
 const dateOnly = (s) => (s ? String(s).slice(0, 10) : "");
@@ -209,6 +217,11 @@ export default function SubmissionDetail({ id, onClose, onChanged, me }) {
   const allComplete = lines.length > 0 && lines.every(lineComplete);
   const dupFlag = sub?.flags?.find((f) => f.code === "duplicate_expense_id");
   const needsPmApproval = sub?.origin === "pm_direct" && !me?.isPmApprover;
+  // A submitter-only user (a PM sending in their own expense) never reviews:
+  // no approve / preview / revision / reject / retry controls, and who it's
+  // for stays fixed. The server enforces the same; this just hides what they
+  // can't use.
+  const isSubmitter = !!me?.isPmSubmitter && !me?.isReviewer;
   // Server-computed: the viewer is the employee on this expense (or its sender),
   // so someone else has to approve it. Enforced server-side; this just explains.
   const selfBlock = data?.self_approval || null;
@@ -357,11 +370,11 @@ This is recorded under your name, and the net is estimated from the claimed amou
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 16 }}>
           <div>
             <div className="expense-id-heading">
-              <EditableText value={sub.expense_id} disabled={!actionable}
+              <EditableText value={sub.expense_id} disabled={!actionable || isSubmitter}
                 onSave={(v) => v && mutate(() => api.patchSubmission(id, { expense_id: v }))} />
             </div>
             <div style={{ fontSize: 17, marginTop: 6 }}>
-              <EditableText value={sub.employee_name} placeholder="(no employee)" disabled={!actionable}
+              <EditableText value={sub.employee_name} placeholder="(no employee)" disabled={!actionable || isSubmitter}
                 onSave={(v) => mutate(() => api.patchSubmission(id, { employee_name: v }))} />
             </div>
             <div className="row-secondary" style={{ marginTop: 4 }}>
@@ -373,10 +386,22 @@ This is recorded under your name, and the net is estimated from the claimed amou
               {sub.employee_email ? ` · ${sub.employee_email}` : ""}
             </div>
           </div>
-          <span className={`badge badge-${sub.status}`}>{sub.status.replace("_", " ")}</span>
-          {sub.origin === "pm_direct" && <span className="badge" title="Submitted directly by the employee, no PDF form">PM</span>}
+          <span className={`badge badge-${sub.status}`}>{isSubmitter ? SUBMITTER_STATUS[sub.status] || sub.status : sub.status.replace("_", " ")}</span>
+          {!isSubmitter && sub.origin === "pm_direct" && <span className="badge" title="Submitted directly by the employee, no PDF form">PM</span>}
         </div>
       </div>
+
+      {isSubmitter && (
+        <div className="card" style={{ color: sub.status === "approved" ? "var(--green)" : sub.status === "needs_revision" || sub.status === "rejected" ? "var(--red)" : "var(--yellow)" }}>
+          {sub.status === "needs_review" && "Submitted — waiting on an admin's approval. Add a line for each expense and attach its receipt."}
+          {sub.status === "needs_revision" && "Sent back for changes — fix what's noted below and it goes back for review."}
+          {sub.status === "approved" && "Approved and posted. It can't be changed now."}
+          {sub.status === "rejected" && "Rejected."}
+          {sub.revision_note && (sub.status === "needs_revision" || sub.status === "rejected") && (
+            <div style={{ marginTop: 6 }}>{sub.revision_note}</div>
+          )}
+        </div>
+      )}
 
       {sub.flags?.some((f) => f.code === "parsing") && (
         <div className="card" style={{ color: "var(--yellow)" }}>
@@ -387,9 +412,13 @@ This is recorded under your name, and the net is estimated from the claimed amou
       {sub.flags?.some((f) => PARSE_FAILURE_FLAGS.has(f.code) && !(sub.origin === "pm_direct" && f.code === "form_parse_failed")) && (
         <div className="card" style={{ color: "var(--red)", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
           <span>Automatic parsing didn't finish (often a temporary API issue) — the original form and receipts are still saved.</span>
-          <button className="btn btn-ghost btn-sm" onClick={handleRetryParse} disabled={busy}>
-            {busy ? "Retrying…" : "↻ Retry parse"}
-          </button>
+          {isSubmitter ? (
+            <span className="row-secondary">Ask an admin to retry it.</span>
+          ) : (
+            <button className="btn btn-ghost btn-sm" onClick={handleRetryParse} disabled={busy}>
+              {busy ? "Retrying…" : "↻ Retry parse"}
+            </button>
+          )}
         </div>
       )}
 
@@ -635,7 +664,7 @@ This is recorded under your name, and the net is estimated from the claimed amou
       {actionError && <div className="card" style={{ color: "var(--red)" }}>{actionError}</div>}
 
       <div className="modal-actions" style={{ justifyContent: "flex-start", flexWrap: "wrap" }}>
-        {actionable && (
+        {actionable && !isSubmitter && (
           <>
             <button className="btn btn-orange" disabled={busy || !allComplete || !!dupFlag || needsPmApproval || !!selfBlock} onClick={handleApprove}
               title={selfBlock ? `You can't approve this one — ${selfBlock}.` : dupFlag ? dupFlag.detail : needsPmApproval ? "Needs an admin's approval first." : undefined}>
@@ -646,26 +675,28 @@ This is recorded under your name, and the net is estimated from the claimed amou
             <button className="btn btn-danger" disabled={busy} onClick={handleReject}>Reject</button>
           </>
         )}
-        <button className="btn btn-danger" disabled={busy} onClick={handleDelete}
-          title="Permanently remove this submission and free its Expense ID" style={{ marginLeft: "auto" }}>
-          Delete
-        </button>
-        {actionable && dupFlag && (
+        {!(isSubmitter && sub.status === "approved") && (
+          <button className="btn btn-danger" disabled={busy} onClick={handleDelete}
+            title="Permanently remove this submission and free its Expense ID" style={{ marginLeft: "auto" }}>
+            Delete
+          </button>
+        )}
+        {actionable && !isSubmitter && dupFlag && (
           <span className="row-secondary" style={{ alignSelf: "center", width: "100%", color: "var(--red)" }}>
             {dupFlag.detail}
           </span>
         )}
-        {actionable && selfBlock && (
+        {actionable && !isSubmitter && selfBlock && (
           <span className="row-secondary" style={{ alignSelf: "center", width: "100%", color: "var(--yellow)" }}>
             You can't approve this one — {selfBlock}. Another admin has to.
           </span>
         )}
-        {actionable && !dupFlag && !selfBlock && needsPmApproval && allComplete && (
+        {actionable && !isSubmitter && !dupFlag && !selfBlock && needsPmApproval && allComplete && (
           <span className="row-secondary" style={{ alignSelf: "center", width: "100%", color: "var(--yellow)" }}>
             Waiting on an admin's approval before this can post to Procore.
           </span>
         )}
-        {actionable && !dupFlag && !allComplete && lines.length > 0 && (
+        {actionable && !isSubmitter && !dupFlag && !allComplete && lines.length > 0 && (
           <span className="row-secondary" style={{ alignSelf: "center", width: "100%" }}>
             Every line needs a receipt (or be flat-claim, or waived), a net amount, and a cost code.
           </span>
@@ -682,7 +713,7 @@ This is recorded under your name, and the net is estimated from the claimed amou
             <a href={`https://us02.procore.com/${sub.project_procore_id}/project/direct_costs/${sub.procore_direct_cost_id}/edit`}
               target="_blank" rel="noreferrer">open in Procore ↗</a>
           </span>
-          {sub.flags?.some((f) => f.code === "attachments_failed") && (
+          {!isSubmitter && sub.flags?.some((f) => f.code === "attachments_failed") && (
             <button className="btn btn-ghost btn-sm" disabled={busy} onClick={handleRetryAttachments}>
               {busy ? "Retrying…" : "↻ Retry attachments"}
             </button>

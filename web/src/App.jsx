@@ -73,19 +73,24 @@ export default function App() {
     api.getMe().catch(() => null).then(setMe);
   }, [authState]);
 
+  // A submitter-only user (a PM sending in their own expenses) has no review
+  // queue — one "My expenses" list of their own rows, status on each row. The
+  // server already scopes the list to their rows; this just drops the tabs.
+  const isSubmitterOnly = !!me?.isPmSubmitter && !me?.isReviewer;
+
   const loadList = useCallback(() => {
     if (authState !== "in") return;
     setLoadingList(true);
     setListError(null);
     api
-      .listSubmissions(status)
+      .listSubmissions(isSubmitterOnly ? null : status)
       .then((data) => setSubmissions(data.submissions || []))
       .catch((e) => {
         if (e.unauthorized) handleLogout();
         else setListError(e.message);
       })
       .finally(() => setLoadingList(false));
-  }, [status, authState]);
+  }, [status, authState, isSubmitterOnly]);
 
   useEffect(() => {
     loadList();
@@ -144,7 +149,8 @@ export default function App() {
         ) : (
           <>
             <div className="tabs">
-              {STATUSES.map((s) => (
+              {me?.isPmSubmitter && !me?.isReviewer && <span className="card-title" style={{ margin: 0, alignSelf: "center" }}>My expenses</span>}
+              {me?.isReviewer && STATUSES.map((s) => (
                 <button
                   key={s.key}
                   className={`tab ${status === s.key ? "active" : ""}`}
@@ -167,7 +173,7 @@ export default function App() {
               )}
             </div>
             {listError && <div className="card" style={{ color: "var(--red)" }}>{listError}</div>}
-            <QueueList submissions={submissions} loading={loadingList} onSelect={selectSubmission} />
+            <QueueList submissions={submissions} loading={loadingList} onSelect={selectSubmission} showStatus={isSubmitterOnly} />
           </>
         )}
       </div>

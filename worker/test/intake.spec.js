@@ -15,6 +15,7 @@ const {
   resolveTier,
   selfApprovalReason,
   canOverrideReceipt,
+  submitterDenial,
 } = _test;
 
 describe("extractExpenseId", () => {
@@ -372,5 +373,24 @@ describe("canOverrideReceipt", () => {
     expect(canOverrideReceipt(env, leela, undefined)).toBe(false);
     expect(canOverrideReceipt(env, leela, "no_access")).toBe(false);
     expect(canOverrideReceipt({ RECEIPT_OVERRIDE_USERS: "" }, leela, "admin")).toBe(false);
+  });
+});
+
+describe("submitterDenial", () => {
+  it("review and Procore-writing actions are admin-only for a submitter", () => {
+    for (const seg of ["approve", "reject", "request-revision", "reparse", "retry-attachments"]) {
+      expect(submitterDenial("POST", seg, "needs_review")).toMatchObject({ status: 403 });
+    }
+  });
+  it("their own editing is allowed while it's not approved", () => {
+    expect(submitterDenial("PATCH", undefined, "needs_review")).toBeNull();
+    expect(submitterDenial("POST", "lines", "needs_revision")).toBeNull();
+    expect(submitterDenial("DELETE", undefined, "rejected")).toBeNull();
+    expect(submitterDenial("GET", undefined, "approved")).toBeNull();
+  });
+  it("an approved expense is frozen for them (reads still work)", () => {
+    expect(submitterDenial("PATCH", undefined, "approved")).toMatchObject({ status: 409 });
+    expect(submitterDenial("DELETE", undefined, "approved")).toMatchObject({ status: 409 });
+    expect(submitterDenial("POST", "lines", "approved")).toMatchObject({ status: 409 });
   });
 });

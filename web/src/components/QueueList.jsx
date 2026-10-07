@@ -9,7 +9,15 @@ function formatMoney(n, currency = "CAD") {
   }
 }
 
-export default function QueueList({ submissions, loading, onSelect }) {
+// What a submitter sees instead of the review-queue status names.
+const SUBMITTER_STATUS = {
+  needs_review: "waiting on approval",
+  needs_revision: "sent back",
+  approved: "approved",
+  rejected: "rejected",
+};
+
+export default function QueueList({ submissions, loading, onSelect, showStatus = false }) {
   if (loading) return <div className="empty-state">Loading…</div>;
   if (!submissions.length) return <div className="empty-state">Nothing here.</div>;
 
@@ -32,7 +40,11 @@ export default function QueueList({ submissions, loading, onSelect }) {
               <div className="row-secondary">{s.province || ""}</div>
             </div>
             <div className="row-amount">{formatMoney(s.net_total, "CAD")}</div>
-            <div className="row-flags">{flagCount ? `${flagCount} flag${flagCount > 1 ? "s" : ""}` : ""}</div>
+            <div className="row-flags">
+              {showStatus
+                ? <span className={`badge badge-${s.status}`}>{SUBMITTER_STATUS[s.status] || s.status}</span>
+                : (flagCount ? `${flagCount} flag${flagCount > 1 ? "s" : ""}` : "")}
+            </div>
           </div>
         );
       })}

@@ -296,6 +296,20 @@ async function requireLogin(request, env) {
   }
 }
 
+// What a submitter-only user may NOT do on their own row. Review and anything
+// that writes to Procore is admin-only; and once an expense is approved it's
+// frozen for them. Returns { status, error, detail } or null.
+const SUBMITTER_BLOCKED_ACTIONS = new Set(["approve", "reject", "request-revision", "reparse", "retry-attachments"]);
+function submitterDenial(method, seg, status) {
+  if (method === "POST" && SUBMITTER_BLOCKED_ACTIONS.has(seg)) {
+    return { status: 403, error: "forbidden", detail: "Only admins can do that." };
+  }
+  if (method !== "GET" && status === "approved") {
+    return { status: 409, error: "already_approved", detail: "This expense is already approved — it can't be changed." };
+  }
+  return null;
+}
+
 // Ben's rule: nobody approves their own expense, admins included. Returns why
 // this approver is blocked, or null. Either of these matching blocks it:
 //  (a) the name Claude read off the form is the approver's name
@@ -1279,11 +1293,14 @@ async function handleDetail(id, sql, user) {
 
 // Reviewer corrections to the form header — Claude misread the Expense ID, the
 // employee, or the project number.
-async function handleSubmissionPatch(subId, request, sql, user) {
+async function handleSubmissionPatch(subId, request, sql, user, submitterOnly = false) {
   const body = await parseBody(request).catch(() => ({}));
   const [sub] = await sql`select * from submissions where id = ${subId}`;
   if (!sub) return json({ error: "not_found" }, 404);
 
+  // A submitter can't re-point their expense at someone else or rewrite its
+  // Expense ID — payment goes to the named employee, so who it's for is fixed.
+  if (submitterOnly) { delete body.employee_name; delete body.expense_id; }
   const nextName = body.employee_name !== undefined ? ((body.employee_name || "").toString().slice(0, 200) || null) : sub.employee_name;
   let nextExpenseId = sub.expense_id;
   if (body.expense_id !== undefined) {
@@ -2093,15 +2110,17 @@ export default {
           // everything past this point (view, edit, approve-attempt, delete,
           // line CRUD, receipts) is scoped by this one check.
           if (pmScoped) {
-            const [owned] = await sql`select created_by from submissions where id = ${subId}`;
+            const [owned] = await sql`select created_by, status from submissions where id = ${subId}`;
             if (!owned) return json({ error: "not_found" }, 404);
             if ((owned.created_by || "").toLowerCase() !== auth.user.username.toLowerCase()) {
               return json({ error: "forbidden", reason: "Not your submission." }, 403);
             }
+            const denial = submitterDenial(request.method, seg, owned.status);
+            if (denial) return json({ error: denial.error, detail: denial.detail }, denial.status);
           }
 
           if (!seg && request.method === "GET") return withRefresh(await handleDetail(subId, sql, auth.user));
-          if (!seg && request.method === "PATCH") return withRefresh(await handleSubmissionPatch(subId, request, sql, auth.user));
+          if (!seg && request.method === "PATCH") return withRefresh(await handleSubmissionPatch(subId, request, sql, auth.user, pmScoped));
           if (!seg && request.method === "DELETE") return withRefresh(await handleSubmissionDelete(subId, env, sql, auth.user));
           if (seg === "reparse" && request.method === "POST") return withRefresh(await handleReparse(subId, env, sql, auth.user));
           if (seg === "retry-attachments" && request.method === "POST") return withRefresh(await handleRetryAttachments(subId, env, sql, auth.user));
@@ -2167,4 +2186,5 @@ export const _test = {
   resolveTier,
   selfApprovalReason,
   canOverrideReceipt,
+  submitterDenial,
 };
