@@ -219,6 +219,8 @@ export default function SubmissionDetail({ id, onClose, onChanged, me }) {
           name: r.r2_key.split("/").pop(),
           label: r.kind === "form" ? "Expense form" : `${r.vendor || "Receipt"}${r.note ? ` (${r.note})` : ""}${forLines.length ? ` → line ${forLines.map((l) => l.row_index).join(", ")}` : ""}`,
           receiptId: r.id,
+          // which pages of a multi-page PDF this receipt is on (null: show the whole file)
+          pages: r.page_start ? [r.page_start, r.page_end || r.page_start] : null,
         };
       })
       .filter(Boolean);

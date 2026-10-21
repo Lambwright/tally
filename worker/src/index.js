@@ -392,6 +392,7 @@ Return ONLY a JSON object, no prose, no markdown fences:
   "receipts": [                         // ONE entry per separate receipt/invoice, in the order you meet them
     { "file": number,                   // which FILE it is in
       "label": string | null,           // only when its file holds several: e.g. "3 of 5 - Green P, Sep 3"
+      "pages": [number, number] | null, // PDFs: first and last page (1-based) of THIS receipt within its file, e.g. [5, 5] or [6, 8]; null for photos
       "vendor": string | null,
       "date": "YYYY-MM-DD" | null,
       "subtotal": number | null,        // pre-tax amount as printed
@@ -412,7 +413,7 @@ Return ONLY a JSON object, no prose, no markdown fences:
 
 Rules:
 - Read numbers exactly as printed. Never infer tax that isn't shown.
-- A multi-page invoice is ONE receipt (use its overall total and tax lines), not one per page. Ignore $0.00 usage rows.
+- A multi-page invoice is ONE receipt (use its overall total and tax lines), not one per page; its "pages" span all of its pages. Ignore $0.00 usage rows.
 - Separate invoices/receipts inside one file are SEPARATE receipts entries, each with its own subtotal, tax and total.
 - Form rows: one line_item per row the employee filled in — the amount is in exactly one of the six category columns (Parking $, Materials $, Fuel $, Mileage (KM), Per Diem $, Other $). IGNORE the "For Office Use Only" block (Subtotal / Net Total / Expense Total) and the "Authorized By" / "Date Authorized" fields.
 - No form among the files: "form" is null.
@@ -432,6 +433,15 @@ function attBlock(a) {
   let mt = (a.contentType || "image/jpeg").toLowerCase();
   if (!/^image\/(jpe?g|png|gif|webp)$/.test(mt)) mt = "image/jpeg";
   return { type: "image", source: { type: "base64", media_type: mt, data: b64 } };
+}
+
+// [first, last] page numbers Claude gave for a receipt in a PDF -> { ps, pe }, or nulls when absent/invalid.
+function pageRange(pages) {
+  if (!Array.isArray(pages) || pages.length < 1) return { ps: null, pe: null };
+  const first = Math.trunc(Number(pages[0]));
+  const last = Math.trunc(Number(pages[pages.length - 1]));
+  if (!(first >= 1) || !(last >= first)) return { ps: null, pe: null };
+  return { ps: first, pe: last };
 }
 
 // One call to Claude -> parsed JSON.
@@ -1290,7 +1300,7 @@ async function parseSubmission(env, sql, submissionId, { files }) {
     const formKey = claude.form && Number.isInteger(Number(claude.form.file)) ? files[Number(claude.form.file)]?.key : null;
     for (const [key, row] of rowByKey) {
       const kind = key === formKey ? "form" : "receipt";
-      await sql`update receipts set kind = ${kind}, vendor = null, receipt_date = null, subtotal = null, tax_json = null, gross = null, confidence = null, note = null where id = ${row.id}`;
+      await sql`update receipts set kind = ${kind}, vendor = null, receipt_date = null, subtotal = null, tax_json = null, gross = null, confidence = null, note = null, page_start = null, page_end = null where id = ${row.id}`;
       row.kind = kind;
       row.used = false;
     }
@@ -1303,15 +1313,17 @@ async function parseSubmission(env, sql, submissionId, { files }) {
         vendor: c.vendor || null, date: c.date || null, subtotal: money(c.subtotal), gross: money(c.gross),
         tax: c.tax_lines ? JSON.stringify(c.tax_lines) : null, currency: c.currency || "CAD",
         conf: Number.isFinite(Number(c.confidence)) ? Number(c.confidence) : null, note: c.label ? String(c.label).slice(0, 200) : null,
+        ...pageRange(c.pages),
       };
       let id = base.id;
       if (!base.used) {
         base.used = true;
         await sql`update receipts set vendor = ${vals.vendor}, receipt_date = ${vals.date}, subtotal = ${vals.subtotal}, tax_json = ${vals.tax}::jsonb,
-          gross = ${vals.gross}, currency = ${vals.currency}, confidence = ${vals.conf}, note = ${vals.note} where id = ${id}`;
+          gross = ${vals.gross}, currency = ${vals.currency}, confidence = ${vals.conf}, note = ${vals.note},
+          page_start = ${vals.ps}, page_end = ${vals.pe} where id = ${id}`;
       } else {
-        const [ins] = await sql`insert into receipts (submission_id, r2_key, kind, vendor, receipt_date, subtotal, tax_json, gross, currency, confidence, note)
-          values (${submissionId}, ${base.r2_key}, 'receipt', ${vals.vendor}, ${vals.date}, ${vals.subtotal}, ${vals.tax}::jsonb, ${vals.gross}, ${vals.currency}, ${vals.conf}, ${vals.note})
+        const [ins] = await sql`insert into receipts (submission_id, r2_key, kind, vendor, receipt_date, subtotal, tax_json, gross, currency, confidence, note, page_start, page_end)
+          values (${submissionId}, ${base.r2_key}, 'receipt', ${vals.vendor}, ${vals.date}, ${vals.subtotal}, ${vals.tax}::jsonb, ${vals.gross}, ${vals.currency}, ${vals.conf}, ${vals.note}, ${vals.ps}, ${vals.pe})
           returning id`;
         id = ins.id;
       }
@@ -1457,7 +1469,7 @@ async function handleDetail(id, sql, user) {
   if (!sub) return json({ error: "not_found" }, 404);
   const line_items = await sql`select * from line_items where submission_id = ${id} order by row_index asc nulls last, created_at asc`;
   const receipts = await sql`
-    select id, submission_id, r2_key, kind, vendor, receipt_date, subtotal, tax_json, gross, currency, confidence, note, created_at
+    select id, submission_id, r2_key, kind, vendor, receipt_date, subtotal, tax_json, gross, currency, confidence, note, page_start, page_end, created_at
     from receipts where submission_id = ${id} order by (kind = 'form') desc, created_at asc, id asc`;
   return json({ submission: sub, line_items, receipts, self_approval: selfApprovalReason(user, sub) });
 }

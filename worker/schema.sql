@@ -99,6 +99,9 @@ create table receipts (
   -- Several rows can share one r2_key (a photo of five stubs = five receipts); `note` says
   -- which one ("2 of 5 - Green P"). See migration_007.sql for an existing database.
   note text,
+  -- Pages of the stored PDF this receipt is on (1-based); null for photos / older rows. See migration_008.sql.
+  page_start integer,
+  page_end integer,
 
   matched_line_item_id uuid,             -- back-pointer; the source of truth is line_items.receipt_id
 
