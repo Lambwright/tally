@@ -199,13 +199,7 @@ TALLY's two levels, as proposed:
 This replaces `ALLOWED_USERS` / `ALLOWED_ROLES` / `PM_APPROVERS` /
 `PM_SUBMITTERS` in `wrangler.jsonc` with one `appRoles.TALLY` read.
 
-**Doesn't fit admin/submitter — needs a home in the matrix:** the receipt
-override. Leela (only) can waive the receipt requirement on a single line so
-it still posts to Procore, at her discretion (`RECEIPT_OVERRIDE_USERS` in
-`wrangler.jsonc`, recorded per line in `line_items.receipt_override_by/_at`
-and in the submission history). It's narrower than "admin" — Ben can approve a
-line she's waived but can't waive one himself — so the matrix will either need
-a third TALLY level for it or this stays a TALLY-local list.
+**Receipt waiver (a HELM tool permission):** being able to waive the receipt requirement on a single line, so it still posts to Procore at someone's discretion, is the HELM tool permission `receipt_override` (label "Receipt waiver"). Ben turns it on per person in HELM → Role Matrix → Tool permissions, and it reaches TALLY as `user.appExtras.TALLY`. The waiver needs both the TALLY **admin** level and that permission, so Ben can approve a line someone has waived but can't waive one himself unless he gives himself the permission, and a submitter holding it still can't waive. Missing or malformed `appExtras` means no waiver. Every waiver is recorded per line (`line_items.receipt_override_by/_at`) and in the submission history. There are no names in TALLY for this any more (the old `RECEIPT_OVERRIDE_USERS` setting is gone).
 
 **Ben's principle (closed loop):** anyone submitting their own expense goes
 through the portal and must say who it's for at creation (a submitter is forced

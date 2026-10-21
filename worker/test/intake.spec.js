@@ -354,28 +354,31 @@ describe("selfApprovalReason", () => {
   });
 });
 
-describe("canOverrideReceipt", () => {
-  const env = { RECEIPT_OVERRIDE_USERS: "leela@einbau.ca" };
-  const leela = { username: "Leela@Einbau.ca" };
-  it("on the list + TALLY admin: allowed", () => {
-    expect(canOverrideReceipt(env, leela, "admin")).toBe(true);
+describe("canOverrideReceipt (HELM tool permission receipt_override)", () => {
+  const withExtra = { username: "leela@einbau.ca", appExtras: { TALLY: ["receipt_override"] } };
+  it("TALLY admin with the receipt_override extra: allowed", () => {
+    expect(canOverrideReceipt(withExtra, "admin")).toBe(true);
   });
-  it("on the list but only a submitter: no waiver", () => {
-    expect(canOverrideReceipt(env, leela, "submitter")).toBe(false);
+  it("TALLY admin without the extra: denied (Ben can approve a waived line but not waive one)", () => {
+    expect(canOverrideReceipt({ username: "ben", appExtras: { TALLY: [] } }, "admin")).toBe(false);
+    expect(canOverrideReceipt({ username: "ben", appExtras: {} }, "admin")).toBe(false);
   });
-  it("Live switch still off ('access'): the list alone, as before", () => {
-    expect(canOverrideReceipt(env, leela, "access")).toBe(true);
+  it("a submitter holding the extra: denied", () => {
+    expect(canOverrideReceipt(withExtra, "submitter")).toBe(false);
   });
-  it("admin who isn't on the list: no waiver", () => {
-    expect(canOverrideReceipt(env, { username: "ben" }, "admin")).toBe(false);
+  it("Live switch off (access), no level or unknown level: denied", () => {
+    expect(canOverrideReceipt(withExtra, "access")).toBe(false);
+    expect(canOverrideReceipt(withExtra, undefined)).toBe(false);
+    expect(canOverrideReceipt(withExtra, "no_access")).toBe(false);
   });
-  it("no level, unknown level, empty list: no waiver", () => {
-    expect(canOverrideReceipt(env, leela, undefined)).toBe(false);
-    expect(canOverrideReceipt(env, leela, "no_access")).toBe(false);
-    expect(canOverrideReceipt({ RECEIPT_OVERRIDE_USERS: "" }, leela, "admin")).toBe(false);
+  it("missing or malformed appExtras fail closed", () => {
+    for (const appExtras of [undefined, null, "receipt_override", ["receipt_override"], { TALLY: "receipt_override" }, { TALLY: null }, { OTHER: ["receipt_override"] }]) {
+      expect(canOverrideReceipt({ username: "x", appExtras }, "admin")).toBe(false);
+    }
+    expect(canOverrideReceipt(null, "admin")).toBe(false);
+    expect(canOverrideReceipt(undefined, "admin")).toBe(false);
   });
 });
-
 describe("submitterDenial", () => {
   it("review and Procore-writing actions are admin-only for a submitter", () => {
     for (const seg of ["approve", "reject", "request-revision", "reparse", "retry-attachments"]) {

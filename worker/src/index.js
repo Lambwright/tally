@@ -23,7 +23,7 @@
 //   DELETE /submissions/:id/lines/:lineId       (Einbau ID) remove a line
 //   POST   /submissions/:id/lines/:lineId/match (Einbau ID) { receipt_id } -> attach a receipt, recompute net
 //   POST   /submissions/:id/lines/:lineId/unmatch (Einbau ID) detach the receipt
-//   POST   /submissions/:id/lines/:lineId/receipt-override (RECEIPT_OVERRIDE_USERS only) { override } waive the receipt requirement on one line
+//   POST   /submissions/:id/lines/:lineId/receipt-override (TALLY admin with the receipt_override tool permission) { override } waive the receipt requirement on one line
 //   POST   /submissions/:id/approve[?dryRun=1]  (Einbau ID) build 1 DC header + N line items, post at net
 //   POST   /submissions/:id/retry-attachments   (Einbau ID) re-upload the form + receipts to an already-created DC
 //   POST   /submissions/:id/request-revision    (Einbau ID) { note } -> needs_revision + a copy-ready reply
@@ -1607,17 +1607,18 @@ async function handleLineUnmatch(subId, lineId, sql, user) {
   return json({ line: row, form_flags });
 }
 
-// Usernames (RECEIPT_OVERRIDE_USERS, comma list) allowed to waive the receipt
-// requirement on a line — Leela only, at her discretion. Deliberately its own
-// TALLY-local list (not part of the role matrix): narrower than "can approve"
-// (Ben can approve; only she can waive). Being on the list isn't enough on its
-// own once TALLY is live on the matrix: the person must also be a TALLY admin,
-// so a submitter on the list can't waive. While the Live switch is off
-// (level 'access') it's the list alone, as before.
-function canOverrideReceipt(env, user, level) {
-  if (level !== "admin" && level !== "access") return false;
-  const allowed = String(env.RECEIPT_OVERRIDE_USERS || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
-  return allowed.includes(String(user?.username || "").toLowerCase());
+// Who may waive the receipt requirement on a line. It is a HELM tool permission, not a
+// name list in TALLY: Ben switches "Receipt waiver" (id receipt_override) on per person in
+// HELM -> Role Matrix -> Tool permissions, and it reaches us as user.appExtras.TALLY.
+// Narrower than "can approve" on purpose (Ben can approve a waived line; only people he
+// gives this can waive one), and it also needs the TALLY admin level, so a submitter
+// holding the extra can't waive. Fails closed: no level, no appExtras, or a malformed
+// one means no waiver.
+const RECEIPT_OVERRIDE_EXTRA = "receipt_override";
+function canOverrideReceipt(user, level) {
+  if (level !== "admin") return false;
+  const extras = user && user.appExtras && typeof user.appExtras === "object" ? user.appExtras.TALLY : undefined;
+  return Array.isArray(extras) && extras.includes(RECEIPT_OVERRIDE_EXTRA);
 }
 
 // POST /submissions/:id/lines/:lineId/receipt-override { override: true|false }
@@ -1625,7 +1626,7 @@ function canOverrideReceipt(env, user, level) {
 // the line posts to Procore with no receipt; net is a province-rate estimate off
 // the claimed gross (flagged tax_estimated) unless a net was typed by hand.
 async function handleReceiptOverride(subId, lineId, request, env, sql, user, level) {
-  if (!canOverrideReceipt(env, user, level)) {
+  if (!canOverrideReceipt(user, level)) {
     return json({ error: "forbidden", detail: "Only receipt-override approvers can post a line without a receipt." }, 403);
   }
   const body = await parseBody(request).catch(() => ({}));
@@ -2043,7 +2044,7 @@ export default {
           isReviewer: auth.isReviewer,
           isPmSubmitter: auth.isPmSubmitter,
           isPmApprover: auth.isPmApprover,
-          canOverrideReceipt: canOverrideReceipt(env, auth.user, auth.level),
+          canOverrideReceipt: canOverrideReceipt(auth.user, auth.level),
         }));
       }
 
