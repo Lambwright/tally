@@ -1074,7 +1074,7 @@ function computeLineFlags(line, receipt, formProvince, project, { shared = false
       add("amount_mismatch", "medium", `Form line ${lg} vs receipt total ${rg}.`);
     const ln = money(line.net_amount), lt = money(line.tax_amount);
     if (lg !== null && ln !== null && lt !== null && Math.abs(ln + lt - lg) > 0.02)
-      add("amount_mismatch", "low", `net ${ln} + tax ${lt} != gross ${lg}.`);
+      add("net_tax_mismatch", "low", `net ${ln} + tax ${lt} != gross ${lg}.`);
     const conf = receipt.confidence; // still meaningful when shared — a blurry photo is blurry either way
     if (conf != null && Number(conf) < LOW_CONFIDENCE_THRESHOLD)
       add("low_confidence", "medium", `Receipt read confidence ${conf}.`);
@@ -1716,11 +1716,15 @@ async function handleLinePatch(subId, lineId, request, sql, user) {
     // (another line joining/leaving the same receipt) leaves it alone.
     next.net_amount = money(body.net_amount);
     next.tax_source = "manual";
+    // the tax is whatever is left of the gross, so net + tax always adds up (a stale tax from an
+    // earlier estimate or a foreign-currency receipt used to trip a false "doesn't reconcile" flag)
+    if (money(next.gross_amount) !== null) next.tax_amount = round2(money(next.gross_amount) - next.net_amount);
   } else if (!next.is_flat_claim && line.tax_source === "manual" && body.net_amount === undefined) {
     // Editing something else (description, date, cost code...) on a line
     // whose net the reviewer already set by hand — leave that number alone
     // instead of quietly recomputing over it. Clear the net field to opt
-    // back into auto.
+    // back into auto. The gross may have changed though, so the tax follows it.
+    if (money(next.gross_amount) !== null && money(next.net_amount) !== null) next.tax_amount = round2(money(next.gross_amount) - money(next.net_amount));
   } else {
     const d = deriveLineNet(next, receipt, sub.province, { shared });
     next.net_amount = d.net; next.tax_amount = d.tax; next.tax_source = d.tax_source;

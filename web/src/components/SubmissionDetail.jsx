@@ -25,7 +25,8 @@ const FLAG_LABELS = {
   low_confidence_match: "Matched on amount alone",
   tax_estimated: "Tax estimated, not read off the receipt",
   tax_unknown: "Receipt matched but no tax figure",
-  amount_mismatch: "Numbers don't reconcile",
+  amount_mismatch: "Amount differs from receipt",
+  net_tax_mismatch: "Net + tax ≠ gross",
   low_confidence: "Low extraction confidence",
   geo_mismatch: "Location doesn't match the project",
   attachments_failed: "Some files didn't attach in Procore — attach by hand",
@@ -88,6 +89,7 @@ export default function SubmissionDetail({ id, onClose, onChanged, me }) {
   const [dryRun, setDryRun] = useState(null);
   const [lightboxIdx, setLightboxIdx] = useState(null);
   const [newLine, setNewLine] = useState({ line_date: "", description: "", category: "materials", gross_amount: "" });
+  const [addOpen, setAddOpen] = useState(false);
   const [selectedLineIds, setSelectedLineIds] = useState(new Set());
   const [bulkCostCodeText, setBulkCostCodeText] = useState("");
 
@@ -332,6 +334,7 @@ export default function SubmissionDetail({ id, onClose, onChanged, me }) {
     setBusy(true);
     await mutate(() => api.addLine(id, newLine));
     setNewLine({ line_date: "", description: "", category: "materials", gross_amount: "" });
+    setAddOpen(false);
     setBusy(false);
   }
   async function handleRetryAttachments() {
@@ -647,24 +650,37 @@ This is recorded under your name, and the net is estimated from the claimed amou
                 );
               })}
               {lines.length === 0 && (
-                <tr><td colSpan={11} className="row-secondary" style={{ padding: 12 }}>No lines yet — add them below.</td></tr>
+                <tr><td colSpan={11} className="row-secondary" style={{ padding: 12 }}>No lines yet — add one below.</td></tr>
               )}
+              {actionable && (addOpen ? (
+                <tr className="add-line-tr">
+                  <td />
+                  <td><input type="date" value={newLine.line_date} onChange={(e) => setNewLine({ ...newLine, line_date: e.target.value })} /></td>
+                  <td><input placeholder="Description" value={newLine.description} onChange={(e) => setNewLine({ ...newLine, description: e.target.value })} /></td>
+                  <td>
+                    <select value={newLine.category} onChange={(e) => setNewLine({ ...newLine, category: e.target.value })}>
+                      {CATEGORIES.map((c) => <option key={c} value={c}>{c.replace("_", " ")}</option>)}
+                    </select>
+                  </td>
+                  <td><input type="number" step="0.01" placeholder="Gross" value={newLine.gross_amount}
+                    onChange={(e) => setNewLine({ ...newLine, gross_amount: e.target.value })} /></td>
+                  <td colSpan={6}>
+                    <button className="btn btn-ghost btn-sm" onClick={handleAddLine} disabled={busy}>Add line</button>{" "}
+                    <button className="btn btn-ghost btn-sm" onClick={() => setAddOpen(false)} disabled={busy}>Cancel</button>
+                  </td>
+                </tr>
+              ) : (
+                <tr className="add-line-tr">
+                  <td />
+                  <td colSpan={10}>
+                    <button className="btn btn-ghost btn-sm" onClick={() => setAddOpen(true)}>+ Add Line Item</button>
+                  </td>
+                </tr>
+              ))}
             </tbody>
           </table>
         </div>
 
-        {actionable && (
-          <div className="add-line-row">
-            <input type="date" value={newLine.line_date} onChange={(e) => setNewLine({ ...newLine, line_date: e.target.value })} />
-            <input placeholder="Description" value={newLine.description} onChange={(e) => setNewLine({ ...newLine, description: e.target.value })} />
-            <select value={newLine.category} onChange={(e) => setNewLine({ ...newLine, category: e.target.value })}>
-              {CATEGORIES.map((c) => <option key={c} value={c}>{c.replace("_", " ")}</option>)}
-            </select>
-            <input type="number" step="0.01" placeholder="Gross" value={newLine.gross_amount}
-              onChange={(e) => setNewLine({ ...newLine, gross_amount: e.target.value })} />
-            <button className="btn btn-ghost btn-sm" onClick={handleAddLine} disabled={busy}>+ Add line</button>
-          </div>
-        )}
       </div>
 
       <div className="card">

@@ -522,3 +522,19 @@ describe("isPickableProject", () => {
     expect(isPickableProject(p("VANCOUVER - AVAILABILITY", "BC - VANCOUVER - AAA - Availability"))).toBe(false);
   });
 });
+
+describe("line amount flags", () => {
+  const project = { active: true, stage: "Course of Construction", province: "ON" };
+  it("a net that does not add up with the tax gets its own flag, not the receipt-total one", () => {
+    const line = { category: "other", gross_amount: 8.3, net_amount: 7.35, tax_amount: 0.2, tax_source: "manual", receipt_id: "r" };
+    const codes = computeLineFlags(line, { gross: 8.3 }, "ON", project).map((f) => f.code);
+    expect(codes).toContain("net_tax_mismatch");
+    expect(codes).not.toContain("amount_mismatch");
+  });
+  it("a line that adds up and matches its receipt total has neither", () => {
+    const line = { category: "other", gross_amount: 8.3, net_amount: 7.35, tax_amount: 0.95, tax_source: "manual", receipt_id: "r" };
+    const codes = computeLineFlags(line, { gross: 8.3 }, "ON", project).map((f) => f.code);
+    expect(codes).not.toContain("net_tax_mismatch");
+    expect(codes).not.toContain("amount_mismatch");
+  });
+});
