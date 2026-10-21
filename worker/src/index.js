@@ -426,15 +426,35 @@ async function parseFormAndReceipts(env, formAtt, receiptAtts) {
   });
   content.push({ type: "text", text: FORM_PROMPT });
 
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
+  const body = JSON.stringify({ model: VISION_MODEL, max_tokens: 4096, messages: [{ role: "user", content }] });
+  const key = env.ANTHROPIC_API_KEY || "";
+  const send = () => fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": env.ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify({ model: VISION_MODEL, max_tokens: 4096, messages: [{ role: "user", content }] }),
+    headers: { "Content-Type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01" },
+    body,
   });
+
+  // A dropped connection never reaches Anthropic, so one retry is safe. If it still
+  // fails, say what actually happened — the bare "Network connection lost" hid
+  // whether it was the key, the payload, or the network. Key checks are booleans
+  // and a length only; the key itself is never logged.
+  let res;
+  try {
+    try {
+      res = await send();
+    } catch (first) {
+      await new Promise((r) => setTimeout(r, 1000));
+      res = await send();
+    }
+  } catch (e) {
+    const keyShape = !key ? "missing"
+      : /\s/.test(key) ? "contains whitespace"
+      : /[^\x21-\x7e]/.test(key) ? "contains a non-ASCII character"
+      : key.startsWith("sk-ant-") ? `looks well-formed (${key.length} chars)` : `doesn't start with sk-ant- (${key.length} chars)`;
+    const detail = `${e.name || "Error"}: ${e.message}${e.cause ? ` (cause: ${e.cause.message || e.cause})` : ""} — request ${Math.round(body.length / 1024)} KB, API key ${keyShape}`;
+    console.error("anthropic fetch failed:", detail);
+    throw new Error(`couldn't reach the Anthropic API (${detail})`);
+  }
   if (!res.ok) throw new Error(`Anthropic API error: ${res.status} ${await res.text()}`);
   const data = await res.json();
   const tb = (data.content || []).find((b) => b.type === "text");
