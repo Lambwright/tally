@@ -453,6 +453,19 @@ function pageRange(pages) {
   return { ps: first, pe: last };
 }
 
+// Projects that should never show up in the project picker: Procore's project templates
+// (no project number, "Template" in the name) and the per-region "AVAILABILITY" placeholders.
+// Only the picker is filtered. Overhead projects people really expense to (Einbau Headquarters,
+// the vans, the offices) stay, and an expense that already names one still validates normally.
+function isPickableProject(p) {
+  const number = String(p?.project_number || "").trim();
+  const name = String(p?.name || "");
+  if (!number) return false;
+  if (/template/i.test(name) || /template/i.test(number)) return false;
+  if (/availability/i.test(name) || /availability/i.test(number)) return false;
+  return true;
+}
+
 // One call to Claude -> parsed JSON.
 async function callClaude(env, content) {
   const body = JSON.stringify({ model: VISION_MODEL, max_tokens: 4096, messages: [{ role: "user", content }] });
@@ -2287,12 +2300,12 @@ export default {
       }
 
       if (url.pathname === "/projects" && request.method === "GET") {
-        const rows = await sql`
+        const allRows = await sql`
           select procore_id, project_number, name, stage, active, region, province, refreshed_at
           from projects_cache
           where active = true and stage is distinct from 'On Hold' and stage is distinct from 'Completed and Invoiced'
           order by project_number desc`;
-        return withRefresh(json({ projects: rows }));
+        return withRefresh(json({ projects: allRows.filter(isPickableProject) }));
       }
 
       if (url.pathname === "/export" && request.method === "GET") {
@@ -2412,6 +2425,7 @@ export default {
 export const _test = {
   readAttachments,
   pageRange,
+  isPickableProject,
   extractExpenseId,
   normalizeCategory,
   salvageByFieldBoundaries,

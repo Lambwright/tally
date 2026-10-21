@@ -5,6 +5,7 @@ const {
   extractExpenseId,
   readAttachments,
   pageRange,
+  isPickableProject,
   normalizeCategory,
   salvageByFieldBoundaries,
   matchLinesToReceipts,
@@ -501,5 +502,23 @@ describe("pageRange", () => {
     for (const bad of [null, undefined, [], "", "none", [0, 2], [7, 3], { x: 1 }]) {
       expect(pageRange(bad)).toEqual({ ps: null, pe: null });
     }
+  });
+});
+
+describe("isPickableProject", () => {
+  const p = (project_number, name) => ({ project_number, name });
+  it("keeps real projects and the overhead ones people expense to", () => {
+    expect(isPickableProject(p("2026_0183", "ON - Forte Fixtures - Harry Rosen Cumberland"))).toBe(true);
+    expect(isPickableProject(p("0000_0000", "Einbau Headquarters"))).toBe(true);
+    expect(isPickableProject(p("0000_0100", "Van#2 - BB56319"))).toBe(true);
+  });
+  it("hides templates (no number, or Template in the name)", () => {
+    expect(isPickableProject(p("", "Standard Project Template"))).toBe(false);
+    expect(isPickableProject(p(null, "Standard Project Template - Time and Material"))).toBe(false);
+    expect(isPickableProject(p("2026_0999", "Visual Elements Roll Out - Template"))).toBe(false);
+  });
+  it("hides the AVAILABILITY placeholders", () => {
+    expect(isPickableProject(p("GTA - AVAILABILITY", "GTA - AAA - Availability"))).toBe(false);
+    expect(isPickableProject(p("VANCOUVER - AVAILABILITY", "BC - VANCOUVER - AAA - Availability"))).toBe(false);
   });
 });
