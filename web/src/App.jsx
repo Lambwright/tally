@@ -11,7 +11,8 @@ import SubmitExpense from "./components/SubmitExpense.jsx";
 import ExportPanel from "./components/ExportPanel.jsx";
 import Cameo from "./components/Cameo.jsx";
 
-const CAMEO_USER = "josh@einbau.ca";
+// Who gets the walk-on, same rule for everyone: every CAMEO_EVERY-th sign-in on a browser.
+const CAMEO_USERS = ["josh@einbau.ca", "ben", "ben@einbau.ca"];
 const CAMEO_EVERY = 7;
 
 const STATUSES = [
@@ -106,7 +107,7 @@ export default function App() {
     setUser(u);
     if (u.themeAccent?.TALLY) applyAccentPreset(u.themeAccent.TALLY);
     setAuthState("in");
-    if (u && String(u.username).toLowerCase() === CAMEO_USER) {
+    if (u && CAMEO_USERS.includes(String(u.username).toLowerCase())) {
       try {
         const n = (parseInt(localStorage.getItem("tally_visits") || "0", 10) || 0) + 1;
         localStorage.setItem("tally_visits", String(n));
