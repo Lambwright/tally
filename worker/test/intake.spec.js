@@ -4,6 +4,7 @@ import { _test } from "../src/index.js";
 const {
   extractExpenseId,
   readAttachments,
+  pageRange,
   normalizeCategory,
   salvageByFieldBoundaries,
   matchLinesToReceipts,
@@ -484,5 +485,21 @@ describe("readAttachments progress", () => {
       expect(calls).toBe(2);
       expect(out.receipts).toEqual([]);
     } finally { globalThis.fetch = real; }
+  });
+});
+
+describe("pageRange", () => {
+  it("accepts the shapes Claude might return", () => {
+    expect(pageRange([5, 7])).toEqual({ ps: 5, pe: 7 });
+    expect(pageRange([5])).toEqual({ ps: 5, pe: 5 });
+    expect(pageRange(5)).toEqual({ ps: 5, pe: 5 });
+    expect(pageRange("5-7")).toEqual({ ps: 5, pe: 7 });
+    expect(pageRange(["6", "8"])).toEqual({ ps: 6, pe: 8 });
+    expect(pageRange({ start: 2, end: 3 })).toEqual({ ps: 2, pe: 3 });
+  });
+  it("gives nulls for nothing usable", () => {
+    for (const bad of [null, undefined, [], "", "none", [0, 2], [7, 3], { x: 1 }]) {
+      expect(pageRange(bad)).toEqual({ ps: null, pe: null });
+    }
   });
 });

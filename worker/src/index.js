@@ -437,9 +437,18 @@ function attBlock(a) {
 
 // [first, last] page numbers Claude gave for a receipt in a PDF -> { ps, pe }, or nulls when absent/invalid.
 function pageRange(pages) {
-  if (!Array.isArray(pages) || pages.length < 1) return { ps: null, pe: null };
-  const first = Math.trunc(Number(pages[0]));
-  const last = Math.trunc(Number(pages[pages.length - 1]));
+  // Claude is asked for [first, last], but be forgiving: 5, "5", "5-7", [5], [5, 7], { start, end }
+  const nums = [];
+  const add = (v) => {
+    if (typeof v === "number") nums.push(v);
+    else if (typeof v === "string") for (const m of v.matchAll(/\d+/g)) nums.push(Number(m[0]));
+    else if (Array.isArray(v)) v.forEach(add);
+    else if (v && typeof v === "object") { add(v.start ?? v.first ?? v.from); add(v.end ?? v.last ?? v.to); }
+  };
+  add(pages);
+  if (!nums.length) return { ps: null, pe: null };
+  const first = Math.trunc(nums[0]);
+  const last = Math.trunc(nums[nums.length - 1]);
   if (!(first >= 1) || !(last >= first)) return { ps: null, pe: null };
   return { ps: first, pe: last };
 }
@@ -2402,6 +2411,7 @@ export default {
 // Exported for unit tests.
 export const _test = {
   readAttachments,
+  pageRange,
   extractExpenseId,
   normalizeCategory,
   salvageByFieldBoundaries,

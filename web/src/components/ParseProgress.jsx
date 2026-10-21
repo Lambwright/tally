@@ -2,7 +2,27 @@
 // different from a stalled one. The worker keeps the "parsing" flag's `updated_at` fresh with
 // a heartbeat; if it goes quiet for STALL_MS the parse has died (e.g. the request was cut off)
 // and the person can restart it.
+import { useEffect, useState } from "react";
+import ClaudeTyping from "./ClaudeTyping.jsx";
+
 export const STALL_MS = 120000;
+
+// Something to say while it works — a new word every few seconds.
+const VERBS = [
+  "Percolating", "Ruminating", "Pondering", "Pontificating", "Cogitating", "Deliberating", "Mulling it over",
+  "Noodling", "Marinating", "Simmering", "Squinting at receipts", "Untangling", "Contemplating", "Musing",
+  "Philosophizing", "Puzzling", "Deciphering", "Rummaging", "Tabulating", "Concocting", "Cross-referencing",
+  "Peering at the fine print", "Consulting the oracle", "Wrangling line items", "Reticulating", "Brewing",
+];
+function useVerb(active) {
+  const [i, setI] = useState(() => Math.floor(Math.random() * VERBS.length));
+  useEffect(() => {
+    if (!active) return undefined;
+    const t = setInterval(() => setI((n) => (n + 1 + Math.floor(Math.random() * 5)) % VERBS.length), 3200);
+    return () => clearInterval(t);
+  }, [active]);
+  return VERBS[i];
+}
 
 function mmss(ms) {
   const s = Math.max(0, Math.round(ms / 1000));
@@ -20,7 +40,16 @@ function Step({ state, children }) {
   );
 }
 
-export default function ParseProgress({ flag, now, onRestart, restarting }) {
+export default function ParseProgress({ flag, now, onRestart, restarting, finished = false }) {
+  const verb = useVerb(!finished);
+  if (finished) {
+    return (
+      <div className="card" style={{ display: "flex", alignItems: "center", gap: 16 }}>
+        <ClaudeTyping state="done" />
+        <div className="card-title" style={{ color: "var(--green)" }}>All done!</div>
+      </div>
+    );
+  }
   const started = Date.parse(flag.started_at || "") || null;
   const updated = Date.parse(flag.updated_at || "") || null;
   const queued = !flag.running;
@@ -31,8 +60,11 @@ export default function ParseProgress({ flag, now, onRestart, restarting }) {
 
   return (
     <div className="card" style={{ borderColor: stalled ? "var(--red)" : undefined }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" }}>
+      <ClaudeTyping state={stalled ? "stalled" : "working"} />
+      <div style={{ flex: 1, minWidth: 220 }}>
       <div className="card-title" style={{ color: stalled ? "var(--red)" : "var(--yellow)" }}>
-        {stalled ? "This looks stalled" : "Reading your files…"}
+        {stalled ? "This looks stalled" : `${verb}…`}
         {started && !queued ? <span className="row-secondary" style={{ marginLeft: 10, fontWeight: 400 }}>{mmss(now - started)} elapsed</span> : null}
       </div>
 
@@ -44,6 +76,8 @@ export default function ParseProgress({ flag, now, onRestart, restarting }) {
             : `Claude is reading the files${flag.total ? ` — ${flag.done || 0} of ${flag.total} batch${flag.total === 1 ? "" : "es"} done` : ""}`}
         </Step>
         <Step state={phase === "saving" && !queued ? "running" : "todo"}>Matching receipts to lines and saving</Step>
+      </div>
+      </div>
       </div>
 
       {stalled ? (

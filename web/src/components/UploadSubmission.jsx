@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../api.js";
+import Combobox from "./Combobox.jsx";
 
 const MAX_FILES = 12;
 
@@ -125,19 +126,13 @@ export default function UploadSubmission({ onClose, onCreated }) {
 
         <div className="field" style={{ marginTop: 12 }}>
           <label htmlFor="upload-employee">Employee this expense is for (required)</label>
-          <input id="upload-employee" list="upload-employee-options" placeholder="Search Einbau employees…"
-            value={employeeName} disabled={busy} onChange={(e) => setEmployeeName(e.target.value)} />
-          <datalist id="upload-employee-options">
-            {users.map((u) => <option key={u.id} value={u.name} />)}
-          </datalist>
+          <Combobox id="upload-employee" placeholder="Search Einbau employees…" value={employeeName} disabled={busy}
+            onChange={setEmployeeName} options={users.map((u) => ({ value: u.name, label: u.name }))} />
         </div>
         <div className="field">
           <label htmlFor="upload-project">Project number (optional — Claude reads it off the form)</label>
-          <input id="upload-project" list="upload-project-options" placeholder="Search active projects…"
-            value={projectNumber} disabled={busy} onChange={(e) => setProjectNumber(e.target.value)} />
-          <datalist id="upload-project-options">
-            {projects.map((p) => <option key={p.procore_id} value={p.project_number}>{p.name}</option>)}
-          </datalist>
+          <Combobox id="upload-project" placeholder="Search active projects…" value={projectNumber} disabled={busy}
+            onChange={setProjectNumber} options={projects.map((p) => ({ value: p.project_number, label: p.project_number, sub: p.name }))} />
         </div>
 
         {error && <div className="login-error">{error}</div>}

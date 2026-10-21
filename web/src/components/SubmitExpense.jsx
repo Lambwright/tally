@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../api.js";
+import Combobox from "./Combobox.jsx";
 
 const MAX_FILES = 12;
 
@@ -121,11 +122,8 @@ export default function SubmitExpense({ onClose, onCreated }) {
 
         <div className="field" style={{ marginTop: 12 }}>
           <label htmlFor="submit-expense-project">Project number</label>
-          <input id="submit-expense-project" list="submit-expense-project-options" placeholder="Search active projects…"
-            value={projectNumber} disabled={busy} onChange={(e) => setProjectNumber(e.target.value)} />
-          <datalist id="submit-expense-project-options">
-            {projects.map((p) => <option key={p.procore_id} value={p.project_number}>{p.name}</option>)}
-          </datalist>
+          <Combobox id="submit-expense-project" placeholder="Search active projects…" value={projectNumber} disabled={busy}
+            onChange={setProjectNumber} options={projects.map((p) => ({ value: p.project_number, label: p.project_number, sub: p.name }))} />
         </div>
 
         {error && <div className="login-error">{error}</div>}

@@ -435,3 +435,52 @@ body {
 }
 .dc-preview-table td { padding: 8px; border-bottom: 1px solid var(--border-color); }
 .dc-preview-table tfoot td { border-bottom: none; padding-top: 10px; }
+
+/* Combobox — typeahead dropdown in the shape of SCOUT's, in TALLY's dark palette. */
+.combobox-wrap { position: relative; }
+.combobox-dropdown {
+  position: absolute; top: calc(100% + 4px); left: 0; right: 0;
+  background: var(--bg-card); border: 1px solid var(--border-color); border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md); max-height: 240px; overflow-y: auto; z-index: 9999;
+}
+.combobox-option {
+  display: flex; justify-content: space-between; align-items: baseline; gap: 12px;
+  padding: 9px 12px; font-size: 13px; cursor: pointer; color: var(--text-primary); transition: background 0.1s;
+}
+.combobox-option.highlighted { background: rgba(226,135,26,0.14); }
+.combobox-option.selected { font-weight: 600; color: var(--orange); }
+.combobox-sub { font-size: 12px; color: var(--text-secondary); text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.combobox-empty { padding: 12px; font-size: 12px; color: var(--text-tertiary); text-align: center; }
+
+/* ClaudeTyping — the little creature on the parse-progress card. Three states: working /
+   done (hops up) / stalled (sits still, shows a "?"). */
+.cc-scene { display: block; overflow: visible; flex-shrink: 0; }
+.cc-scene * { transform-box: fill-box; }
+.cc-check, .cc-question { opacity: 0; }
+.cc-line { transform-origin: left center; animation: cc-line 1.7s ease-in-out infinite; }
+.cc-line.l2 { animation-delay: -0.4s; } .cc-line.l3 { animation-delay: -0.9s; } .cc-line.l4 { animation-delay: -1.3s; }
+.cc-cursor { animation: cc-blink 0.7s steps(1) infinite; }
+.cc-arm-a { animation: cc-type 0.26s ease-in-out infinite alternate; }
+.cc-arm-b { animation: cc-type 0.26s ease-in-out -0.13s infinite alternate; }
+.cc-char { animation: cc-bob 1.2s ease-in-out infinite; }
+@keyframes cc-line { 0%, 100% { transform: scaleX(0.25); } 50% { transform: scaleX(1); } }
+@keyframes cc-blink { 50% { opacity: 0; } }
+@keyframes cc-type { from { transform: translateY(0); } to { transform: translateY(-4px); } }
+@keyframes cc-bob { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-1px); } }
+
+.cc-scene.is-done .cc-line, .cc-scene.is-done .cc-cursor { opacity: 0; animation: none; }
+.cc-scene.is-done .cc-check { opacity: 1; }
+.cc-scene.is-done .cc-char { animation: cc-hop 0.95s ease-out 1 both; }
+.cc-scene.is-done .cc-arm-a, .cc-scene.is-done .cc-arm-b { animation: none; transform: translateY(-14px); }
+@keyframes cc-hop {
+  0% { transform: translateY(0); } 30% { transform: translateY(-34px); } 55% { transform: translateY(0); }
+  72% { transform: translateY(-12px); } 100% { transform: translateY(0); }
+}
+
+.cc-scene.is-stalled .cc-line, .cc-scene.is-stalled .cc-cursor, .cc-scene.is-stalled .cc-arm-a,
+.cc-scene.is-stalled .cc-arm-b, .cc-scene.is-stalled .cc-char { animation: none; }
+.cc-scene.is-stalled .cc-question { opacity: 1; }
+
+@media (prefers-reduced-motion: reduce) {
+  .cc-line, .cc-cursor, .cc-arm-a, .cc-arm-b, .cc-char { animation: none !important; }
+}

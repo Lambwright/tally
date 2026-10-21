@@ -131,6 +131,20 @@ export default function SubmissionDetail({ id, onClose, onChanged, me }) {
 
   // while parsing: refresh the progress every 2.5 s and tick the clock every second
   const isParsing = !!parsingFlag;
+  // when a parse finishes cleanly, let the creature hop for a couple of seconds before the card goes
+  const wasParsing = useRef(false);
+  const [justFinished, setJustFinished] = useState(false);
+  const parseFailed = !!sub?.flags?.some((f) => PARSE_FAILURE_FLAGS.has(f.code));
+  useEffect(() => {
+    if (wasParsing.current && !isParsing && !parseFailed) {
+      setJustFinished(true);
+      const t = setTimeout(() => setJustFinished(false), 2400);
+      wasParsing.current = isParsing;
+      return () => clearTimeout(t);
+    }
+    wasParsing.current = isParsing;
+    return undefined;
+  }, [isParsing, parseFailed]);
   useEffect(() => {
     if (!isParsing) return;
     const poll = setInterval(() => load(true), 2500);
@@ -217,7 +231,7 @@ export default function SubmissionDetail({ id, onClose, onChanged, me }) {
           url: res.url,
           type: res.type,
           name: r.r2_key.split("/").pop(),
-          label: r.kind === "form" ? "Expense form" : `${r.vendor || "Receipt"}${r.note ? ` (${r.note})` : ""}${forLines.length ? ` → line ${forLines.map((l) => l.row_index).join(", ")}` : ""}`,
+          label: r.kind === "form" ? "Expense form" : `${r.vendor || "Receipt"}${r.note ? ` (${r.note})` : ""}${r.page_start ? ` · p.${r.page_start}${r.page_end > r.page_start ? `–${r.page_end}` : ""}` : ""}${forLines.length ? ` → line ${forLines.map((l) => l.row_index).join(", ")}` : ""}`,
           receiptId: r.id,
           // which pages of a multi-page PDF this receipt is on (null: show the whole file)
           pages: r.page_start ? [r.page_start, r.page_end || r.page_start] : null,
@@ -440,6 +454,7 @@ This is recorded under your name, and the net is estimated from the claimed amou
         </div>
       )}
 
+      {!parsingFlag && justFinished && <ParseProgress finished />}
       {parsingFlag && (
         <ParseProgress flag={parsingFlag} now={parseNow} restarting={parseRestarting} onRestart={() => { parseKicked.current = true; startParse(); }} />
       )}
