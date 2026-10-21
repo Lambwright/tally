@@ -14,6 +14,7 @@
 //   DELETE /submissions/:id                     (Einbau ID) hard-delete (cascade + R2 cleanup) — frees the Expense ID
 //   DELETE /submissions/:id/receipts/:receiptId (Einbau ID) remove one attachment (unmatches any line it backed)
 //   POST   /submissions/:id/reparse             (Einbau ID) re-run the Claude parse against the already-stored attachments
+//   POST   /submissions/:id/parse               (Einbau ID, also the submitter on their own row) run the first / a stalled parse inside the request, with live progress
 //   GET    /submissions?status=                 (Einbau ID) queue list — per-form summary
 //   GET    /submissions/:id                     (Einbau ID) { submission, line_items[], receipts[] }
 //   GET    /submissions/:id/receipt?key=        (Einbau ID) stream an attachment from R2 (private bucket)
@@ -78,7 +79,8 @@ const VISION_MODEL = "claude-sonnet-4-6";
 const INACTIVE_STAGES = new Set(["On Hold", "Completed and Invoiced"]);
 
 const LOW_CONFIDENCE_THRESHOLD = 0.75;
-const MAX_RECEIPTS = 12; // parser handles this many cleanly; overflow is flagged
+const MAX_RECEIPTS = 40; // receipts per submission (files are read FILE_BATCH at a time, so this just bounds the work)
+const MAX_FILES = 40;
 
 // The six columns on Einbau's Employee Expense Form.
 const CATEGORIES = new Set(["parking", "materials", "fuel", "mileage", "per_diem", "other"]);
@@ -359,11 +361,21 @@ function extractJSON(text) {
   return JSON.parse(match[0]);
 }
 
-const FORM_PROMPT = `You are given ONE Einbau "Employee Expense Form" (usually a PDF) and ZERO OR MORE receipt images, each labelled "RECEIPT <n>:".
+// One reader for every way an expense arrives (email, app upload, with or without the
+// Einbau form). Nothing is decided by the sender: Claude looks at each FILE and says
+// whether it is the expense form, one receipt, or several receipts (a photo of five
+// parking stubs, a PDF of six invoices), and TALLY keeps one receipt record per
+// receipt — several records may point at the same stored file.
+const READ_PROMPT = `You are given one or more FILES, each labelled "FILE <n>:" (n starts at 0). Nobody has told you what they are. Each file is one of:
+ - the Einbau "Employee Expense Form" (normally at most one, usually a PDF),
+ - a single receipt or invoice,
+ - several receipts or invoices in one file (a photo of a handful of parking stubs, a PDF holding a month of invoices, a long statement of separate charges),
+ - something else (a cover note, a blank page) — ignore it.
 
 Return ONLY a JSON object, no prose, no markdown fences:
 {
-  "form": {
+  "form": null | {
+    "file": number,                     // which FILE is the form
     "expense_id": string | null,        // the "Expense ID" field, format DDMMYY-JJJJJ-EEEE
     "employee_name": string | null,     // the "Name" field — the EMPLOYEE this expense belongs to, not whoever emailed/forwarded it
     "project_number": string | null,    // format YYYY_NNNN
@@ -377,30 +389,40 @@ Return ONLY a JSON object, no prose, no markdown fences:
         "gross": number }               // amount entered in that column (tax-in)
     ]
   },
-  "receipts": [
-    { "index": number,                  // the <n> from "RECEIPT <n>:"
+  "receipts": [                         // ONE entry per separate receipt/invoice, in the order you meet them
+    { "file": number,                   // which FILE it is in
+      "label": string | null,           // only when its file holds several: e.g. "3 of 5 - Green P, Sep 3"
       "vendor": string | null,
       "date": "YYYY-MM-DD" | null,
       "subtotal": number | null,        // pre-tax amount as printed
       "tax_lines": [ { "label": string, "amount": number } ],  // each printed tax line; [] if none
       "gross": number | null,           // total charged
+      "currency": "CAD" | "USD" | string | null,
+      "category": "parking" | "materials" | "fuel" | "other",  // what was bought
+      "description": string,            // vendor + what it was for, short
       "confidence": number }            // 0..1 in the numbers above
   ],
   "matches": [
     { "row": number, "receipt_index": number | null, "confidence": number }
-    // best guess which receipt backs each form row: amount first, then vendor vs
-    // the row description, then date. null if unsure. mileage / per_diem never have one.
+    // only when there is a form: best guess which receipts[] entry (0-based position in the
+    // array above) backs each form row — amount first, then vendor vs the row description,
+    // then date. null if unsure. mileage / per_diem never have one.
   ]
 }
 
 Rules:
 - Read numbers exactly as printed. Never infer tax that isn't shown.
-- One line_item per row the employee filled in — the amount is in exactly one of the
-  six category columns (Parking $, Materials $, Fuel $, Mileage (KM), Per Diem $, Other $).
-- IGNORE the "For Office Use Only" block (Subtotal / Net Total / Expense Total) and the
-  "Authorized By" / "Date Authorized" fields — those are handled downstream, not by you.
-- If the form is missing or unreadable, return "form" with null fields and "line_items": [].
+- A multi-page invoice is ONE receipt (use its overall total and tax lines), not one per page. Ignore $0.00 usage rows.
+- Separate invoices/receipts inside one file are SEPARATE receipts entries, each with its own subtotal, tax and total.
+- Form rows: one line_item per row the employee filled in — the amount is in exactly one of the six category columns (Parking $, Materials $, Fuel $, Mileage (KM), Per Diem $, Other $). IGNORE the "For Office Use Only" block (Subtotal / Net Total / Expense Total) and the "Authorized By" / "Date Authorized" fields.
+- No form among the files: "form" is null.
 - If a receipt is unreadable, still include its entry with nulls and confidence 0.`;
+
+// Used when the files had to be read in several calls: the receipts are already read,
+// so matching them to the form's rows needs only their text, not the images again.
+const MATCH_PROMPT = `Above: the rows of an Einbau expense form (FORM ROWS) and the receipts read from its attachments (RECEIPTS, each with its "id"). Match each form row to the receipt that backs it: amount first, then vendor vs the row description, then date. A receipt backs at most one row. Leave a row out if unsure; mileage and per_diem rows never have a receipt.
+
+Return ONLY a JSON object, no prose: { "matches": [ { "row": number, "receipt_index": number, "confidence": number } ] } — receipt_index is the receipt's "id".`;
 
 function attBlock(a) {
   const b64 = String(a.base64 || "").replace(/^data:[^,]+,/, "").replace(/\s/g, "");
@@ -412,20 +434,8 @@ function attBlock(a) {
   return { type: "image", source: { type: "base64", media_type: mt, data: b64 } };
 }
 
-async function parseFormAndReceipts(env, formAtt, receiptAtts) {
-  const content = [];
-  if (formAtt) {
-    content.push({ type: "text", text: "FORM (Einbau Employee Expense Form):" });
-    content.push(attBlock(formAtt));
-  } else {
-    content.push({ type: "text", text: "FORM: (not attached)" });
-  }
-  receiptAtts.forEach((a, i) => {
-    content.push({ type: "text", text: `RECEIPT ${i}:` });
-    content.push(attBlock(a));
-  });
-  content.push({ type: "text", text: FORM_PROMPT });
-
+// One call to Claude -> parsed JSON.
+async function callClaude(env, content) {
   const body = JSON.stringify({ model: VISION_MODEL, max_tokens: 4096, messages: [{ role: "user", content }] });
   const key = env.ANTHROPIC_API_KEY || "";
   const send = () => fetch("https://api.anthropic.com/v1/messages", {
@@ -455,11 +465,79 @@ async function parseFormAndReceipts(env, formAtt, receiptAtts) {
     console.error("anthropic fetch failed:", detail);
     throw new Error(`couldn't reach the Anthropic API (${detail})`);
   }
+  // Rate-limited or overloaded (429 / 5xx / 529): wait and try again — these are temporary.
+  // Honours Retry-After, else 2s, 5s, 12s.
+  for (const wait of [2000, 5000, 12000]) {
+    if (res.ok || ![429, 500, 502, 503, 504, 529].includes(res.status)) break;
+    const ra = Number(res.headers.get("retry-after"));
+    await new Promise((r) => setTimeout(r, Number.isFinite(ra) && ra > 0 ? Math.min(ra, 20) * 1000 : wait));
+    res = await send();
+  }
   if (!res.ok) throw new Error(`Anthropic API error: ${res.status} ${await res.text()}`);
   const data = await res.json();
   const tb = (data.content || []).find((b) => b.type === "text");
   if (!tb) throw new Error("Anthropic returned no text block");
   return extractJSON(tb.text.replace(/```json|```/g, "").trim());
+}
+
+// Files go to Claude FILE_BATCH at a time (one reply is capped at 4096 tokens, and a
+// bundle can be a dozen invoices), the batches run side by side, and the answers are
+// stitched together with global file numbers and receipt positions. A failing batch
+// fails the whole parse — a silent partial result would look complete.
+const FILE_BATCH = 3;
+const EMPTY_FORM = { file: null, expense_id: null, employee_name: null, project_number: null, province: null, date_authorized: null, line_items: [] };
+
+// atts: [{ base64, contentType }] — every stored file, in a stable order.
+// returns { form: {...EMPTY_FORM shape} | null, receipts: [{ file, ...}], matches: [{ row, receipt_index, confidence }] }
+async function readAttachments(env, atts, onProgress = null) {
+  const batches = [];
+  for (let i = 0; i < atts.length; i += FILE_BATCH) batches.push(atts.slice(i, i + FILE_BATCH));
+
+  let batchesDone = 0;
+  const results = await Promise.all(batches.map((batch) => {
+    const content = [];
+    batch.forEach((a, i) => {
+      content.push({ type: "text", text: `FILE ${i}:` });
+      content.push(attBlock(a));
+    });
+    content.push({ type: "text", text: READ_PROMPT });
+    return callClaude(env, content).then((r) => {
+      batchesDone += 1;
+      if (onProgress) Promise.resolve(onProgress({ phase: "reading", done: batchesDone, total: batches.length })).catch(() => {});
+      return r;
+    });
+  }));
+  if (onProgress) await Promise.resolve(onProgress({ phase: "reading", done: batches.length, total: batches.length })).catch(() => {});
+
+  let form = null;
+  const receipts = [];
+  const matches = [];
+  results.forEach((r, bi) => {
+    const fileOffset = bi * FILE_BATCH;
+    (Array.isArray(r?.receipts) ? r.receipts : []).forEach((rc) => receipts.push({ ...rc, file: (Number(rc.file) || 0) + fileOffset }));
+    // the form with the most rows wins if more than one file claims to be it
+    if (r?.form && (!form || (r.form.line_items || []).length > (form.line_items || []).length)) {
+      form = { ...EMPTY_FORM, ...r.form, file: (Number(r.form.file) || 0) + fileOffset };
+      if (batches.length === 1) matches.push(...(Array.isArray(r.matches) ? r.matches : []));
+    }
+  });
+
+  // Several calls: the form's rows and the receipts were read apart, so match them from text.
+  if (batches.length > 1 && form && (form.line_items || []).length && receipts.length) {
+    try {
+      const rows = form.line_items.map((l) => ({ row: l.row, date: l.date, description: l.description, category: l.category, gross: l.gross }));
+      const summaries = receipts.map((rc, id) => ({ id, vendor: rc.vendor, date: rc.date, subtotal: rc.subtotal, gross: rc.gross, description: rc.description }));
+      const m = await callClaude(env, [
+        { type: "text", text: `FORM ROWS:\n${JSON.stringify(rows)}\n\nRECEIPTS:\n${JSON.stringify(summaries)}` },
+        { type: "text", text: MATCH_PROMPT },
+      ]);
+      matches.push(...(Array.isArray(m?.matches) ? m.matches : []));
+    } catch (e) {
+      // not fatal: the amount/vendor/date matcher still runs without Claude's hints
+      console.error("match call failed:", e && e.message);
+    }
+  }
+  return { form, receipts, matches };
 }
 
 // ---------------------------------------------------------------------------
@@ -579,7 +657,9 @@ async function procoreAttachUploadsToDirectCost(env, token, projectId, directCos
 async function attachSubmissionFiles(env, token, projectId, directCostId, receiptRows) {
   const attachResults = [];
   const uploaded = []; // { key, uuid }
-  for (const r of receiptRows) {
+  // several receipt records can share one stored file — attach each file once
+  const onePerFile = [...new Map(receiptRows.map((r) => [r.r2_key, r])).values()];
+  for (const r of onePerFile) {
     try {
       const obj = await env.RECEIPTS.get(r.r2_key);
       if (!obj) throw new Error("object missing from R2");
@@ -989,9 +1069,11 @@ async function createSubmissionFromAttachments(env, sql, ctx, {
   atts, employeeName = null, employeeEmail = null, province = null, projectNumber = null,
   rawEmail = null, expenseIdHint = null, historyText, origin = "email", createdBy = null,
 }) {
-  const formAtt = atts.find((a) => (a.contentType || "").toLowerCase().includes("pdf")) || null;
-  const receiptAtts = atts.filter((a) => a !== formAtt).slice(0, MAX_RECEIPTS);
-  const storeAtts = formAtt ? [formAtt, ...receiptAtts] : [...receiptAtts];
+  // Nobody tells us what each file is: Claude reads them all and says which one is the
+  // form (if any) and how many receipts each holds. Until it has answered, the first PDF
+  // is shown as the form — a guess that parseSubmission corrects.
+  const guessedForm = atts.find((a) => (a.contentType || "").toLowerCase().includes("pdf")) || null;
+  const storeAtts = atts.slice(0, MAX_FILES);
 
   // R2 keys are opaque — a UUID prefix, unrelated to the Expense ID (which we may
   // not know yet). Sequential puts keep the subrequest peak low.
@@ -1000,7 +1082,7 @@ async function createSubmissionFromAttachments(env, sql, ctx, {
   for (const a of storeAtts) {
     const key = `${keyPrefix}/${a.name}`;
     await env.RECEIPTS.put(key, base64ToBytes(a.base64), { httpMetadata: { contentType: a.contentType } });
-    stored.push({ key, kind: a === formAtt ? "form" : "receipt" });
+    stored.push({ key, kind: a === guessedForm ? "form" : "receipt", contentType: a.contentType, base64: a.base64 });
   }
 
   const expenseId = expenseIdHint || `pending-${keyPrefix}`;
@@ -1026,11 +1108,16 @@ async function createSubmissionFromAttachments(env, sql, ctx, {
     stored.map((s) => sql`insert into receipts (submission_id, r2_key, kind) values (${sub.id}, ${s.key}, ${s.kind})`)
   );
 
-  // The slow part — off the request path.
-  ctx.waitUntil(
-    parseSubmission(env, sql, sub.id, { formAtt, receiptAtts })
-      .catch((err) => console.error("background parse failed for", sub.id, err && err.message))
-  );
+  // The slow part. Email intake (Power Automate has no browser to drive it) parses in the
+  // background, which Cloudflare cuts off after ~30 s. An app upload leaves the submission
+  // "parsing" and the review page calls POST /submissions/:id/parse, which has no such cap
+  // and reports progress.
+  if (origin === "email") {
+    ctx.waitUntil(
+      parseSubmission(env, sql, sub.id, { files: stored.map((s) => ({ key: s.key, contentType: s.contentType, base64: s.base64 })) })
+        .catch((err) => console.error("background parse failed for", sub.id, err && err.message))
+    );
+  }
 
   return sub;
 }
@@ -1114,13 +1201,36 @@ async function handleUpload(request, env, sql, ctx, auth) {
 }
 
 // Background: the Claude call, matching, line inserts, receipt enrichment, flags.
-async function parseSubmission(env, sql, submissionId, { formAtt, receiptAtts }) {
+// `files`: every stored file of the submission — [{ key (R2), contentType, base64 }] — in
+// a stable order. Claude decides which is the form and how many receipts each holds.
+async function parseSubmission(env, sql, submissionId, { files }) {
+  // Live progress for the review page: the transient "parsing" flag carries the phase and
+  // batch counts plus a timestamp that a heartbeat keeps fresh, so the page can show what
+  // it is working through and tell a stalled parse from a slow one. Writes only while the
+  // flag still exists, so a late heartbeat can never overwrite the final flags.
+  const startedAt = new Date().toISOString();
+  let progress = { phase: "reading", done: 0, total: Math.max(1, Math.ceil(files.length / FILE_BATCH)) };
+  const writeProgress = async () => {
+    const detail = progress.phase === "saving"
+      ? "Saving the lines and matching receipts…"
+      : `Reading ${files.length} file${files.length === 1 ? "" : "s"} with Claude — ${progress.done} of ${progress.total} batch${progress.total === 1 ? "" : "es"} done`;
+    const flag = { code: "parsing", severity: "low", detail, running: true, files: files.length, ...progress, started_at: startedAt, updated_at: new Date().toISOString() };
+    await sql`update submissions set flags = ${JSON.stringify([flag])}::jsonb, updated_at = now()
+      where id = ${submissionId} and flags @> '[{"code":"parsing"}]'::jsonb`;
+  };
+  await writeProgress().catch(() => {});
+  const heartbeat = setInterval(() => { writeProgress().catch(() => {}); }, 15000);
+
   let claude = null, claudeError = null;
   try {
-    claude = await parseFormAndReceipts(env, formAtt, receiptAtts);
+    claude = await readAttachments(env, files, (p) => { progress = { ...progress, ...p }; return writeProgress(); });
   } catch (e) {
     claudeError = e.message;
+  } finally {
+    clearInterval(heartbeat);
   }
+  progress = { ...progress, phase: "saving" };
+  await writeProgress().catch(() => {});
   const form = (claude && claude.form) || {};
   const claudeReceipts = claude && Array.isArray(claude.receipts) ? claude.receipts : [];
   const claudeMatches = claude && Array.isArray(claude.matches) ? claude.matches : [];
@@ -1166,24 +1276,62 @@ async function parseSubmission(env, sql, submissionId, { formAtt, receiptAtts })
       updated_at = now()
     where id = ${submissionId}`;
 
-  // Enrich the receipt rows with what Claude read.
-  const receiptRows = await sql`select * from receipts where submission_id = ${submissionId} order by (kind = 'form') desc, created_at asc`;
-  const realReceiptRows = receiptRows.filter((r) => r.kind === "receipt");
-  for (let i = 0; i < realReceiptRows.length; i++) {
-    const c = claudeReceipts.find((r) => Number(r.index) === i) || {};
-    await sql`
-      update receipts set vendor = ${c.vendor || null}, receipt_date = ${c.date || null}, subtotal = ${money(c.subtotal)},
-        tax_json = ${c.tax_lines ? JSON.stringify(c.tax_lines) : null}::jsonb, gross = ${money(c.gross)},
-        currency = ${c.currency || "CAD"}, confidence = ${Number.isFinite(Number(c.confidence)) ? Number(c.confidence) : null}
-      where id = ${realReceiptRows[i].id}`;
+  // One receipt record per receipt Claude found (several can share a stored file — a photo
+  // of five stubs is five records), and the form file marked as the form. If Claude failed
+  // we leave the records as they were.
+  let enriched = [];
+  if (!claudeError) {
+    const stored = await sql`select * from receipts where submission_id = ${submissionId} order by created_at asc, id asc`;
+    const rowByKey = new Map();
+    for (const r of stored) {
+      if (rowByKey.has(r.r2_key)) await sql`delete from receipts where id = ${r.id}`; // a re-parse starts the per-receipt records afresh
+      else rowByKey.set(r.r2_key, r);
+    }
+    const formKey = claude.form && Number.isInteger(Number(claude.form.file)) ? files[Number(claude.form.file)]?.key : null;
+    for (const [key, row] of rowByKey) {
+      const kind = key === formKey ? "form" : "receipt";
+      await sql`update receipts set kind = ${kind}, vendor = null, receipt_date = null, subtotal = null, tax_json = null, gross = null, confidence = null, note = null where id = ${row.id}`;
+      row.kind = kind;
+      row.used = false;
+    }
+    for (let i = 0; i < claudeReceipts.length; i++) {
+      const c = claudeReceipts[i] || {};
+      const key = files[Number(c.file)]?.key;
+      const base = key && rowByKey.get(key);
+      if (!base || base.kind === "form") continue; // a receipt "found" in the form file or a file that doesn't exist: ignore
+      const vals = {
+        vendor: c.vendor || null, date: c.date || null, subtotal: money(c.subtotal), gross: money(c.gross),
+        tax: c.tax_lines ? JSON.stringify(c.tax_lines) : null, currency: c.currency || "CAD",
+        conf: Number.isFinite(Number(c.confidence)) ? Number(c.confidence) : null, note: c.label ? String(c.label).slice(0, 200) : null,
+      };
+      let id = base.id;
+      if (!base.used) {
+        base.used = true;
+        await sql`update receipts set vendor = ${vals.vendor}, receipt_date = ${vals.date}, subtotal = ${vals.subtotal}, tax_json = ${vals.tax}::jsonb,
+          gross = ${vals.gross}, currency = ${vals.currency}, confidence = ${vals.conf}, note = ${vals.note} where id = ${id}`;
+      } else {
+        const [ins] = await sql`insert into receipts (submission_id, r2_key, kind, vendor, receipt_date, subtotal, tax_json, gross, currency, confidence, note)
+          values (${submissionId}, ${base.r2_key}, 'receipt', ${vals.vendor}, ${vals.date}, ${vals.subtotal}, ${vals.tax}::jsonb, ${vals.gross}, ${vals.currency}, ${vals.conf}, ${vals.note})
+          returning id`;
+        id = ins.id;
+      }
+      enriched.push({ id, idx: i, vendor: vals.vendor, gross: vals.gross, receipt_date: vals.date, subtotal: vals.subtotal, tax_json: c.tax_lines || null, description: c.description, category: c.category });
+    }
   }
-  const enriched = realReceiptRows.map((r, i) => {
-    const c = claudeReceipts.find((x) => Number(x.index) === i) || {};
-    return { id: r.id, idx: i, vendor: c.vendor || null, gross: money(c.gross), receipt_date: c.date || null, subtotal: money(c.subtotal), tax_json: c.tax_lines || null };
-  });
+  const receiptRows = await sql`select * from receipts where submission_id = ${submissionId} order by (kind = 'form') desc, created_at asc`;
 
-  // Lines → match → net → insert.
-  const formLines = Array.isArray(form.line_items) ? form.line_items : [];
+  // Lines → match → net → insert. The form's rows if there is a form with rows; otherwise
+  // one line per receipt (a web upload of just invoices, a photo of parking stubs, ...).
+  let formLines = Array.isArray(form.line_items) ? form.line_items : [];
+  let matchHints = claudeMatches;
+  let synthesized = false;
+  if (!formLines.length && enriched.length) {
+    synthesized = true;
+    formLines = enriched.map((r, i) => ({
+      row: i + 1, date: r.receipt_date, description: r.description || r.vendor || "Receipt", category: r.category, gross: r.gross,
+    }));
+    matchHints = enriched.map((r, i) => ({ row: i + 1, receipt_index: r.idx, confidence: 0.95 }));
+  }
   const lines = formLines.map((li, i) => {
     const category = normalizeCategory(li.category);
     return {
@@ -1195,7 +1343,10 @@ async function parseSubmission(env, sql, submissionId, { formAtt, receiptAtts })
       gross_amount: money(li.gross),
     };
   });
-  const matches = matchLinesToReceipts(lines, enriched, claudeMatches);
+  // Lines built straight from receipts are matched 1:1 by construction — no amount needed.
+  const matches = synthesized
+    ? new Map(enriched.map((r, i) => [i + 1, { receipt_id: r.id, method: "auto", confidence: 0.95, flag: null }]))
+    : matchLinesToReceipts(lines, enriched, matchHints);
   const lineInserts = lines.map((l) => {
     const mm = matches.get(l.row_index) || null;
     const receiptId = mm?.receipt_id || null;
@@ -1306,8 +1457,8 @@ async function handleDetail(id, sql, user) {
   if (!sub) return json({ error: "not_found" }, 404);
   const line_items = await sql`select * from line_items where submission_id = ${id} order by row_index asc nulls last, created_at asc`;
   const receipts = await sql`
-    select id, submission_id, r2_key, kind, vendor, receipt_date, subtotal, tax_json, gross, currency, confidence, created_at
-    from receipts where submission_id = ${id} order by (kind = 'form') desc, created_at asc`;
+    select id, submission_id, r2_key, kind, vendor, receipt_date, subtotal, tax_json, gross, currency, confidence, note, created_at
+    from receipts where submission_id = ${id} order by (kind = 'form') desc, created_at asc, id asc`;
   return json({ submission: sub, line_items, receipts, self_approval: selfApprovalReason(user, sub) });
 }
 
@@ -1942,35 +2093,79 @@ async function handleReject(subId, request, sql, user) {
 // and reruns the same extraction + matching against the SAME row. Synchronous —
 // this is a manual retry from the UI, not PA, so there's no 2-minute deadline to
 // dodge; the caller just waits for the result.
-async function handleReparse(subId, env, sql, user) {
-  const [sub] = await sql`select * from submissions where id = ${subId}`;
-  if (!sub) return json({ error: "not_found" }, 404);
-
-  const receiptRows = await sql`select * from receipts where submission_id = ${subId} order by (kind = 'form') desc, created_at asc`;
-  if (!receiptRows.length) return json({ error: "no_attachments", detail: "Nothing stored to re-parse." }, 422);
-
-  const atts = [];
+// One entry per stored FILE (several receipt records can share a file); Claude re-decides
+// what each file is, so none of the old form/receipt split is carried over.
+async function loadStoredFiles(env, sql, subId) {
+  const receiptRows = await sql`select * from receipts where submission_id = ${subId} order by created_at asc, id asc`;
+  if (!receiptRows.length) return { error: json({ error: "no_attachments", detail: "Nothing stored to re-parse." }, 422) };
+  const files = [];
+  const seen = new Set();
   for (const r of receiptRows) {
+    if (seen.has(r.r2_key)) continue;
+    seen.add(r.r2_key);
     const obj = await env.RECEIPTS.get(r.r2_key);
     if (!obj) continue;
     const bytes = new Uint8Array(await obj.arrayBuffer());
-    atts.push({
-      kind: r.kind,
+    files.push({
+      key: r.r2_key,
       contentType: obj.httpMetadata?.contentType || (r.kind === "form" ? "application/pdf" : "image/jpeg"),
       base64: bytesToBase64(bytes),
     });
   }
-  const formAtt = atts.find((a) => a.kind === "form") || null;
-  const receiptAtts = atts.filter((a) => a.kind === "receipt");
-  if (!formAtt && receiptAtts.length === 0) {
-    return json({ error: "attachments_missing", detail: "Stored files couldn't be read back from R2." }, 502);
+  if (files.length === 0) {
+    return { error: json({ error: "attachments_missing", detail: "Stored files couldn't be read back from R2." }, 502) };
   }
+  return { files };
+}
+
+// POST /submissions/:id/parse — runs the first (or a stalled) parse INSIDE this request. The
+// review page calls it right after an upload and shows live progress; unlike the background
+// task an email intake uses (cut off after ~30 s), a request has no such cap, so a big
+// bundle can take as long as it needs. Only acts on a submission that is still "parsing": a
+// finished parse is left alone, one that reported progress in the last 2 minutes is
+// already running, and one that has gone quiet is treated as stalled and restarted.
+const PARSE_STALL_MS = 120000;
+async function handleParsePending(subId, env, sql, user) {
+  const [sub] = await sql`select * from submissions where id = ${subId}`;
+  if (!sub) return json({ error: "not_found" }, 404);
+  const flag = (sub.flags || []).find((f) => f.code === "parsing");
+  if (!flag) return json({ started: false, reason: "not_parsing", submission: sub });
+  if (flag.running && Date.now() - Date.parse(flag.updated_at || 0) < PARSE_STALL_MS) {
+    return json({ started: false, reason: "already_running", submission: sub });
+  }
+
+  // Claim it. If two callers race, only the one whose update still matches the flags as they were read wins
+  // (compared as jsonb — timestamps would lose precision round-tripping through JS).
+  const claimed = await sql`
+    update submissions
+       set flags = ${JSON.stringify([{ code: "parsing", severity: "low", detail: "Starting…", running: true, phase: "reading", done: 0, total: 1, started_at: new Date().toISOString(), updated_at: new Date().toISOString() }])}::jsonb,
+           updated_at = now()
+     where id = ${subId} and flags = ${JSON.stringify(sub.flags)}::jsonb
+     returning id`;
+  if (!claimed.length) return json({ started: false, reason: "already_running", submission: sub });
+
+  const loaded = await loadStoredFiles(env, sql, subId);
+  if (loaded.error) return loaded.error;
+  await parseSubmission(env, sql, subId, { files: loaded.files });
+
+  const [freshSub] = await sql`select * from submissions where id = ${subId}`;
+  const line_items = await sql`select * from line_items where submission_id = ${subId} order by row_index asc nulls last, created_at asc`;
+  return json({ started: true, submission: freshSub, line_items });
+}
+
+async function handleReparse(subId, env, sql, user) {
+  const [sub] = await sql`select * from submissions where id = ${subId}`;
+  if (!sub) return json({ error: "not_found" }, 404);
+
+  const loaded = await loadStoredFiles(env, sql, subId);
+  if (loaded.error) return loaded.error;
+  const files = loaded.files;
 
   await sql`delete from line_items where submission_id = ${subId}`;
   await sql`update submissions set flags = ${JSON.stringify([{ code: "parsing", severity: "low", detail: "Re-parsing…" }])}::jsonb, updated_at = now() where id = ${subId}`;
   await bumpForm(sql, subId, historyEvent("reparse", `${user.username} triggered a re-parse`));
 
-  await parseSubmission(env, sql, subId, { formAtt, receiptAtts, body: {} });
+  await parseSubmission(env, sql, subId, { files });
 
   const [freshSub] = await sql`select * from submissions where id = ${subId}`;
   const line_items = await sql`select * from line_items where submission_id = ${subId} order by row_index asc nulls last, created_at asc`;
@@ -1999,8 +2194,10 @@ async function handleReceiptDelete(subId, receiptId, env, sql, user) {
       where id = ${l.id}`;
   }
 
-  await env.RECEIPTS.delete(receipt.r2_key).catch(() => {});
   await sql`delete from receipts where id = ${receiptId}`;
+  // several receipt records can share one stored file (a photo of five stubs) — only drop the file with the last of them
+  const [stillUsed] = await sql`select 1 as x from receipts where submission_id = ${subId} and r2_key = ${receipt.r2_key} limit 1`;
+  if (!stillUsed) await env.RECEIPTS.delete(receipt.r2_key).catch(() => {});
 
   await bumpForm(sql, subId, historyEvent(
     "receipt_deleted",
@@ -2144,6 +2341,7 @@ export default {
           if (!seg && request.method === "PATCH") return withRefresh(await handleSubmissionPatch(subId, request, sql, auth.user, pmScoped));
           if (!seg && request.method === "DELETE") return withRefresh(await handleSubmissionDelete(subId, env, sql, auth.user));
           if (seg === "reparse" && request.method === "POST") return withRefresh(await handleReparse(subId, env, sql, auth.user));
+          if (seg === "parse" && request.method === "POST") return withRefresh(await handleParsePending(subId, env, sql, auth.user));
           if (seg === "retry-attachments" && request.method === "POST") return withRefresh(await handleRetryAttachments(subId, env, sql, auth.user));
           if (seg === "receipt" && request.method === "GET") return await handleReceipt(subId, url, env, sql);
           if (seg === "receipts") {
@@ -2191,6 +2389,7 @@ export default {
 
 // Exported for unit tests.
 export const _test = {
+  readAttachments,
   extractExpenseId,
   normalizeCategory,
   salvageByFieldBoundaries,

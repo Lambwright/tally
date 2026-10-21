@@ -91,7 +91,7 @@ export default function UploadSubmission({ onClose, onCreated }) {
       <div className="modal" onClick={(e) => e.stopPropagation()}>
         <div className="card-title" style={{ marginBottom: 4 }}>New expense submission</div>
         <p className="row-secondary" style={{ marginBottom: 12 }}>
-          Drop the expense form (PDF) and receipt photos below — Claude reads them the same way it does from email.
+          Drop in whatever you have — the expense form, receipts, a photo of several receipts, a PDF of invoices. Claude works out what each file is.
         </p>
 
         <div

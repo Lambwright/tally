@@ -49,6 +49,8 @@ export const api = {
   deleteSubmission: (id) => request(`/submissions/${id}`, { method: "DELETE" }),
   deleteReceipt: (id, receiptId) => request(`/submissions/${id}/receipts/${receiptId}`, { method: "DELETE" }),
   reparseSubmission: (id) => request(`/submissions/${id}/reparse`, { method: "POST", body: {} }),
+  // first / stalled parse, run inside the request (no 30 s background cap) — see worker handleParsePending
+  parsePending: (id) => request(`/submissions/${id}/parse`, { method: "POST", body: {} }),
   uploadSubmission: (fields) => request(`/submissions/upload`, { method: "POST", body: fields }),
   retryAttachments: (id) => request(`/submissions/${id}/retry-attachments`, { method: "POST", body: {} }),
   getCostCodes: (id) => request(`/submissions/${id}/cost-codes`), // { codes, defaults }

@@ -3,6 +3,7 @@ import { _test } from "../src/index.js";
 
 const {
   extractExpenseId,
+  readAttachments,
   normalizeCategory,
   salvageByFieldBoundaries,
   matchLinesToReceipts,
@@ -395,5 +396,93 @@ describe("submitterDenial", () => {
     expect(submitterDenial("PATCH", undefined, "approved")).toMatchObject({ status: 409 });
     expect(submitterDenial("DELETE", undefined, "approved")).toMatchObject({ status: 409 });
     expect(submitterDenial("POST", "lines", "approved")).toMatchObject({ status: 409 });
+  });
+});
+
+describe("readAttachments (one reader for every entry style)", () => {
+  const att = () => ({ contentType: "application/pdf", base64: "QQ==" });
+  const reply = (obj) => ({ ok: true, json: async () => ({ content: [{ type: "text", text: JSON.stringify(obj) }] }) });
+  const env = { ANTHROPIC_API_KEY: "sk-ant-x" };
+  const withFetch = async (fn, body) => {
+    const real = globalThis.fetch;
+    globalThis.fetch = fn;
+    try { return await body(); } finally { globalThis.fetch = real; }
+  };
+
+  it("keeps several receipts found in one file as separate receipts", async () => {
+    await withFetch(async () => reply({
+      form: null,
+      receipts: [
+        { file: 0, label: "1 of 3", vendor: "Green P", gross: 12 },
+        { file: 0, label: "2 of 3", vendor: "Green P", gross: 9 },
+        { file: 0, label: "3 of 3", vendor: "Impark", gross: 7 },
+      ],
+    }), async () => {
+      const out = await readAttachments(env, [att()]);
+      expect(out.form).toBeNull();
+      expect(out.receipts.map((r) => r.gross)).toEqual([12, 9, 7]);
+      expect(out.receipts.every((r) => r.file === 0)).toBe(true);
+    });
+  });
+
+  it("reads more files than one call takes in batches, with global file numbers", async () => {
+    let calls = 0;
+    await withFetch(async () => {
+      calls += 1;
+      // every batch answers with a receipt in its own local file 1
+      return reply({ form: null, receipts: [{ file: 1, vendor: "v" + calls, gross: calls }] });
+    }, async () => {
+      const out = await readAttachments(env, [att(), att(), att(), att(), att()]);
+      expect(calls).toBe(2); // 5 files -> batches of 3 + 2
+      expect(out.receipts.map((r) => r.file).sort()).toEqual([1, 4]);
+    });
+  });
+
+  it("form + receipts in separate batches: the form is kept and matched from text", async () => {
+    let calls = 0;
+    await withFetch(async (_url, init) => {
+      calls += 1;
+      const text = JSON.parse(init.body).messages[0].content.map((c) => c.text || "").join(" ");
+      if (text.includes("FORM ROWS:")) return reply({ matches: [{ row: 2, receipt_index: 0, confidence: 0.9 }] });
+      if (text.includes("FILE 0:") && calls === 1) {
+        return reply({ form: { file: 0, expense_id: "X", line_items: [{ row: 1, gross: 5 }, { row: 2, gross: 20 }] }, receipts: [] });
+      }
+      return reply({ form: null, receipts: [{ file: 0, vendor: "Shell", gross: 20 }] });
+    }, async () => {
+      const out = await readAttachments(env, [att(), att(), att(), att()]);
+      expect(out.form.expense_id).toBe("X");
+      expect(out.form.file).toBe(0);
+      expect(out.receipts).toHaveLength(1);
+      expect(out.receipts[0].file).toBe(3); // local file 0 of the second batch
+      expect(out.matches).toEqual([{ row: 2, receipt_index: 0, confidence: 0.9 }]);
+    });
+  });
+});
+
+describe("readAttachments progress", () => {
+  it("reports each finished batch to the progress callback", async () => {
+    const real = globalThis.fetch;
+    globalThis.fetch = async () => ({ ok: true, json: async () => ({ content: [{ type: "text", text: JSON.stringify({ form: null, receipts: [] }) }] }) });
+    try {
+      const seen = [];
+      const att = { contentType: "application/pdf", base64: "QQ==" };
+      await readAttachments({ ANTHROPIC_API_KEY: "sk-ant-x" }, [att, att, att, att, att, att, att], (p) => seen.push(`${p.done}/${p.total}`));
+      expect(seen[seen.length - 1]).toBe("3/3"); // 7 files -> 3 batches
+      expect(seen.filter((x) => x === "1/3")).toHaveLength(1);
+    } finally { globalThis.fetch = real; }
+  });
+  it("retries a busy (529) answer instead of failing", async () => {
+    const real = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls += 1;
+      if (calls === 1) return { ok: false, status: 529, headers: { get: () => "0" }, text: async () => "overloaded" };
+      return { ok: true, status: 200, headers: { get: () => null }, json: async () => ({ content: [{ type: "text", text: JSON.stringify({ form: null, receipts: [] }) }] }) };
+    };
+    try {
+      const out = await readAttachments({ ANTHROPIC_API_KEY: "sk-ant-x" }, [{ contentType: "application/pdf", base64: "QQ==" }]);
+      expect(calls).toBe(2);
+      expect(out.receipts).toEqual([]);
+    } finally { globalThis.fetch = real; }
   });
 });

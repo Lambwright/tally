@@ -1,8 +1,9 @@
-import { Suspense, lazy, useCallback, useEffect, useMemo, useState } from "react";
+import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, fetchReceiptObjectUrl } from "../api.js";
 import RevisionModal from "./RevisionModal.jsx";
 import EditableText from "./EditableText.jsx";
 import DirectCostPreview from "./DirectCostPreview.jsx";
+import ParseProgress, { STALL_MS } from "./ParseProgress.jsx";
 
 // pdf-lib is bulky and only needed once someone opens an attachment.
 const Lightbox = lazy(() => import("./Lightbox.jsx"));
@@ -90,8 +91,9 @@ export default function SubmissionDetail({ id, onClose, onChanged, me }) {
   const [selectedLineIds, setSelectedLineIds] = useState(new Set());
   const [bulkCostCodeText, setBulkCostCodeText] = useState("");
 
-  const load = useCallback(() => {
-    setLoading(true);
+  // quiet = true: a background refresh (polling while it parses) — no loading spinner, no flicker.
+  const load = useCallback((quiet) => {
+    if (quiet !== true) setLoading(true);
     setError(null);
     api.getSubmission(id)
       .then(setData)
@@ -102,6 +104,39 @@ export default function SubmissionDetail({ id, onClose, onChanged, me }) {
   useEffect(() => { load(); }, [load]);
 
   const sub = data?.submission;
+  const parsingFlag = sub?.flags?.find((f) => f.code === "parsing") || null;
+  const parseKicked = useRef(false);
+  const [parseNow, setParseNow] = useState(Date.now());
+  const [parseRestarting, setParseRestarting] = useState(false);
+
+  // A submission that is still "parsing" and not being worked on (an app upload just
+  // finished, or a parse that went quiet) is started from here: the request runs the whole
+  // parse with no background time cap and the worker reports progress into the flag.
+  const startParse = useCallback(() => {
+    setParseRestarting(true);
+    setActionError(null);
+    return api.parsePending(id)
+      .then(() => { onChanged?.(); load(true); })
+      .catch((e) => setActionError(e.data?.detail || e.message))
+      .finally(() => setParseRestarting(false));
+  }, [id, load, onChanged]);
+
+  useEffect(() => {
+    if (!parsingFlag || parseKicked.current) return;
+    const quiet = !parsingFlag.running || Date.now() - Date.parse(parsingFlag.updated_at || "") > STALL_MS;
+    if (!quiet) return; // someone (another tab, the email background task) is already on it
+    parseKicked.current = true;
+    startParse();
+  }, [parsingFlag, startParse]);
+
+  // while parsing: refresh the progress every 2.5 s and tick the clock every second
+  const isParsing = !!parsingFlag;
+  useEffect(() => {
+    if (!isParsing) return;
+    const poll = setInterval(() => load(true), 2500);
+    const tick = setInterval(() => setParseNow(Date.now()), 1000);
+    return () => { clearInterval(poll); clearInterval(tick); };
+  }, [isParsing, load]);
   const lines = data?.line_items || [];
   const receipts = data?.receipts || [];
   const actionable = sub && sub.status !== "approved" && sub.status !== "rejected";
@@ -182,7 +217,7 @@ export default function SubmissionDetail({ id, onClose, onChanged, me }) {
           url: res.url,
           type: res.type,
           name: r.r2_key.split("/").pop(),
-          label: r.kind === "form" ? "Expense form" : `${r.vendor || "Receipt"}${forLines.length ? ` → line ${forLines.map((l) => l.row_index).join(", ")}` : ""}`,
+          label: r.kind === "form" ? "Expense form" : `${r.vendor || "Receipt"}${r.note ? ` (${r.note})` : ""}${forLines.length ? ` → line ${forLines.map((l) => l.row_index).join(", ")}` : ""}`,
           receiptId: r.id,
         };
       })
@@ -403,10 +438,8 @@ This is recorded under your name, and the net is estimated from the claimed amou
         </div>
       )}
 
-      {sub.flags?.some((f) => f.code === "parsing") && (
-        <div className="card" style={{ color: "var(--yellow)" }}>
-          Still reading the form and receipts in the background — <button className="btn btn-ghost btn-sm" onClick={load}>refresh</button> in a minute to see the lines.
-        </div>
+      {parsingFlag && (
+        <ParseProgress flag={parsingFlag} now={parseNow} restarting={parseRestarting} onRestart={() => { parseKicked.current = true; startParse(); }} />
       )}
 
       {sub.flags?.some((f) => PARSE_FAILURE_FLAGS.has(f.code) && !(sub.origin === "pm_direct" && f.code === "form_parse_failed")) && (
@@ -640,7 +673,7 @@ This is recorded under your name, and the net is estimated from the claimed amou
               <div className="receipt-thumb-wrap" key={r.id}>
                 {receiptUrls[r.r2_key]?.url ? (
                   <button type="button" className={`receipt-thumb ${forLines.length ? "is-matched" : "is-unmatched"}`}
-                    onClick={() => openLightbox(r.id)} title={r.vendor ? `${r.vendor} — ${filename}` : filename}>
+                    onClick={() => openLightbox(r.id)} title={r.vendor ? `${r.vendor}${r.note ? ` (${r.note})` : ""} — ${filename}` : filename}>
                     <img src={receiptUrls[r.r2_key].url} alt="" />
                     {label}
                   </button>
