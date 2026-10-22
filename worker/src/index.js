@@ -60,6 +60,7 @@
 //  - Procore receives the NET (pre-tax) amount. Tax is applied downstream in NetSuite.
 
 import { neon } from "@neondatabase/serverless";
+import { buildExpenseFormPdf, expenseIdFor, torontoDate, GENERATED_FORM_NOTE } from "./expenseForm.js";
 import {
   CATEGORY_TO_WBS_CODE,
   DIRECTCOST_VERIFIED,
@@ -1397,7 +1398,7 @@ async function parseSubmission(env, sql, submissionId, { files }) {
     const formKey = claude.form && Number.isInteger(Number(claude.form.file)) ? files[Number(claude.form.file)]?.key : null;
     for (const [key, row] of rowByKey) {
       const kind = key === formKey ? "form" : "receipt";
-      await sql`update receipts set kind = ${kind}, vendor = null, receipt_date = null, subtotal = null, tax_json = null, gross = null, confidence = null, note = null, page_start = null, page_end = null where id = ${row.id}`;
+      await sql`update receipts set kind = ${kind}, vendor = null, receipt_date = null, subtotal = null, tax_json = null, gross = null, confidence = null, note = case when note = ${GENERATED_FORM_NOTE} then note else null end, page_start = null, page_end = null where id = ${row.id}`;
       row.kind = kind;
       row.used = false;
     }
@@ -1973,6 +1974,56 @@ function isSuperAdminUser(u) {
 
 const holdsApprovePortal = (u) => Array.isArray(u?.extras) && u.extras.includes(APPROVE_PORTAL_EXTRA);
 
+// A portal expense starts with a placeholder Expense ID ("pending-<uuid>", which is far too long to be a
+// Procore invoice number). Submitting gives it a real one in the Procore form's format; a second form for
+// the same person, project and day gets -2, -3... Email expenses already carry the form's own ID.
+async function assignExpenseId(sql, sub) {
+  if (sub.origin === "email" || !/^pending-/.test(String(sub.expense_id || ""))) return sub.expense_id;
+  const base = expenseIdFor({ date: torontoDate(), projectNumber: sub.project_number, employeeName: sub.employee_name });
+  for (let n = 1; n < 50; n++) {
+    const candidate = n === 1 ? base : `${base}-${n}`;
+    const [clash] = await sql`select 1 as x from submissions where expense_id = ${candidate} and id <> ${sub.id} limit 1`;
+    if (!clash) {
+      await sql`update submissions set expense_id = ${candidate}, updated_at = now() where id = ${sub.id}`;
+      return candidate;
+    }
+  }
+  return sub.expense_id;
+}
+
+// (Re)draw TALLY's Employee Expense Form for this expense and store it as THE form. A form somebody attached
+// themselves (a real one from Procore) is left alone. Called at Submit, and again at Approve with the
+// approver's name and the date filled in under Authorized By / Date Authorized.
+async function writeExpenseForm(env, sql, sub, lines, { authorizedBy = null, authorizedDate = null } = {}) {
+  const forms = await sql`select * from receipts where submission_id = ${sub.id} and kind = 'form'`;
+  if (forms.some((f) => f.note !== GENERATED_FORM_NOTE)) return { kept: true };
+  const bytes = await buildExpenseFormPdf({ sub, lines, authorizedBy, authorizedDate });
+  const key = `${crypto.randomUUID()}/Employee Expense Form - ${sub.expense_id}.pdf`;
+  await env.RECEIPTS.put(key, bytes, { httpMetadata: { contentType: "application/pdf" } });
+  for (const f of forms) {
+    await env.RECEIPTS.delete(f.r2_key).catch(() => {});
+    await sql`delete from receipts where id = ${f.id}`;
+  }
+  await sql`insert into receipts (submission_id, r2_key, kind, note) values (${sub.id}, ${key}, 'form', ${GENERATED_FORM_NOTE})`;
+  return { generated: true, key };
+}
+
+// Receipts on this expense that are already on another (not rejected) expense for the same employee: the
+// same vendor, receipt date and total. Submitting the same receipts twice is how a person gets paid twice.
+async function findDuplicateReceipts(sql, sub) {
+  return sql`
+    select s.expense_id, r.vendor, r.receipt_date, r.gross
+    from receipts r join submissions s on s.id = r.submission_id
+    where s.id <> ${sub.id} and s.status <> 'rejected'
+      and lower(coalesce(s.employee_name, '')) = lower(coalesce(${sub.employee_name}, ''))
+      and r.kind = 'receipt' and r.vendor is not null and r.gross is not null
+      and exists (
+        select 1 from receipts m
+        where m.submission_id = ${sub.id} and m.kind = 'receipt'
+          and lower(m.vendor) = lower(r.vendor) and m.receipt_date is not distinct from r.receipt_date and m.gross = r.gross)
+    limit 10`;
+}
+
 // Who can approve a portal expense (Ben, 2026-10-21):
 //  - anyone holding the "approve portal expenses" permission (Leela today), except the person submitting
 //    and the employee the expense is for: nobody approves their own;
@@ -2070,6 +2121,30 @@ async function handleSubmitForReview(subId, request, env, sql, user, isReviewer)
   });
   if (incomplete.length) {
     return json({ error: "lines_incomplete", detail: `${incomplete.length} line(s) still need a receipt and/or a net amount.`, lines: incomplete.map((l) => ({ row: l.row_index, description: l.description })) }, 422);
+  }
+
+  // Not the same receipts twice (unless the person confirms they really are separate).
+  if (body.allow_duplicates !== true) {
+    const dupes = await findDuplicateReceipts(sql, sub);
+    if (dupes.length) {
+      return json({
+        error: "duplicate_receipts",
+        detail: "These receipts look like ones already submitted: " +
+          dupes.map((d) => `${d.vendor} ${money(d.gross) !== null ? "$" + Number(d.gross).toFixed(2) : ""} (${isoDate(d.receipt_date) || "no date"}) is on ${d.expense_id}`).join("; ") + ".",
+        matches: dupes,
+      }, 409);
+    }
+  }
+
+  // Every expense carries the Employee Expense Form: TALLY draws it from the lines and gives the expense its
+  // real Expense ID (the Procore invoice number). Without the form it isn't submitted.
+  if (sub.origin !== "email") {
+    try {
+      const expenseId = await assignExpenseId(sql, sub);
+      await writeExpenseForm(env, sql, { ...sub, expense_id: expenseId }, lines);
+    } catch (e) {
+      return json({ error: "form_failed", detail: `Couldn't build the Employee Expense Form: ${e.message}` }, 500);
+    }
   }
 
   const verb = sub.status === "needs_review" ? "reassigned to" : sub.status === "needs_revision" ? "resubmitted to" : "submitted to";
@@ -2246,6 +2321,12 @@ async function handleApprove(subId, url, request, env, sql, user, isPmApprover) 
   // just a description. Best-effort: a failure here doesn't undo the (already
   // correctly created) financial record — it's flagged instead so it can be
   // attached by hand if needed.
+  // The form TALLY drew gets the approver's name and today's date before it goes to Procore.
+  try {
+    await writeExpenseForm(env, sql, sub, lines, { authorizedBy: user.displayName || user.username, authorizedDate: torontoDate() });
+  } catch (e) {
+    console.error("couldn't redraw the authorized form:", e && e.message);
+  }
   const receiptRows = await sql`select * from receipts where submission_id = ${subId} order by (kind = 'form') desc, created_at asc`;
   const attachResults = await attachSubmissionFiles(env, token, sub.project_procore_id, dcId, receiptRows);
   const attachFailures = attachResults.filter((a) => !a.ok);
@@ -2682,6 +2763,9 @@ export const _test = {
   readAttachments,
   pageRange,
   pickApprovers,
+  expenseIdFor,
+  buildExpenseFormPdf,
+  torontoDate,
   positiveInt,
   resolveEmployeeId,
   missingLineItems,

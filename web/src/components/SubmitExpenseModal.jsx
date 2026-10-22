@@ -15,6 +15,8 @@ export default function SubmitExpenseModal({ id, sub, costCodes, resubmit = fals
   const [approver, setApprover] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
+  const [duplicates, setDuplicates] = useState(false); // the server found receipts already submitted
+  const [confirmDupes, setConfirmDupes] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -36,9 +38,10 @@ export default function SubmitExpenseModal({ id, sub, costCodes, resubmit = fals
     setBusy(true);
     setError(null);
     try {
-      await api.submitExpense(id, approver);
+      await api.submitExpense(id, approver, { allowDuplicates: confirmDupes });
       onSubmitted();
     } catch (e) {
+      setDuplicates(e.data?.error === "duplicate_receipts");
       setError(e.data?.detail || e.message);
       setBusy(false);
     }
@@ -80,6 +83,12 @@ export default function SubmitExpenseModal({ id, sub, costCodes, resubmit = fals
         )}
 
         {error && <div className="login-error" style={{ marginTop: 10 }}>{error}</div>}
+        {duplicates && (
+          <label className="row-secondary" style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 8, cursor: "pointer" }}>
+            <input type="checkbox" checked={confirmDupes} onChange={(e) => setConfirmDupes(e.target.checked)} />
+            These are separate purchases, not the same receipts again. Submit anyway.
+          </label>
+        )}
 
         <div className="modal-actions">
           <button type="button" className="btn btn-ghost" onClick={onClose} disabled={busy}>Cancel</button>

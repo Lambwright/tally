@@ -98,7 +98,7 @@ export default function UploadSubmission({ onClose, onCreated }) {
       <div className="modal" onClick={(e) => e.stopPropagation()}>
         <div className="card-title" style={{ marginBottom: 4 }}>New expense submission</div>
         <p className="row-secondary" style={{ marginBottom: 12 }}>
-          Drop in whatever you have — the expense form, receipts, a photo of several receipts, a PDF of invoices. Claude works out what each file is.
+          Drop in whatever you have — the expense form, receipts, a photo of several receipts, a PDF of invoices. Claude works out what each file is, and TALLY fills in the Employee Expense Form for you when you submit.
         </p>
 
         <div

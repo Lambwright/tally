@@ -5,6 +5,8 @@ const {
   extractExpenseId,
   readAttachments,
   pageRange,
+  expenseIdFor,
+  buildExpenseFormPdf,
   isPickableProject,
   pickApprovers,
   canApprovePortalExpense,
@@ -699,5 +701,31 @@ describe("isoDate and the Direct Cost line description", () => {
     expect(isoDate(new Date("2026-09-25T00:00:00Z"))).toBe("2026-09-25");
     expect(isoDate(null)).toBe("");
     expect(isoDate(new Date("nope"))).toBe("");
+  });
+});
+
+describe("expenseIdFor (the Procore form's Expense ID)", () => {
+  it("matches the IDs the Procore form makes", () => {
+    expect(expenseIdFor({ date: "2026-07-31", projectNumber: "0000_0000_5", employeeName: "Dustin MacDougall" })).toBe("310726-000005-DUMA");
+    expect(expenseIdFor({ date: "2026-09-21", projectNumber: "2026_0183", employeeName: "Michael Sefeldas" })).toBe("210926-260183-MISE");
+    expect(expenseIdFor({ date: "2026-10-09", projectNumber: "0000_0000", employeeName: "Scott Carter-Nichols" })).toBe("091026-000000-SCCA");
+  });
+  it("copes with a middle name, a one-word name and a missing project", () => {
+    expect(expenseIdFor({ date: "2026-01-02", projectNumber: "2025_0695", employeeName: "Mary Anne Smith" })).toBe("020126-250695-MASM");
+    expect(expenseIdFor({ date: "2026-01-02", projectNumber: "2025_0695", employeeName: "Cher" })).toBe("020126-250695-CHXX");
+    expect(expenseIdFor({ date: "2026-01-02", projectNumber: null, employeeName: "Ben Wright" })).toBe("020126-000000-BEWR");
+  });
+});
+
+describe("buildExpenseFormPdf", () => {
+  it("draws a PDF with the lines, and paginates a long one", async () => {
+    const sub = { employee_name: "Ben Wright", project_number: "2026_0183", province: "ON", expense_id: "211026-260183-BEWR" };
+    const mk = (i) => ({ category: ["parking", "materials", "fuel", "mileage", "per_diem", "other"][i % 6], line_date: "2026-10-0" + ((i % 9) + 1), description: "Line " + i + " a description long enough to wrap onto a second line of the form", gross_amount: 10 + i, net_amount: 9 + i });
+    const small = await buildExpenseFormPdf({ sub, lines: [mk(1), mk(2)] });
+    expect(String.fromCharCode(...small.slice(0, 5))).toBe("%PDF-");
+    const big = await buildExpenseFormPdf({ sub, lines: Array.from({ length: 40 }, (_, i) => mk(i)), authorizedBy: "Leela Singh", authorizedDate: "2026-10-22" });
+    const { PDFDocument } = await import("pdf-lib");
+    expect((await PDFDocument.load(small)).getPageCount()).toBe(1);
+    expect((await PDFDocument.load(big)).getPageCount()).toBeGreaterThan(1);
   });
 });
