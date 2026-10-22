@@ -98,7 +98,12 @@ export async function listProjectWbsCodes(env, token, procoreFetch, projectId) {
 // wbs_code_id. `explicitChoice` is what the reviewer picked in the app — either a
 // flat-code string or a raw wbs_code_id; both are accepted.
 export async function resolveWbsCodeId(env, token, procoreFetch, projectId, category, explicitChoice) {
-  const codes = await listProjectWbsCodes(env, token, procoreFetch, projectId);
+  return resolveWbsFromCodes(await listProjectWbsCodes(env, token, procoreFetch, projectId), projectId, category, explicitChoice);
+}
+
+// The same lookup against a code list you already fetched, so approving a 16-line expense reads the
+// project's cost codes once instead of sixteen times (that burst is what tripped Procore's rate limit).
+export function resolveWbsFromCodes(codes, projectId, category, explicitChoice) {
 
   // Reviewer picked a raw id straight from the dropdown — trust it if it's real.
   if (explicitChoice && codes.some((c) => c.id === String(explicitChoice))) {

@@ -65,6 +65,7 @@ import {
   DIRECTCOST_VERIFIED,
   dedupToken,
   missingLineItems,
+  resolveWbsFromCodes,
   buildDirectCostHeader,
   buildDirectCostLineItem,
   listProjectWbsCodes,
@@ -566,18 +567,36 @@ async function getProcoreToken(env) {
   return (await res.json()).access_token;
 }
 
+// Procore allows a short burst (25 requests, a few seconds to a minute) and 600 an hour per app
+// (PROCORE-RATE-LIMITS.md). A 429 whose reset is only seconds away is the short window: wait it out and
+// retry (a refused request can't have done anything, so retrying even a POST is safe). If the reset is
+// further off it is the hourly limit: fail fast with a clear message rather than make a person wait.
+const RATE_WAIT_MAX_MS = 25000;
 async function procoreFetch(env, token, path, { method = "GET", body } = {}) {
-  const res = await fetch(`${env.PROCORE_API_BASE}${path}`, {
-    method,
-    headers: {
-      Accept: "application/json",
-      Authorization: `Bearer ${token}`,
-      "Procore-Company-Id": env.PROCORE_COMPANY_ID,
-      "Content-Type": "application/json",
-    },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  const text = await res.text();
+  let res, text;
+  for (let attempt = 0; ; attempt++) {
+    res = await fetch(`${env.PROCORE_API_BASE}${path}`, {
+      method,
+      headers: {
+        Accept: "application/json",
+        Authorization: `Bearer ${token}`,
+        "Procore-Company-Id": env.PROCORE_COMPANY_ID,
+        "Content-Type": "application/json",
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    text = await res.text();
+    if (res.status !== 429) break;
+    const resetAt = Number(res.headers?.get?.("x-rate-limit-reset"));
+    const waitMs = Number.isFinite(resetAt) && resetAt > 0 ? Math.max(1500, resetAt * 1000 - Date.now() + 500) : 5000;
+    if (attempt >= 3 || waitMs > RATE_WAIT_MAX_MS) {
+      const err = new Error(`Procore is rate-limiting TALLY right now (${method} ${path}). ${waitMs > RATE_WAIT_MAX_MS ? `It resets in about ${Math.ceil(waitMs / 60000)} min.` : "Try again in a minute."}`);
+      err.status = 429;
+      err.body = { rateLimited: true };
+      throw err;
+    }
+    await new Promise((r) => setTimeout(r, waitMs));
+  }
   const parsed = text ? JSON.parse(text) : { success: res.ok, status: res.status };
   if (!res.ok) {
     const err = new Error(`Procore ${method} ${path} -> ${res.status}: ${text.slice(0, 300)}`);
@@ -2099,9 +2118,15 @@ async function handleApprove(subId, url, request, env, sql, user, isPmApprover) 
       : `No province on the form or its project, and ${linesMissingTax.length} line(s) have no manual tax code override.`;
 
   const resolved = [];
+  let projectCodes;
+  try {
+    projectCodes = await listProjectWbsCodes(env, token, procoreFetch, sub.project_procore_id); // once, not per line
+  } catch (e) {
+    return json({ error: "cost_code_unresolved", detail: `Couldn't read the project's cost codes: ${e.message}` }, 502);
+  }
   for (const l of lines) {
     try {
-      const wbs = await resolveWbsCodeId(env, token, procoreFetch, sub.project_procore_id, l.category, l.cost_code || null);
+      const wbs = resolveWbsFromCodes(projectCodes, sub.project_procore_id, l.category, l.cost_code || null);
       resolved.push({ line: l, wbs });
     } catch (e) {
       return json({ error: "cost_code_unresolved", detail: `Line ${l.row_index} (${l.category}): ${e.message}` }, 422);
@@ -2605,6 +2630,8 @@ export default {
 
 // Exported for unit tests.
 export const _test = {
+  procoreFetch,
+  resolveWbsFromCodes,
   readAttachments,
   pageRange,
   pickApprovers,

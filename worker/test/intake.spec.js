@@ -11,6 +11,8 @@ const {
   positiveInt,
   resolveEmployeeId,
   missingLineItems,
+  procoreFetch,
+  resolveWbsFromCodes,
   normalizeCategory,
   salvageByFieldBoundaries,
   matchLinesToReceipts,
@@ -650,5 +652,41 @@ describe("missingLineItems (resuming a half-posted Direct Cost)", () => {
   it("a line with a different amount is not a match", () => {
     const b = [built("a [EXP:1]", "10.00")];
     expect(missingLineItems([{ description: "a [EXP:1]", unit_cost: "9.00" }], b)).toEqual(b);
+  });
+});
+
+describe("procoreFetch rate limiting", () => {
+  const env = { PROCORE_API_BASE: "https://p.test", PROCORE_COMPANY_ID: "1" };
+  const res429 = (resetInSec) => ({ ok: false, status: 429, headers: { get: (h) => (h === "x-rate-limit-reset" ? String(Math.floor(Date.now() / 1000) + resetInSec) : null) }, text: async () => "{\"message\":\"limit\"}" });
+  const ok = { ok: true, status: 200, headers: { get: () => null }, text: async () => "{\"id\":5}" };
+
+  it("waits out a short window and retries", async () => {
+    const real = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = async () => { calls += 1; return calls === 1 ? res429(1) : ok; };
+    try {
+      const r = await procoreFetch(env, "tok", "/x", { method: "POST", body: { a: 1 } });
+      expect(r).toEqual({ id: 5 });
+      expect(calls).toBe(2);
+    } finally { globalThis.fetch = real; }
+  });
+  it("fails fast with a clear message when the reset is far away (the hourly limit)", async () => {
+    const real = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = async () => { calls += 1; return res429(1800); };
+    try {
+      await expect(procoreFetch(env, "tok", "/x")).rejects.toMatchObject({ status: 429, body: { rateLimited: true } });
+      expect(calls).toBe(1);
+    } finally { globalThis.fetch = real; }
+  });
+});
+
+describe("resolveWbsFromCodes", () => {
+  const codes = [{ id: "11", code: "59-01.O", description: "Other" }, { id: "12", code: "55.MC", description: "Materials" }];
+  it("honours an explicit id from the list", () => {
+    expect(resolveWbsFromCodes(codes, "p1", "other", "12")).toBe("12");
+  });
+  it("says so when the project has no matching budget line", () => {
+    expect(() => resolveWbsFromCodes([], "p1", "other", "99-99.X")).toThrow(/no budget line/);
   });
 });
