@@ -65,6 +65,7 @@ import {
   DIRECTCOST_VERIFIED,
   dedupToken,
   missingLineItems,
+  isoDate,
   resolveWbsFromCodes,
   buildDirectCostHeader,
   buildDirectCostLineItem,
@@ -567,6 +568,38 @@ async function getProcoreToken(env) {
   return (await res.json()).access_token;
 }
 
+// How long to wait out a 429, from Procore's x-rate-limit-reset (epoch seconds); 5 s when it isn't sent.
+function rateLimitWaitMs(res) {
+  const resetAt = Number(res.headers?.get?.("x-rate-limit-reset"));
+  return Number.isFinite(resetAt) && resetAt > 0 ? Math.max(1500, resetAt * 1000 - Date.now() + 500) : 5000;
+}
+
+// fetch() for the Uploads API and the attachment PATCH (they don't go through procoreFetch): waits out a
+// short-window 429 and retries, otherwise hands back whatever Procore answered.
+async function fetchWith429Retry(url, init) {
+  let res;
+  for (let attempt = 0; ; attempt++) {
+    res = await fetch(url, init);
+    if (res.status !== 429 || attempt >= 3) return res;
+    const wait = rateLimitWaitMs(res);
+    if (wait > RATE_WAIT_MAX_MS) return res;
+    await new Promise((r) => setTimeout(r, wait));
+  }
+}
+
+// Every line item on one Direct Cost. The Direct Cost's own GET does NOT include its lines (only a
+// line_items_count); they come from this nested list.
+async function listDirectCostLines(env, token, projectId, dcId) {
+  const all = [];
+  for (let page = 1; page <= 10; page++) {
+    const rows = await procoreFetch(env, token, `/rest/v1.0/projects/${projectId}/direct_costs/${dcId}/line_items?per_page=100&page=${page}`);
+    if (!Array.isArray(rows) || !rows.length) break;
+    all.push(...rows);
+    if (rows.length < 100) break;
+  }
+  return all;
+}
+
 // Procore allows a short burst (25 requests, a few seconds to a minute) and 600 an hour per app
 // (PROCORE-RATE-LIMITS.md). A 429 whose reset is only seconds away is the short window: wait it out and
 // retry (a refused request can't have done anything, so retrying even a POST is safe). If the reset is
@@ -587,8 +620,7 @@ async function procoreFetch(env, token, path, { method = "GET", body } = {}) {
     });
     text = await res.text();
     if (res.status !== 429) break;
-    const resetAt = Number(res.headers?.get?.("x-rate-limit-reset"));
-    const waitMs = Number.isFinite(resetAt) && resetAt > 0 ? Math.max(1500, resetAt * 1000 - Date.now() + 500) : 5000;
+    const waitMs = rateLimitWaitMs(res);
     if (attempt >= 3 || waitMs > RATE_WAIT_MAX_MS) {
       const err = new Error(`Procore is rate-limiting TALLY right now (${method} ${path}). ${waitMs > RATE_WAIT_MAX_MS ? `It resets in about ${Math.ceil(waitMs / 60000)} min.` : "Try again in a minute."}`);
       err.status = 429;
@@ -617,7 +649,7 @@ async function procoreFetch(env, token, path, { method = "GET", body } = {}) {
 // example for this is a different resource (meeting_topics, `item.upload_ids`),
 // so if THIS step throws, that's the one to probe/report back on.
 async function procoreCreateAndUploadFile(env, token, projectId, { bytes, contentType, filename }) {
-  const createRes = await fetch(`${env.PROCORE_API_BASE}/rest/v1.1/projects/${projectId}/uploads`, {
+  const createRes = await fetchWith429Retry(`${env.PROCORE_API_BASE}/rest/v1.1/projects/${projectId}/uploads`, {
     method: "POST",
     headers: {
       Accept: "application/json",
@@ -656,7 +688,7 @@ async function procoreCreateAndUploadFile(env, token, projectId, { bytes, conten
 // so a second file's association doesn't blow away the first (upload_ids reads
 // as a set-the-list field on PATCH, not an append).
 async function procoreAttachUploadsToDirectCost(env, token, projectId, directCostId, uploadIds) {
-  const res = await fetch(`${env.PROCORE_API_BASE}/rest/v1.0/projects/${projectId}/direct_costs/${directCostId}`, {
+  const res = await fetchWith429Retry(`${env.PROCORE_API_BASE}/rest/v1.0/projects/${projectId}/direct_costs/${directCostId}`, {
     method: "PATCH",
     headers: {
       Accept: "application/json",
@@ -701,7 +733,15 @@ async function attachSubmissionFiles(env, token, projectId, directCostId, receip
   if (uploaded.length) {
     try {
       await procoreAttachUploadsToDirectCost(env, token, projectId, directCostId, uploaded.map((u) => u.uuid));
-      uploaded.forEach((u) => attachResults.push({ key: u.key, ok: true }));
+      // Procore can answer 200 and still not link the files, so look: the Direct Cost must now show them.
+      await new Promise((r) => setTimeout(r, 1500));
+      const dc = await procoreFetch(env, token, `/rest/v1.0/projects/${projectId}/direct_costs/${directCostId}`).catch(() => null);
+      const shown = Number(dc?.attachments_count ?? (Array.isArray(dc?.attachments) ? dc.attachments.length : NaN));
+      if (Number.isFinite(shown) && shown < uploaded.length) {
+        uploaded.forEach((u) => attachResults.push({ key: u.key, ok: false, error: `Procore accepted the upload but the Direct Cost shows ${shown} attachment(s), expected ${uploaded.length}` }));
+      } else {
+        uploaded.forEach((u) => attachResults.push({ key: u.key, ok: true }));
+      }
     } catch (e) {
       uploaded.forEach((u) => attachResults.push({ key: u.key, ok: false, error: `Uploaded but not attached — ${e.message}` }));
     }
@@ -806,8 +846,8 @@ async function findOwnDirectCost(env, token, sub, headerItem) {
       String(r.vendor?.id || r.vendor_id || "") === String(headerItem.vendor_id) &&
       String(r.direct_cost_date || "").slice(0, 10) === String(headerItem.direct_cost_date).slice(0, 10));
     if (hit) {
-      const full = await procoreFetch(env, token, `/rest/v1.0/projects/${sub.project_procore_id}/direct_costs/${hit.id}`).catch(() => null);
-      const lines = Array.isArray(full?.line_items) ? full.line_items : [];
+      const lines = await listDirectCostLines(env, token, sub.project_procore_id, hit.id).catch(() => null);
+      if (!lines) return null; // can't tell what is on it: don't adopt
       const ours = lines.every((l) => String(l.description || "").includes(dedupToken(sub)));
       return ours ? { id: hit.id, line_items: lines } : null;
     }
@@ -2135,7 +2175,7 @@ async function handleApprove(subId, url, request, env, sql, user, isPmApprover) 
 
   // Date Authorized (from the form) if we have one; otherwise the earliest
   // expense date on the form; today only as a last resort.
-  const headerDate = sub.date_authorized || lines.map((l) => l.line_date).filter(Boolean).sort()[0] || new Date().toISOString().slice(0, 10);
+  const headerDate = isoDate(sub.date_authorized) || lines.map((l) => isoDate(l.line_date)).filter(Boolean).sort()[0] || new Date().toISOString().slice(0, 10);
   let header;
   try {
     header = buildDirectCostHeader({ ...sub, header_date: headerDate }, { employeeId, env });
@@ -2182,8 +2222,14 @@ async function handleApprove(subId, url, request, env, sql, user, isPmApprover) 
     await sql`update submissions set procore_direct_cost_id = ${dcId}, updated_at = now() where id = ${subId}`;
   }
 
-  const current = await procoreFetch(env, token, `/rest/v1.0/projects/${sub.project_procore_id}/direct_costs/${dcId}`).catch(() => null);
-  const toPost = missingLineItems(current?.line_items, lineItems);
+  let haveLines;
+  try {
+    haveLines = await listDirectCostLines(env, token, sub.project_procore_id, dcId);
+  } catch (e) {
+    // Without knowing what is already on it, posting could duplicate lines. Stop instead.
+    return json({ error: "line_post_failed", direct_cost_id: dcId, detail: `Couldn't read the lines already on Direct Cost ${dcId}: ${e.message}. Press Approve again in a minute.` }, 502);
+  }
+  const toPost = missingLineItems(haveLines, lineItems);
   const posted = [];
   for (const li of toPost) {
     try {
@@ -2630,6 +2676,7 @@ export default {
 
 // Exported for unit tests.
 export const _test = {
+  isoDate,
   procoreFetch,
   resolveWbsFromCodes,
   readAttachments,

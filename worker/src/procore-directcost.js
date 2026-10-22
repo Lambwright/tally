@@ -148,7 +148,7 @@ export function buildDirectCostHeader(submission, { employeeId = null, env } = {
     );
   }
   const date =
-    submission.header_date || submission.receipt_date || new Date().toISOString().slice(0, 10);
+    isoDate(submission.header_date) || isoDate(submission.receipt_date) || new Date().toISOString().slice(0, 10);
   const item = {
     direct_cost_type: DIRECT_COST_TYPE,
     status: "approved",
@@ -174,6 +174,14 @@ export function buildDirectCostHeader(submission, { employeeId = null, env } = {
 // from a live line item; the id->province mapping lives in
 // PROCORE_TAX_CODE_IDS (index.js resolves it before calling this). Omitted
 // entirely when the submission's province has no configured mapping.
+// A date as YYYY-MM-DD whether the database driver handed back a string or a Date (a Date used to be
+// pasted into line descriptions as "Fri Sep 25 2026 00:00:00 GMT+0000 (Coordinated Universal Time)").
+export function isoDate(v) {
+  if (!v) return "";
+  if (v instanceof Date) return Number.isNaN(v.getTime()) ? "" : v.toISOString().slice(0, 10);
+  return String(v).slice(0, 10);
+}
+
 export function buildDirectCostLineItem(line, wbsCodeId, expenseId, taxCodeId = null) {
   const net = Number(line.net_amount);
   if (!Number.isFinite(net) || net <= 0) {
@@ -182,7 +190,7 @@ export function buildDirectCostLineItem(line, wbsCodeId, expenseId, taxCodeId = 
   // No separate date field on a Direct Cost line item (confirmed off a live
   // one) — the expense's own date goes into the description text instead.
   const label = (line.description || line.category || "expense").toString().slice(0, 120);
-  const dateTag = line.line_date ? `${line.line_date} — ` : "";
+  const dateTag = isoDate(line.line_date) ? `${isoDate(line.line_date)} — ` : "";
   const item = {
     wbs_code_id: String(wbsCodeId),
     description: `${dateTag}${label} ${dedupToken({ expense_id: expenseId })}`,

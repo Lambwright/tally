@@ -11,6 +11,7 @@ const {
   positiveInt,
   resolveEmployeeId,
   missingLineItems,
+  isoDate,
   procoreFetch,
   resolveWbsFromCodes,
   normalizeCategory,
@@ -688,5 +689,15 @@ describe("resolveWbsFromCodes", () => {
   });
   it("says so when the project has no matching budget line", () => {
     expect(() => resolveWbsFromCodes([], "p1", "other", "99-99.X")).toThrow(/no budget line/);
+  });
+});
+
+describe("isoDate and the Direct Cost line description", () => {
+  it("formats strings and Dates as YYYY-MM-DD", () => {
+    expect(isoDate("2026-09-25")).toBe("2026-09-25");
+    expect(isoDate("2026-09-25T00:00:00.000Z")).toBe("2026-09-25");
+    expect(isoDate(new Date("2026-09-25T00:00:00Z"))).toBe("2026-09-25");
+    expect(isoDate(null)).toBe("");
+    expect(isoDate(new Date("nope"))).toBe("");
   });
 });
