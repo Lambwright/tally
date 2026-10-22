@@ -35,6 +35,10 @@
 		// but NOT in ALLOWED_USERS sees only their own submissions; being in both
 		// just keeps full reviewer access.
 		"PM_SUBMITTERS": "",
+		// Super admins, by Einbau ID username. TEMPORARY: auth-worker's /auth/app/users doesn't say who one is yet;
+		// once HELM adds jobRole/isSuperAdmin to those rows this goes away. They can approve portal expenses
+		// submitted by a person who holds the approve_portal_expenses permission, and never their own.
+		"SUPER_ADMIN_USERS": "ben",
 		"CURRENT_APP": "tally",
 		// The "MISC EMP Expenses" vendor's numeric Procore id -- expense Direct
 		// Costs post against this vendor, not Einbau itself. CONFIRMED (Ben,

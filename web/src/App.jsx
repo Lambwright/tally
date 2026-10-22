@@ -16,6 +16,7 @@ const CAMEO_USERS = ["josh@einbau.ca", "ben", "ben@einbau.ca"];
 const CAMEO_EVERY = 7;
 
 const STATUSES = [
+  { key: "draft", label: "My Drafts" },
   { key: "needs_review", label: "Needs Review" },
   { key: "needs_revision", label: "Needs Revision" },
   { key: "approved", label: "Approved" },
@@ -33,6 +34,7 @@ export default function App() {
   const [authState, setAuthState] = useState("checking"); // checking | out | in
   const [user, setUser] = useState(null);
   const [status, setStatus] = useState("needs_review");
+  const [showEveryones, setShowEveryones] = useState(false); // Needs Review: false = assigned to me or unassigned
   const [submissions, setSubmissions] = useState([]);
   const [loadingList, setLoadingList] = useState(false);
   const [listError, setListError] = useState(null);
@@ -84,14 +86,14 @@ export default function App() {
     setLoadingList(true);
     setListError(null);
     api
-      .listSubmissions(isSubmitterOnly ? null : status)
+      .listSubmissions(isSubmitterOnly ? null : status, { mine: status === "needs_review" && !showEveryones })
       .then((data) => setSubmissions(data.submissions || []))
       .catch((e) => {
         if (e.unauthorized) handleLogout();
         else setListError(e.message);
       })
       .finally(() => setLoadingList(false));
-  }, [status, authState, isSubmitterOnly]);
+  }, [status, authState, isSubmitterOnly, showEveryones]);
 
   useEffect(() => {
     loadList();
@@ -160,6 +162,12 @@ export default function App() {
                   {s.label}
                 </button>
               ))}
+              {me?.isReviewer && status === "needs_review" && (
+                <label className="row-secondary" style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+                  <input type="checkbox" checked={showEveryones} onChange={(e) => setShowEveryones(e.target.checked)} />
+                  Show everyone's
+                </label>
+              )}
               <button className="tab" onClick={loadList} disabled={loadingList} style={{ marginLeft: "auto" }} title="Refresh">
                 {loadingList ? "↻ …" : "↻ Refresh"}
               </button>

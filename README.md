@@ -228,3 +228,24 @@ session) — self-approval would need to match on `employee_name`/
   dev proxy keeps the browser same-origin so `auth-worker`'s CORS lock is a
   non-issue locally.
 - Full checklist in [`worker/README.md`](worker/README.md).
+
+## Submit Expense workflow (2026-10-21)
+
+An expense created in the web app starts as a **draft** (only its creator sees it: "My Drafts" for
+reviewers, "My expenses" for submitters). **Submit Expense** (or **Resubmit Expense** after a revision)
+shows the Procore payload preview, then asks who approves it; only then does it become `needs_review`
+in that person's queue (`submissions.approver`). Email intake is unchanged: it arrives as
+`needs_review` with no approver and any admin can take it. See `worker/migration_009.sql`.
+
+**Who can approve a portal expense** (HELM tool permission `approve_portal_expenses`, "Approve portal
+expenses", switched on per person in HELM; Leela only today):
+- holders of the permission, except the person submitting and the employee the expense is for;
+- when the submitter holds the permission too (Leela's own expense), the other holders and the super
+  admins can, so Leela's goes to Ben; super admins never approve their own either.
+Everyone listed must also be a TALLY admin. The assigned approver is checked again at Approve time.
+`SUPER_ADMIN_USERS` in `wrangler.jsonc` is a temporary stand-in until HELM's `/auth/app/users` rows say
+who a super admin is.
+
+**Export PDF** (approved expenses; reviewers and the creator): one PDF with a summary table of the lines
+as TALLY has them, the original expense form, and every receipt (an image per page; a receipt that is some
+pages of a PDF brings just those pages). Built in the browser, `web/src/exportPdf.js`.

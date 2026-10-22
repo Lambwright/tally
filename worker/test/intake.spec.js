@@ -6,6 +6,8 @@ const {
   readAttachments,
   pageRange,
   isPickableProject,
+  pickApprovers,
+  canApprovePortalExpense,
   normalizeCategory,
   salvageByFieldBoundaries,
   matchLinesToReceipts,
@@ -536,5 +538,61 @@ describe("line amount flags", () => {
     const codes = computeLineFlags(line, { gross: 8.3 }, "ON", project).map((f) => f.code);
     expect(codes).not.toContain("net_tax_mismatch");
     expect(codes).not.toContain("amount_mismatch");
+  });
+});
+
+describe("pickApprovers (approve_portal_expenses)", () => {
+  const env = { SUPER_ADMIN_USERS: "ben" };
+  const X = "approve_portal_expenses";
+  const users = [
+    { username: "ben", displayName: "Ben Wright", level: "admin", extras: [] },
+    { username: "leela@einbau.ca", displayName: "Leela Singh", level: "admin", extras: ["receipt_override", X] },
+    { username: "josh@einbau.ca", displayName: "Josh Brown", level: "submitter", extras: [] },
+  ];
+  const sub = { employee_name: "Devid Manzke", form_employee_name: null };
+  const names = (r) => r.map((x) => x.username);
+  it("for an ordinary submitter the list is the permission holders only (Leela)", () => {
+    const r = pickApprovers(users, { username: "josh@einbau.ca", appExtras: {} }, sub, env);
+    expect(names(r)).toEqual(["leela@einbau.ca"]);
+    expect(r[0].isDefault).toBe(true);
+  });
+  it("Ben submitting still goes to Leela, never to himself", () => {
+    const r = pickApprovers(users, { username: "ben", appExtras: {} }, sub, env);
+    expect(names(r)).toEqual(["leela@einbau.ca"]);
+  });
+  it("Leela submitting: the other holders and the super admins, so Ben", () => {
+    const r = pickApprovers(users, { username: "leela@einbau.ca", appExtras: { TALLY: [X] } }, sub, env);
+    expect(names(r)).toEqual(["ben"]);
+  });
+  it("more holders: a holder submitting offers the other holders first, then the super admins", () => {
+    const more = [...users, { username: "ann", displayName: "Ann Lee", level: "admin", extras: [X] }];
+    const r = pickApprovers(more, { username: "leela@einbau.ca", appExtras: { TALLY: [X] } }, sub, env);
+    expect(names(r)).toEqual(["ann", "ben"]);
+    expect(r[0].isDefault).toBe(true);
+  });
+  it("never offers the employee the expense is for; with no other holder left it falls back to the super admins", () => {
+    const r = pickApprovers(users, { username: "josh@einbau.ca", appExtras: {} }, { employee_name: "Leela Singh" }, env);
+    expect(names(r)).toEqual(["ben"]);
+    expect(pickApprovers(users, { username: "ben", appExtras: {} }, { employee_name: "Leela Singh" }, env)).toEqual([]);
+  });
+  it("a holder who is not a TALLY admin is not offered (they could not open the review screen)", () => {
+    const r = pickApprovers([{ username: "x", displayName: "X", level: "submitter", extras: [X] }], { username: "josh@einbau.ca", appExtras: {} }, sub, env);
+    expect(r).toEqual([]);
+  });
+  it("keeps the current approver as the default when re-sending, and handles no list", () => {
+    const more = [...users, { username: "ann", displayName: "Ann Lee", level: "admin", extras: [X] }];
+    const r = pickApprovers(more, { username: "josh@einbau.ca", appExtras: {} }, { ...sub, approver: "ann" }, env);
+    expect(r.find((x) => x.isDefault).username).toBe("ann");
+    expect(pickApprovers(undefined, { username: "ben" }, sub, env)).toEqual([]);
+  });
+});
+
+describe("canApprovePortalExpense", () => {
+  const env = { SUPER_ADMIN_USERS: "ben" };
+  it("needs the permission or to be a super admin", () => {
+    expect(canApprovePortalExpense({ username: "leela@einbau.ca", appExtras: { TALLY: ["approve_portal_expenses"] } }, env)).toBe(true);
+    expect(canApprovePortalExpense({ username: "ben", appExtras: {} }, env)).toBe(true);
+    expect(canApprovePortalExpense({ username: "josh@einbau.ca", appExtras: { TALLY: ["receipt_override"] } }, env)).toBe(false);
+    expect(canApprovePortalExpense({ username: "x" }, env)).toBe(false);
   });
 });

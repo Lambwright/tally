@@ -1132,7 +1132,7 @@ async function createSubmissionFromAttachments(env, sql, ctx, {
     values
       (${expenseId}, ${employeeName}, ${employeeEmail}, ${(province || "").toUpperCase().slice(0, 2) || null},
        ${projectNumber}, ${project?.procore_id || null}, ${project?.name || null}, ${project?.stage || null},
-       'needs_review', ${JSON.stringify([{ code: "parsing", severity: "low", detail: "Reading the form and receipts — refresh in a minute." }])}::jsonb,
+       ${origin === "email" ? "needs_review" : "draft"}, ${JSON.stringify([{ code: "parsing", severity: "low", detail: "Reading the form and receipts — refresh in a minute." }])}::jsonb,
        ${rawEmail}, ${JSON.stringify(history)}::jsonb, now(), ${origin}, ${createdBy})
     returning *`;
 
@@ -1415,13 +1415,15 @@ async function parseSubmission(env, sql, submissionId, { files }) {
 const SUB_SUMMARY = `
   s.id, s.expense_id, s.employee_name, s.employee_email, s.province,
   s.project_number, s.project_name, s.project_stage, s.status, s.flags,
-  s.origin, s.created_by,
+  s.origin, s.created_by, s.approver, s.submitted_for_review_at,
   s.reviewed_by, s.reviewed_at, s.procore_direct_cost_id, s.submitted_at, s.created_at, s.updated_at`;
 
 // `ownerFilter`: a username to scope the list to (PM_SUBMITTERS-only callers
 // see only their own rows), or null for full access.
-async function handleList(url, sql, ownerFilter) {
+async function handleList(url, sql, ownerFilter, me = null) {
   const status = url.searchParams.get("status") || null;
+  const mine = url.searchParams.get("mine") === "1" ? String(me || "").toLowerCase() : null;
+  const caller = String(me || "").toLowerCase();
   const rows = await sql`
     select ${sql.unsafe(SUB_SUMMARY)},
            coalesce(li.n, 0) as line_count, coalesce(li.net_total, 0) as net_total,
@@ -1433,6 +1435,8 @@ async function handleList(url, sql, ownerFilter) {
     ) li on li.submission_id = s.id
     where (${status}::text is null or s.status = ${status})
       and (${ownerFilter}::text is null or s.created_by = ${ownerFilter})
+      and (s.status <> 'draft' or lower(s.created_by) = ${caller})
+      and (${mine}::text is null or s.approver is null or lower(s.approver) = ${mine})
     order by s.created_at desc limit 500`;
   return json({ submissions: rows });
 }
@@ -1878,6 +1882,130 @@ async function handleReceiptOverride(subId, lineId, request, env, sql, user, lev
 // approve / revision / reject
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Submit Expense: pick who approves, then it lands in that person's queue
+// ---------------------------------------------------------------------------
+
+// HELM tool permission (Role Matrix -> TALLY extras): who may approve expenses that come in through the
+// web portal. Ben switches it on per person; today that is Leela only.
+const APPROVE_PORTAL_EXTRA = "approve_portal_expenses";
+
+// Super admins (Ben). auth-worker's /auth/app/users rows don't say who is one yet, so until HELM adds a
+// jobRole/isSuperAdmin field to them, SUPER_ADMIN_USERS (wrangler.jsonc, comma list) says. Temporary.
+function isSuperAdminUser(u, env) {
+  if (u && (u.jobRole === "superadmin" || u.isSuperAdmin === true)) return true;
+  const names = String(env?.SUPER_ADMIN_USERS || "").split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
+  return names.includes(String(u?.username || "").toLowerCase());
+}
+
+const holdsApprovePortal = (u) => Array.isArray(u?.extras) && u.extras.includes(APPROVE_PORTAL_EXTRA);
+
+// Who can approve a portal expense (Ben, 2026-10-21):
+//  - anyone holding the "approve portal expenses" permission (Leela today), except the person submitting
+//    and the employee the expense is for: nobody approves their own;
+//  - when the SUBMITTER holds the permission too (Leela's own expense), the other holders and the super
+//    admins can, so Leela's goes to Ben;
+//  - super admins never approve their own either.
+// Everyone listed must also be a TALLY admin (they need the review screens). The first holder is the
+// default, or the current approver when re-sending. `users` is /auth/app/users for TALLY:
+// [{ username, displayName, level, extras }]; `caller` is the signed-in user from /auth/verify.
+function pickApprovers(users, caller, sub, env = {}) {
+  const me = String(caller?.username || "").toLowerCase();
+  const callerHolds = Array.isArray(caller?.appExtras?.TALLY) && caller.appExtras.TALLY.includes(APPROVE_PORTAL_EXTRA);
+  const eligible = (Array.isArray(users) ? users : [])
+    .filter((u) => u && u.level === "admin" && String(u.username || "").toLowerCase() !== me)
+    .filter((u) => !selfApprovalReason({ displayName: u.displayName }, sub));
+  const holders = eligible.filter(holdsApprovePortal);
+  const supers = eligible.filter((u) => !holdsApprovePortal(u) && isSuperAdminUser(u, env));
+  const picked = callerHolds || holders.length === 0 ? [...holders, ...supers] : holders;
+  const rows = picked.map((u) => ({
+    username: u.username,
+    displayName: u.displayName || u.username,
+    canApprovePortal: holdsApprovePortal(u),
+    isSuperAdmin: isSuperAdminUser(u, env),
+  }));
+  rows.sort((a, b) => (Number(b.canApprovePortal) - Number(a.canApprovePortal)) || a.displayName.localeCompare(b.displayName));
+  const current = String(sub?.approver || "").toLowerCase();
+  const def = rows.find((r) => r.username.toLowerCase() === current) || rows[0] || null;
+  return rows.map((r) => ({ ...r, isDefault: !!def && r.username === def.username }));
+}
+
+// May this signed-in user approve a portal expense at all (checked again when they press Approve, in case
+// the permission was taken away after it was assigned)?
+function canApprovePortalExpense(user, env) {
+  const holds = Array.isArray(user?.appExtras?.TALLY) && user.appExtras.TALLY.includes(APPROVE_PORTAL_EXTRA);
+  return holds || isSuperAdminUser(user, env);
+}
+
+async function fetchTallyUsers(env, request) {
+  const header = request.headers.get("Authorization") || "";
+  const res = await env.AUTH_WORKER.fetch("https://auth.ben-a90.workers.dev/auth/app/users", {
+    method: "POST",
+    headers: { Authorization: header, "Content-Type": "application/json" },
+    body: JSON.stringify({ app: "TALLY" }),
+  });
+  if (!res.ok) throw new Error(`auth-worker /auth/app/users answered HTTP ${res.status}`);
+  const data = await res.json();
+  return Array.isArray(data.users) ? data.users : [];
+}
+
+// GET /submissions/:id/approvers -> { approvers: [{ username, displayName, hasWaiver, isDefault }] }
+async function handleApprovers(subId, request, env, sql, user) {
+  const [sub] = await sql`select * from submissions where id = ${subId}`;
+  if (!sub) return json({ error: "not_found" }, 404);
+  try {
+    return json({ approvers: pickApprovers(await fetchTallyUsers(env, request), user, sub, env), current: sub.approver || null });
+  } catch (e) {
+    return json({ error: "approvers_unavailable", detail: `Couldn't load the approver list: ${e.message}` }, 502);
+  }
+}
+
+// POST /submissions/:id/submit { approver } — the creator (or an admin) sends a draft, a sent-back
+// expense, or an already-submitted one (reassign) to the chosen approver's queue. Same completeness
+// rules as Approve, so what lands in the queue is ready to approve.
+async function handleSubmitForReview(subId, request, env, sql, user, isReviewer) {
+  const [sub] = await sql`select * from submissions where id = ${subId}`;
+  if (!sub) return json({ error: "not_found" }, 404);
+  if (!["draft", "needs_revision", "needs_review"].includes(sub.status)) {
+    return json({ error: "wrong_status", detail: `This expense is ${sub.status} — it can't be submitted.` }, 409);
+  }
+  const isOwner = String(sub.created_by || "").toLowerCase() === String(user.username || "").toLowerCase();
+  if (!isOwner && !isReviewer) return json({ error: "forbidden", detail: "Only the person who created this expense, or an admin, can submit it." }, 403);
+
+  const body = await parseBody(request).catch(() => ({}));
+  const wanted = String(body.approver || "").trim().toLowerCase();
+  if (!wanted) return json({ error: "approver_required", detail: "Choose who will approve this expense." }, 400);
+
+  let eligible;
+  try {
+    eligible = pickApprovers(await fetchTallyUsers(env, request), user, sub, env);
+  } catch (e) {
+    return json({ error: "approvers_unavailable", detail: `Couldn't check the approver list: ${e.message}` }, 502);
+  }
+  const chosen = eligible.find((r) => r.username.toLowerCase() === wanted);
+  if (!chosen) return json({ error: "not_an_approver", detail: "That person can't approve this expense (they aren't a TALLY approver, or the expense is theirs)." }, 422);
+
+  if ((sub.flags || []).some((f) => f.code === "parsing")) return json({ error: "still_parsing", detail: "Claude is still reading the files. Wait for it to finish." }, 409);
+  const dupFlag = (sub.flags || []).find((f) => f.code === "duplicate_expense_id");
+  if (dupFlag) return json({ error: "duplicate_expense_id", detail: dupFlag.detail }, 409);
+  if (!sub.project_procore_id) return json({ error: "no_project", detail: "Pick the project before submitting." }, 422);
+  const lines = await sql`select * from line_items where submission_id = ${subId} order by row_index asc nulls last, created_at asc`;
+  if (!lines.length) return json({ error: "no_lines", detail: "There are no expense lines to submit." }, 422);
+  const incomplete = lines.filter((l) => {
+    const net = money(l.net_amount);
+    return !(l.is_flat_claim || l.receipt_id || l.receipt_override_by) || net === null || net <= 0;
+  });
+  if (incomplete.length) {
+    return json({ error: "lines_incomplete", detail: `${incomplete.length} line(s) still need a receipt and/or a net amount.`, lines: incomplete.map((l) => ({ row: l.row_index, description: l.description })) }, 422);
+  }
+
+  const verb = sub.status === "needs_review" ? "reassigned to" : sub.status === "needs_revision" ? "resubmitted to" : "submitted to";
+  await sql`update submissions set status = 'needs_review', approver = ${chosen.username}, submitted_for_review_at = now(), updated_at = now() where id = ${subId}`;
+  await bumpForm(sql, subId, historyEvent("submitted", `${user.username} ${verb} ${chosen.displayName} for approval`));
+  const [fresh] = await sql`select * from submissions where id = ${subId}`;
+  return json({ submission: fresh, approver: chosen });
+}
+
 async function handleApprove(subId, url, request, env, sql, user, isPmApprover) {
   const [sub] = await sql`select * from submissions where id = ${subId}`;
   if (!sub) return json({ error: "not_found" }, 404);
@@ -1905,6 +2033,17 @@ async function handleApprove(subId, url, request, env, sql, user, isPmApprover) 
   const selfReason = selfApprovalReason(user, sub);
   if (selfReason && !dryRun) {
     return json({ error: "self_approval", detail: `You can't approve this one — ${selfReason}. Another admin has to.` }, 409);
+  }
+
+  // A draft has not been submitted yet, and a submitted one is for its chosen approver to approve.
+  if (!dryRun && sub.status === "draft") {
+    return json({ error: "not_submitted", detail: "This expense is still a draft — submit it first." }, 409);
+  }
+  if (!dryRun && sub.approver && !canApprovePortalExpense(user, env)) {
+    return json({ error: "not_portal_approver", detail: "You no longer have the permission to approve portal expenses." }, 403);
+  }
+  if (!dryRun && sub.approver && String(sub.approver).toLowerCase() !== String(user.username || "").toLowerCase()) {
+    return json({ error: "not_assigned", detail: `This expense is assigned to ${sub.approver}. They approve it, or it can be reassigned.` }, 409);
   }
 
   // A PM's own submission (no PDF form) needs an admin's sign-off before it can
@@ -2352,7 +2491,7 @@ export default {
         const pmScoped = auth.isPmSubmitter && !auth.isReviewer;
 
         if (parts.length === 1 && request.method === "GET") {
-          return withRefresh(await handleList(url, sql, pmScoped ? auth.user.username : null));
+          return withRefresh(await handleList(url, sql, pmScoped ? auth.user.username : null, auth.user.username));
         }
         if (parts[1] === "upload" && parts.length === 2 && request.method === "POST") {
           return withRefresh(await handleUpload(request, env, sql, ctx, auth));
@@ -2371,13 +2510,15 @@ export default {
             if ((owned.created_by || "").toLowerCase() !== auth.user.username.toLowerCase()) {
               return json({ error: "forbidden", reason: "Not your submission." }, 403);
             }
-            const denial = submitterDenial(request.method, seg, owned.status);
+            const denial = submitterDenial(request.method, seg === "approve" && url.searchParams.get("dryRun") === "1" ? "approve-preview" : seg, owned.status);
             if (denial) return json({ error: denial.error, detail: denial.detail }, denial.status);
           }
 
           if (!seg && request.method === "GET") return withRefresh(await handleDetail(subId, sql, auth.user));
           if (!seg && request.method === "PATCH") return withRefresh(await handleSubmissionPatch(subId, request, sql, auth.user, pmScoped));
           if (!seg && request.method === "DELETE") return withRefresh(await handleSubmissionDelete(subId, env, sql, auth.user));
+          if (seg === "approvers" && request.method === "GET") return await handleApprovers(subId, request, env, sql, auth.user);
+          if (seg === "submit" && request.method === "POST") return withRefresh(await handleSubmitForReview(subId, request, env, sql, auth.user, auth.isReviewer));
           if (seg === "reparse" && request.method === "POST") return withRefresh(await handleReparse(subId, env, sql, auth.user));
           if (seg === "parse" && request.method === "POST") return withRefresh(await handleParsePending(subId, env, sql, auth.user));
           if (seg === "retry-attachments" && request.method === "POST") return withRefresh(await handleRetryAttachments(subId, env, sql, auth.user));
@@ -2429,6 +2570,8 @@ export default {
 export const _test = {
   readAttachments,
   pageRange,
+  pickApprovers,
+  canApprovePortalExpense,
   isPickableProject,
   extractExpenseId,
   normalizeCategory,

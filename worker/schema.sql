@@ -43,8 +43,12 @@ create table submissions (
   -- line date — see migration_001.sql for adding this to an existing database.
   date_authorized date,
 
+  -- 'draft' = created in the app, not yet submitted (see migration_009.sql).
   status text not null default 'needs_review' check (status in
-    ('needs_review', 'needs_revision', 'approved', 'rejected')),
+    ('draft', 'needs_review', 'needs_revision', 'approved', 'rejected')),
+  -- Who must approve it, set by Submit Expense (Einbau ID username); null = any admin (email intake).
+  approver text,
+  submitted_for_review_at timestamptz,
 
   -- Where this row came from. 'pm_direct' is a PM submitting their own cost
   -- with no PDF form — Approve is gated to PM_APPROVERS for those (see

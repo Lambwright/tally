@@ -11,6 +11,7 @@ function formatMoney(n, currency = "CAD") {
 
 // What a submitter sees instead of the review-queue status names.
 const SUBMITTER_STATUS = {
+  draft: "draft — not submitted",
   needs_review: "waiting on approval",
   needs_revision: "sent back",
   approved: "approved",
@@ -30,6 +31,9 @@ export default function QueueList({ submissions, loading, onSelect, showStatus =
             <div>
               <div className="row-primary">{s.employee_name || s.employee_email || "(unknown employee)"}</div>
               <div className="row-secondary">{s.expense_id}</div>
+              {s.approver && s.status === "needs_review" && (
+                <div className="row-secondary">→ {String(s.approver).split("@")[0].replace(/^./, (c) => c.toUpperCase())}</div>
+              )}
             </div>
             <div>
               <div className="row-primary">{s.project_number || "—"}</div>

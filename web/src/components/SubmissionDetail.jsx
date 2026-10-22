@@ -4,6 +4,7 @@ import RevisionModal from "./RevisionModal.jsx";
 import EditableText from "./EditableText.jsx";
 import DirectCostPreview from "./DirectCostPreview.jsx";
 import ParseProgress, { STALL_MS } from "./ParseProgress.jsx";
+import SubmitExpenseModal from "./SubmitExpenseModal.jsx";
 
 // pdf-lib is bulky and only needed once someone opens an attachment.
 const Lightbox = lazy(() => import("./Lightbox.jsx"));
@@ -90,6 +91,7 @@ export default function SubmissionDetail({ id, onClose, onChanged, me }) {
   const [lightboxIdx, setLightboxIdx] = useState(null);
   const [newLine, setNewLine] = useState({ line_date: "", description: "", category: "materials", gross_amount: "" });
   const [addOpen, setAddOpen] = useState(false);
+  const [showSubmit, setShowSubmit] = useState(false);
   const [selectedLineIds, setSelectedLineIds] = useState(new Set());
   const [bulkCostCodeText, setBulkCostCodeText] = useState("");
 
@@ -156,6 +158,10 @@ export default function SubmissionDetail({ id, onClose, onChanged, me }) {
   const lines = data?.line_items || [];
   const receipts = data?.receipts || [];
   const actionable = sub && sub.status !== "approved" && sub.status !== "rejected";
+  // Submit Expense replaces Approve for the person who made the expense: a draft, or one sent back to them.
+  const isCreator = !!sub && !!me?.username && String(sub.created_by || "").toLowerCase() === String(me.username).toLowerCase();
+  const canSubmit = !!sub && isCreator && (sub.status === "draft" || sub.status === "needs_revision");
+  const canReassign = !!sub && !!me?.isReviewer && sub.status === "needs_review" && (!!sub.approver || isCreator);
 
   // cost codes
   useEffect(() => {
@@ -325,6 +331,40 @@ export default function SubmissionDetail({ id, onClose, onChanged, me }) {
       load();
     } catch (e) {
       setActionError(e.data?.detail || e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+  // The approved expense as one PDF: summary table of the lines, then the form and every receipt.
+  async function handleExportPdf() {
+    setBusy(true);
+    setActionError(null);
+    try {
+      const cc = costCodes && !costCodes.error ? costCodes : await api.getCostCodes(id).catch(() => null); // not loaded once approved
+      const codeById = Object.fromEntries((cc?.codes || []).map((c) => [c.id, c.code]));
+      const taxById = Object.fromEntries((cc?.tax_codes || []).map((c) => [String(c.id), c.name]));
+      const taxDefault = cc?.default_tax_code_id ? String(cc.default_tax_code_id) : "";
+      const { buildExpensePdf } = await import("../exportPdf.js"); // pdf-lib is bulky: only load it when asked
+      const bytes = await buildExpensePdf({
+        sub, lines, receipts,
+        labels: {
+          costCode: (l) => codeById[l.cost_code] || codeById[cc?.defaults?.[l.category]?.wbs_code_id] || "",
+          taxCode: (l) => taxById[l.tax_code] || taxById[taxDefault] || "",
+        },
+        getFile: async (key) => {
+          const r = receiptUrls[key];
+          if (!r?.url) return null;
+          return { bytes: new Uint8Array(await (await fetch(r.url)).arrayBuffer()), type: r.type };
+        },
+      });
+      const url = URL.createObjectURL(new Blob([bytes], { type: "application/pdf" }));
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${(sub.employee_name || "expense").replace(/[^A-Za-z0-9]+/g, "-")}_${sub.expense_id}.pdf`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
+    } catch (e) {
+      setActionError(`Couldn't build the PDF: ${e.message}`);
     } finally {
       setBusy(false);
     }
@@ -730,7 +770,30 @@ This is recorded under your name, and the net is estimated from the claimed amou
       {actionError && <div className="card" style={{ color: "var(--red)" }}>{actionError}</div>}
 
       <div className="modal-actions" style={{ justifyContent: "flex-start", flexWrap: "wrap" }}>
-        {actionable && !isSubmitter && (
+        {canSubmit && (
+          <>
+            <button className="btn btn-orange" disabled={busy || !allComplete || lines.length === 0 || !!parsingFlag || !!dupFlag}
+              onClick={() => setShowSubmit(true)}
+              title={parsingFlag ? "Claude is still reading the files." : !allComplete ? "Every line needs a receipt (or be flat-claim, or waived) and a net amount first." : undefined}>
+              {sub.status === "needs_revision" ? "Resubmit Expense" : "Submit Expense"}
+            </button>
+            {!allComplete && lines.length > 0 && (
+              <span className="row-secondary" style={{ alignSelf: "center" }}>Every line needs a receipt (or flat-claim, or waived) and a net amount first.</span>
+            )}
+          </>
+        )}
+        {sub.status === "approved" && (me?.isReviewer || isCreator) && (
+          <button className="btn btn-orange" disabled={busy} onClick={handleExportPdf}
+            title="One PDF: a table of the lines, the expense form, and every receipt">
+            {busy ? "Building PDF…" : "Export PDF"}
+          </button>
+        )}
+        {canReassign && (
+          <button className="btn btn-ghost" disabled={busy} onClick={() => setShowSubmit(true)}>
+            {sub.approver ? `Assigned to ${String(sub.approver).split("@")[0].replace(/^./, (c) => c.toUpperCase())} · Change approver` : "Assign approver"}
+          </button>
+        )}
+        {actionable && !isSubmitter && !canSubmit && (
           <>
             <button className="btn btn-orange" disabled={busy || !allComplete || !!dupFlag || needsPmApproval || !!selfBlock} onClick={handleApprove}
               title={selfBlock ? `You can't approve this one — ${selfBlock}.` : dupFlag ? dupFlag.detail : needsPmApproval ? "Needs an admin's approval first." : undefined}>
@@ -770,6 +833,12 @@ This is recorded under your name, and the net is estimated from the claimed amou
       </div>
 
       {dryRun && <DirectCostPreview dryRun={dryRun} sub={sub} costCodes={costCodes} />}
+
+      {showSubmit && (
+        <SubmitExpenseModal id={id} sub={sub} costCodes={costCodes} resubmit={sub.status === "needs_revision"}
+          onClose={() => setShowSubmit(false)}
+          onSubmitted={() => { setShowSubmit(false); onChanged?.(); onClose(); }} />
+      )}
 
       {sub.procore_direct_cost_id && (
         <div className="row-secondary" style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>

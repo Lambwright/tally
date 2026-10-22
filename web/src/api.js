@@ -43,7 +43,13 @@ async function request(path, { method = "GET", body, headers } = {}) {
 }
 
 export const api = {
-  listSubmissions: (status) => request(`/submissions${status ? `?status=${encodeURIComponent(status)}` : ""}`),
+  // mine = only what is assigned to me or unassigned (a reviewer's default queue)
+  listSubmissions: (status, { mine = false } = {}) => {
+    const q = [];
+    if (status) q.push(`status=${encodeURIComponent(status)}`);
+    if (mine) q.push("mine=1");
+    return request(`/submissions${q.length ? `?${q.join("&")}` : ""}`);
+  },
   getSubmission: (id) => request(`/submissions/${id}`), // { submission, line_items, receipts }
   patchSubmission: (id, fields) => request(`/submissions/${id}`, { method: "PATCH", body: fields }),
   deleteSubmission: (id) => request(`/submissions/${id}`, { method: "DELETE" }),
@@ -66,6 +72,8 @@ export const api = {
 
   approve: (id, { dryRun = false } = {}) =>
     request(`/submissions/${id}/approve${dryRun ? "?dryRun=1" : ""}`, { method: "POST", body: {} }),
+  listApprovers: (id) => request(`/submissions/${id}/approvers`), // { approvers: [{ username, displayName, hasWaiver, isDefault }] }
+  submitExpense: (id, approver) => request(`/submissions/${id}/submit`, { method: "POST", body: { approver } }),
   requestRevision: (id, note) => request(`/submissions/${id}/request-revision`, { method: "POST", body: { note } }),
   reject: (id, reason) => request(`/submissions/${id}/reject`, { method: "POST", body: { reason } }),
   listProjects: () => request("/projects"),
