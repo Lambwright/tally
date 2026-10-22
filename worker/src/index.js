@@ -35,8 +35,7 @@
 //   GET    /export?from=&to=&status=            (Einbau ID, reviewer) CSV, one row per line item -- payroll/period export
 //
 // Access: user.appRoles.TALLY from auth-worker -- 'admin' (reviewer + approver),
-// 'submitter' (own expenses only), 'access' (HELM's Live switch still off: the
-// old ALLOWED_USERS/PM_* lists in wrangler.jsonc apply), anything else -> 403.
+// 'submitter' (own expenses only), anything else -> 403. (No username lists in TALLY.)
 // See resolveTier. Nobody approves their own expense (selfApprovalReason).
 //
 // PM self-serve: a submitter hits the same /submissions/upload with no PDF
@@ -225,22 +224,16 @@ async function parseBody(request) {
 // Auth
 // ---------------------------------------------------------------------------
 
-const csv = (v) => String(v || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+const NO_TALLY_ACCESS = "You don't have access to TALLY. Ask your administrator.";
 
-const NO_TALLY_ACCESS = "You don't have access to TALLY, ask Ben.";
-
-// Turns an auth-worker user object (from /auth/verify) into TALLY's permission
-// flags. Pure — no I/O — so it's unit-tested. Three cases for appRoles.TALLY
-// (auth-worker/README.md, "Role matrix"):
+// Turns an auth-worker user object (from /auth/verify) into TALLY's permission flags. Pure, no I/O,
+// so it's unit-tested. Everything comes from HELM (auth-worker/README.md, "Role matrix"): appRoles.TALLY is
 //   'admin'     -> reviewer + approver of everything (incl. PM-submitted expenses)
 //   'submitter' -> submits own expenses, sees only their own
-//   'access'    -> TALLY's Live switch in HELM is still off: keep the old
-//                  ALLOWED_USERS / ALLOWED_ROLES / PM_SUBMITTERS / PM_APPROVERS
-//                  checks exactly as they were. Those lists go in a follow-up
-//                  once the switch is flipped and settled.
-//   anything else (no_access, missing key, unrecognised) -> denied.
+//   anything else (no_access, 'access', missing key, unrecognised) -> denied. There are no username
+//   lists in TALLY any more: who is who is managed in HELM.
 // `apps` fails closed: missing / non-array counts as [] (no access).
-function resolveTier(user, env) {
+function resolveTier(user) {
   const denied = (reason) => ({ ok: false, status: 403, reason });
   const apps = Array.isArray(user?.apps) ? user.apps : [];
   if (!apps.includes("TALLY")) return denied(NO_TALLY_ACCESS);
@@ -248,26 +241,7 @@ function resolveTier(user, env) {
   const level = user.appRoles && typeof user.appRoles === "object" ? user.appRoles.TALLY : undefined;
   if (level === "admin") return { ok: true, isReviewer: true, isPmSubmitter: false, isPmApprover: true, level };
   if (level === "submitter") return { ok: true, isReviewer: false, isPmSubmitter: true, isPmApprover: false, level };
-  if (level !== "access") return denied(NO_TALLY_ACCESS);
-
-  // --- not switched yet: today's checks, unchanged ---
-  const username = String(user.username || "").toLowerCase();
-  const isPmSubmitter = csv(env.PM_SUBMITTERS).includes(username);
-  const isPmApprover = csv(env.PM_APPROVERS).includes(username);
-
-  // ALLOWED_USERS is the real gate; ALLOWED_ROLES is a coarser fallback when
-  // it isn't set. Being in PM_SUBMITTERS is sufficient on its own.
-  const allowedUsers = csv(env.ALLOWED_USERS);
-  let isReviewer;
-  if (allowedUsers.length) {
-    isReviewer = allowedUsers.includes(username);
-    if (!isReviewer && !isPmSubmitter) return denied(`TALLY is limited to specific users — "${user.username}" isn't one of them.`);
-  } else {
-    const allowedRoles = String(env.ALLOWED_ROLES || "admin,user").split(",").map((r) => r.trim());
-    isReviewer = allowedRoles.includes(user.role);
-    if (!isReviewer && !isPmSubmitter) return denied(`Logged in as "${user.username}" (role "${user.role}"), which isn't allowed in TALLY.`);
-  }
-  return { ok: true, isReviewer, isPmSubmitter, isPmApprover, level };
+  return denied(NO_TALLY_ACCESS);
 }
 
 async function requireLogin(request, env) {
@@ -290,7 +264,7 @@ async function requireLogin(request, env) {
     if (!data.valid) return { ok: false, reason: "Session is invalid or expired — please log in again." };
     if (!data.user) return { ok: false, reason: "auth-worker returned no user for this session." };
 
-    const tier = resolveTier(data.user, env);
+    const tier = resolveTier(data.user);
     if (!tier.ok) return tier;
     return { ...tier, user: data.user, refreshedToken: data.refreshedToken || null };
   } catch (e) {
@@ -1200,7 +1174,7 @@ async function handleIntake(request, env, sql, ctx) {
 // /intake; the response comes back as soon as the files are stored, so the UI
 // can navigate straight to the review page while Claude reads it.
 //
-// A PM_SUBMITTERS-only caller (isReviewer false) is submitting their OWN
+// A submitter-level caller (isReviewer false) is submitting their OWN
 // expense with no PDF form — origin/created_by/employee_name are forced
 // rather than taken from the body, so they can't claim someone else's name
 // or spoof a reviewer-style "upload" row.
@@ -1418,7 +1392,7 @@ const SUB_SUMMARY = `
   s.origin, s.created_by, s.approver, s.submitted_for_review_at,
   s.reviewed_by, s.reviewed_at, s.procore_direct_cost_id, s.submitted_at, s.created_at, s.updated_at`;
 
-// `ownerFilter`: a username to scope the list to (PM_SUBMITTERS-only callers
+// `ownerFilter`: a username to scope the list to (submitter-level callers
 // see only their own rows), or null for full access.
 async function handleList(url, sql, ownerFilter, me = null) {
   const status = url.searchParams.get("status") || null;
@@ -1890,12 +1864,10 @@ async function handleReceiptOverride(subId, lineId, request, env, sql, user, lev
 // web portal. Ben switches it on per person; today that is Leela only.
 const APPROVE_PORTAL_EXTRA = "approve_portal_expenses";
 
-// Super admins (Ben). auth-worker's /auth/app/users rows don't say who is one yet, so until HELM adds a
-// jobRole/isSuperAdmin field to them, SUPER_ADMIN_USERS (wrangler.jsonc, comma list) says. Temporary.
-function isSuperAdminUser(u, env) {
-  if (u && (u.jobRole === "superadmin" || u.isSuperAdmin === true)) return true;
-  const names = String(env?.SUPER_ADMIN_USERS || "").split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
-  return names.includes(String(u?.username || "").toLowerCase());
+// The Super Admin, as HELM says: /auth/app/users rows carry isSuperAdmin, and the signed-in user from
+// /auth/verify has jobRole "superadmin".
+function isSuperAdminUser(u) {
+  return !!u && (u.isSuperAdmin === true || u.jobRole === "superadmin");
 }
 
 const holdsApprovePortal = (u) => Array.isArray(u?.extras) && u.extras.includes(APPROVE_PORTAL_EXTRA);
@@ -1909,20 +1881,20 @@ const holdsApprovePortal = (u) => Array.isArray(u?.extras) && u.extras.includes(
 // Everyone listed must also be a TALLY admin (they need the review screens). The first holder is the
 // default, or the current approver when re-sending. `users` is /auth/app/users for TALLY:
 // [{ username, displayName, level, extras }]; `caller` is the signed-in user from /auth/verify.
-function pickApprovers(users, caller, sub, env = {}) {
+function pickApprovers(users, caller, sub) {
   const me = String(caller?.username || "").toLowerCase();
   const callerHolds = Array.isArray(caller?.appExtras?.TALLY) && caller.appExtras.TALLY.includes(APPROVE_PORTAL_EXTRA);
   const eligible = (Array.isArray(users) ? users : [])
     .filter((u) => u && u.level === "admin" && String(u.username || "").toLowerCase() !== me)
     .filter((u) => !selfApprovalReason({ displayName: u.displayName }, sub));
   const holders = eligible.filter(holdsApprovePortal);
-  const supers = eligible.filter((u) => !holdsApprovePortal(u) && isSuperAdminUser(u, env));
+  const supers = eligible.filter((u) => !holdsApprovePortal(u) && isSuperAdminUser(u));
   const picked = callerHolds || holders.length === 0 ? [...holders, ...supers] : holders;
   const rows = picked.map((u) => ({
     username: u.username,
     displayName: u.displayName || u.username,
     canApprovePortal: holdsApprovePortal(u),
-    isSuperAdmin: isSuperAdminUser(u, env),
+    isSuperAdmin: isSuperAdminUser(u),
   }));
   rows.sort((a, b) => (Number(b.canApprovePortal) - Number(a.canApprovePortal)) || a.displayName.localeCompare(b.displayName));
   const current = String(sub?.approver || "").toLowerCase();
@@ -1932,9 +1904,9 @@ function pickApprovers(users, caller, sub, env = {}) {
 
 // May this signed-in user approve a portal expense at all (checked again when they press Approve, in case
 // the permission was taken away after it was assigned)?
-function canApprovePortalExpense(user, env) {
+function canApprovePortalExpense(user) {
   const holds = Array.isArray(user?.appExtras?.TALLY) && user.appExtras.TALLY.includes(APPROVE_PORTAL_EXTRA);
-  return holds || isSuperAdminUser(user, env);
+  return holds || isSuperAdminUser(user);
 }
 
 async function fetchTallyUsers(env, request) {
@@ -1954,7 +1926,7 @@ async function handleApprovers(subId, request, env, sql, user) {
   const [sub] = await sql`select * from submissions where id = ${subId}`;
   if (!sub) return json({ error: "not_found" }, 404);
   try {
-    return json({ approvers: pickApprovers(await fetchTallyUsers(env, request), user, sub, env), current: sub.approver || null });
+    return json({ approvers: pickApprovers(await fetchTallyUsers(env, request), user, sub), current: sub.approver || null });
   } catch (e) {
     return json({ error: "approvers_unavailable", detail: `Couldn't load the approver list: ${e.message}` }, 502);
   }
@@ -1978,7 +1950,7 @@ async function handleSubmitForReview(subId, request, env, sql, user, isReviewer)
 
   let eligible;
   try {
-    eligible = pickApprovers(await fetchTallyUsers(env, request), user, sub, env);
+    eligible = pickApprovers(await fetchTallyUsers(env, request), user, sub);
   } catch (e) {
     return json({ error: "approvers_unavailable", detail: `Couldn't check the approver list: ${e.message}` }, 502);
   }
@@ -2039,7 +2011,7 @@ async function handleApprove(subId, url, request, env, sql, user, isPmApprover) 
   if (!dryRun && sub.status === "draft") {
     return json({ error: "not_submitted", detail: "This expense is still a draft — submit it first." }, 409);
   }
-  if (!dryRun && sub.approver && !canApprovePortalExpense(user, env)) {
+  if (!dryRun && sub.approver && !canApprovePortalExpense(user)) {
     return json({ error: "not_portal_approver", detail: "You no longer have the permission to approve portal expenses." }, 403);
   }
   if (!dryRun && sub.approver && String(sub.approver).toLowerCase() !== String(user.username || "").toLowerCase()) {
@@ -2466,8 +2438,8 @@ export default {
         }
       }
 
-      // No role split among reviewers for now — any ALLOWED_USERS user has full
-      // control, ops routes included. PM_SUBMITTERS-only callers never reach
+      // No role split among reviewers for now — any TALLY admin has full
+      // control, ops routes included. Submitter-level callers never reach
       // these — admin/probe tooling stays reviewer-only.
       if (url.pathname === "/admin/refresh-projects" && request.method === "POST") {
         if (!auth.isReviewer) return json({ error: "forbidden" }, 403);
@@ -2501,7 +2473,7 @@ export default {
           const subId = parts[1];
           const seg = parts[2];
 
-          // PM_SUBMITTERS-only callers only ever get to their own rows —
+          // Submitter-level callers only ever get to their own rows —
           // everything past this point (view, edit, approve-attempt, delete,
           // line CRUD, receipts) is scoped by this one check.
           if (pmScoped) {

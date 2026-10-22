@@ -21,24 +21,7 @@
 		// us02 is this account's regional data-plane host — confirmed against the
 		// payroll Direct Cost flow, which hits us02.procore.com/rest/v1.0/... too.
 		"PROCORE_API_BASE": "https://us02.procore.com",
-		// Who may use the review queue. ALLOWED_USERS (comma list of Einbau ID
-		// usernames) is the real gate — TALLY is Ben, Josh, Leela, and Devid only.
-		// ALLOWED_ROLES is just a fallback when ALLOWED_USERS is unset.
-		"ALLOWED_USERS": "ben,josh@einbau.ca,leela@einbau.ca,devid@einbau.ca",
-		"ALLOWED_ROLES": "admin,user",
-		// PM self-serve expenses (no PDF form): who may give the final Procore
-		// approval on one -- comma list of Einbau ID usernames, same pattern as
-		// ALLOWED_USERS. Add a backup approver here, no code change needed.
-		"PM_APPROVERS": "leela@einbau.ca",
-		// Who may use the restricted "submit my own expense" tier -- comma list
-		// of Einbau ID usernames. Empty until PMs are onboarded. A username here
-		// but NOT in ALLOWED_USERS sees only their own submissions; being in both
-		// just keeps full reviewer access.
-		"PM_SUBMITTERS": "",
-		// Super admins, by Einbau ID username. TEMPORARY: auth-worker's /auth/app/users doesn't say who one is yet;
-		// once HELM adds jobRole/isSuperAdmin to those rows this goes away. They can approve portal expenses
-		// submitted by a person who holds the approve_portal_expenses permission, and never their own.
-		"SUPER_ADMIN_USERS": "ben",
+		// Who may use TALLY, and as what, comes from HELM (appRoles.TALLY, appExtras.TALLY). No username lists here.
 		"CURRENT_APP": "tally",
 		// The "MISC EMP Expenses" vendor's numeric Procore id -- expense Direct
 		// Costs post against this vendor, not Einbau itself. CONFIRMED (Ben,

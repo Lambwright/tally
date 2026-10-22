@@ -12,7 +12,7 @@ import ExportPanel from "./components/ExportPanel.jsx";
 import Cameo from "./components/Cameo.jsx";
 
 // Who gets the walk-on, same rule for everyone: every CAMEO_EVERY-th sign-in on a browser.
-const CAMEO_USERS = ["josh@einbau.ca", "ben", "ben@einbau.ca"];
+const CAMEO_USERS = ["josh@einbau.ca", "ben@einbau.ca"]; // until HELM's gags page replaces this
 const CAMEO_EVERY = 7;
 
 const STATUSES = [

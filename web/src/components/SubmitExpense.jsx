@@ -88,7 +88,7 @@ export default function SubmitExpense({ onClose, onCreated }) {
       <div className="modal" onClick={(e) => e.stopPropagation()}>
         <div className="card-title" style={{ marginBottom: 4 }}>Submit an expense</div>
         <p className="row-secondary" style={{ marginBottom: 12 }}>
-          Drop your receipts below — no PDF form needed. You'll build the line items on the next page, then it goes to Leela for approval.
+          Drop your receipts below — no PDF form needed. You'll build the line items on the next page, then you choose who approves it and submit it.
         </p>
 
         <div

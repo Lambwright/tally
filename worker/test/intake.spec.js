@@ -304,37 +304,28 @@ describe("salvageByFieldBoundaries", () => {
   });
 });
 
-describe("resolveTier (appRoles.TALLY)", () => {
-  const env = { ALLOWED_USERS: "ben,leela@einbau.ca", PM_APPROVERS: "leela@einbau.ca", PM_SUBMITTERS: "pat@einbau.ca" };
+describe("resolveTier (appRoles.TALLY, everything from HELM)", () => {
   const user = (username, appRoles, apps = ["TALLY"]) => ({ username, apps, appRoles });
 
   it("admin: reviewer + approver, not a scoped submitter", () => {
-    expect(resolveTier(user("anyone", { TALLY: "admin" }), env)).toMatchObject({ ok: true, isReviewer: true, isPmApprover: true, isPmSubmitter: false });
+    expect(resolveTier(user("anyone", { TALLY: "admin" }))).toMatchObject({ ok: true, isReviewer: true, isPmApprover: true, isPmSubmitter: false });
   });
   it("submitter: scoped to own submissions, can't approve", () => {
-    expect(resolveTier(user("josh@einbau.ca", { TALLY: "submitter" }), env)).toMatchObject({ ok: true, isReviewer: false, isPmApprover: false, isPmSubmitter: true });
+    expect(resolveTier(user("josh@einbau.ca", { TALLY: "submitter" }))).toMatchObject({ ok: true, isReviewer: false, isPmApprover: false, isPmSubmitter: true });
   });
-  it("matrix level beats the old username lists in both directions", () => {
-    // listed in ALLOWED_USERS but submitter in the matrix -> submitter
-    expect(resolveTier(user("ben", { TALLY: "submitter" }), env).isReviewer).toBe(false);
-    // not listed anywhere but admin in the matrix -> admin
-    expect(resolveTier(user("newadmin", { TALLY: "admin" }), env).isReviewer).toBe(true);
+  it("the level decides, not the username", () => {
+    expect(resolveTier(user("ben@einbau.ca", { TALLY: "submitter" })).isReviewer).toBe(false);
+    expect(resolveTier(user("newadmin", { TALLY: "admin" })).isReviewer).toBe(true);
   });
-  it("access (Live switch still off): today's lists, unchanged", () => {
-    expect(resolveTier(user("ben", { TALLY: "access" }), env)).toMatchObject({ ok: true, isReviewer: true, isPmApprover: false });
-    expect(resolveTier(user("leela@einbau.ca", { TALLY: "access" }), env)).toMatchObject({ ok: true, isReviewer: true, isPmApprover: true });
-    expect(resolveTier(user("pat@einbau.ca", { TALLY: "access" }), env)).toMatchObject({ ok: true, isReviewer: false, isPmSubmitter: true });
-    expect(resolveTier(user("stranger", { TALLY: "access" }), env)).toMatchObject({ ok: false, status: 403 });
-  });
-  it("no_access, missing key, missing appRoles, or an unrecognised level: denied 403", () => {
-    for (const roles of [{ TALLY: "no_access" }, {}, undefined, null, { TALLY: "superuser" }, { TALLY: "" }]) {
-      expect(resolveTier(user("ben", roles), env)).toMatchObject({ ok: false, status: 403 });
+  it("'access' (HELM switch off in the old days), no_access, missing key or appRoles, or an unrecognised level: denied 403", () => {
+    for (const roles of [{ TALLY: "access" }, { TALLY: "no_access" }, {}, undefined, null, { TALLY: "superuser" }, { TALLY: "" }]) {
+      expect(resolveTier(user("ben@einbau.ca", roles))).toMatchObject({ ok: false, status: 403 });
     }
   });
   it("apps fails closed: missing / non-array / without TALLY is denied even with an admin level", () => {
-    expect(resolveTier({ username: "ben", appRoles: { TALLY: "admin" } }, env).ok).toBe(false);
-    expect(resolveTier({ username: "ben", apps: "TALLY", appRoles: { TALLY: "admin" } }, env).ok).toBe(false);
-    expect(resolveTier(user("ben", { TALLY: "admin" }, ["HANDOFF"]), env).ok).toBe(false);
+    expect(resolveTier({ username: "ben", appRoles: { TALLY: "admin" } }).ok).toBe(false);
+    expect(resolveTier({ username: "ben", apps: "TALLY", appRoles: { TALLY: "admin" } }).ok).toBe(false);
+    expect(resolveTier(user("ben", { TALLY: "admin" }, ["HANDOFF"])).ok).toBe(false);
   });
 });
 
@@ -542,57 +533,56 @@ describe("line amount flags", () => {
 });
 
 describe("pickApprovers (approve_portal_expenses)", () => {
-  const env = { SUPER_ADMIN_USERS: "ben" };
   const X = "approve_portal_expenses";
   const users = [
-    { username: "ben", displayName: "Ben Wright", level: "admin", extras: [] },
-    { username: "leela@einbau.ca", displayName: "Leela Singh", level: "admin", extras: ["receipt_override", X] },
-    { username: "josh@einbau.ca", displayName: "Josh Brown", level: "submitter", extras: [] },
+    { username: "ben@einbau.ca", displayName: "Ben Wright", level: "admin", extras: [], isSuperAdmin: true },
+    { username: "leela@einbau.ca", displayName: "Leela Singh", level: "admin", extras: ["receipt_override", X], isSuperAdmin: false },
+    { username: "josh@einbau.ca", displayName: "Josh Brown", level: "submitter", extras: [], isSuperAdmin: false },
   ];
   const sub = { employee_name: "Devid Manzke", form_employee_name: null };
   const names = (r) => r.map((x) => x.username);
   it("for an ordinary submitter the list is the permission holders only (Leela)", () => {
-    const r = pickApprovers(users, { username: "josh@einbau.ca", appExtras: {} }, sub, env);
+    const r = pickApprovers(users, { username: "josh@einbau.ca", appExtras: {} }, sub);
     expect(names(r)).toEqual(["leela@einbau.ca"]);
     expect(r[0].isDefault).toBe(true);
   });
-  it("Ben submitting still goes to Leela, never to himself", () => {
-    const r = pickApprovers(users, { username: "ben", appExtras: {} }, sub, env);
-    expect(names(r)).toEqual(["leela@einbau.ca"]);
+  it("the super admin submitting still goes to Leela, never to himself", () => {
+    expect(names(pickApprovers(users, { username: "ben@einbau.ca", appExtras: {} }, sub))).toEqual(["leela@einbau.ca"]);
   });
   it("Leela submitting: the other holders and the super admins, so Ben", () => {
-    const r = pickApprovers(users, { username: "leela@einbau.ca", appExtras: { TALLY: [X] } }, sub, env);
-    expect(names(r)).toEqual(["ben"]);
+    const r = pickApprovers(users, { username: "leela@einbau.ca", appExtras: { TALLY: [X] } }, sub);
+    expect(names(r)).toEqual(["ben@einbau.ca"]);
+    expect(r[0].isSuperAdmin).toBe(true);
   });
   it("more holders: a holder submitting offers the other holders first, then the super admins", () => {
     const more = [...users, { username: "ann", displayName: "Ann Lee", level: "admin", extras: [X] }];
-    const r = pickApprovers(more, { username: "leela@einbau.ca", appExtras: { TALLY: [X] } }, sub, env);
-    expect(names(r)).toEqual(["ann", "ben"]);
+    const r = pickApprovers(more, { username: "leela@einbau.ca", appExtras: { TALLY: [X] } }, sub);
+    expect(names(r)).toEqual(["ann", "ben@einbau.ca"]);
     expect(r[0].isDefault).toBe(true);
   });
   it("never offers the employee the expense is for; with no other holder left it falls back to the super admins", () => {
-    const r = pickApprovers(users, { username: "josh@einbau.ca", appExtras: {} }, { employee_name: "Leela Singh" }, env);
-    expect(names(r)).toEqual(["ben"]);
-    expect(pickApprovers(users, { username: "ben", appExtras: {} }, { employee_name: "Leela Singh" }, env)).toEqual([]);
+    const r = pickApprovers(users, { username: "josh@einbau.ca", appExtras: {} }, { employee_name: "Leela Singh" });
+    expect(names(r)).toEqual(["ben@einbau.ca"]);
+    expect(pickApprovers(users, { username: "ben@einbau.ca", appExtras: {} }, { employee_name: "Leela Singh" })).toEqual([]);
   });
   it("a holder who is not a TALLY admin is not offered (they could not open the review screen)", () => {
-    const r = pickApprovers([{ username: "x", displayName: "X", level: "submitter", extras: [X] }], { username: "josh@einbau.ca", appExtras: {} }, sub, env);
+    const r = pickApprovers([{ username: "x", displayName: "X", level: "submitter", extras: [X] }], { username: "josh@einbau.ca", appExtras: {} }, sub);
     expect(r).toEqual([]);
   });
   it("keeps the current approver as the default when re-sending, and handles no list", () => {
     const more = [...users, { username: "ann", displayName: "Ann Lee", level: "admin", extras: [X] }];
-    const r = pickApprovers(more, { username: "josh@einbau.ca", appExtras: {} }, { ...sub, approver: "ann" }, env);
+    const r = pickApprovers(more, { username: "josh@einbau.ca", appExtras: {} }, { ...sub, approver: "ann" });
     expect(r.find((x) => x.isDefault).username).toBe("ann");
-    expect(pickApprovers(undefined, { username: "ben" }, sub, env)).toEqual([]);
+    expect(pickApprovers(undefined, { username: "ben" }, sub)).toEqual([]);
   });
 });
 
 describe("canApprovePortalExpense", () => {
-  const env = { SUPER_ADMIN_USERS: "ben" };
-  it("needs the permission or to be a super admin", () => {
-    expect(canApprovePortalExpense({ username: "leela@einbau.ca", appExtras: { TALLY: ["approve_portal_expenses"] } }, env)).toBe(true);
-    expect(canApprovePortalExpense({ username: "ben", appExtras: {} }, env)).toBe(true);
-    expect(canApprovePortalExpense({ username: "josh@einbau.ca", appExtras: { TALLY: ["receipt_override"] } }, env)).toBe(false);
-    expect(canApprovePortalExpense({ username: "x" }, env)).toBe(false);
+  it("needs the permission or to be the Super Admin (jobRole or isSuperAdmin)", () => {
+    expect(canApprovePortalExpense({ username: "leela@einbau.ca", appExtras: { TALLY: ["approve_portal_expenses"] } })).toBe(true);
+    expect(canApprovePortalExpense({ username: "ben@einbau.ca", jobRole: "superadmin", appExtras: {} })).toBe(true);
+    expect(canApprovePortalExpense({ username: "ben@einbau.ca", isSuperAdmin: true })).toBe(true);
+    expect(canApprovePortalExpense({ username: "josh@einbau.ca", appExtras: { TALLY: ["receipt_override"] } })).toBe(false);
+    expect(canApprovePortalExpense({ username: "x" })).toBe(false);
   });
 });

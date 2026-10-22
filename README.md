@@ -178,12 +178,13 @@ computed from the matrix) and `user.jobRole` (informational) alongside the
 existing `user.apps`; `user.role` becomes legacy and only ever `"admin"` for
 the Super Admin after the switch.
 
-**Status (2026-10-05): built in the worker, pending deploy + Ben flipping TALLY's
-Live switch in HELM.** `resolveTier` reads `appRoles.TALLY`: `admin` /
-`submitter` use the matrix; `access` (switch still off) keeps the old
-`ALLOWED_USERS`/`ALLOWED_ROLES`/`PM_*` lists exactly as they were; anything else,
-or `apps` missing/without TALLY, is a 403. The old lists come out in a
-follow-up once it's settled. Self-approval is enforced in `handleApprove`
+**Status (2026-10-21): done. Everything about who can do what comes from HELM; TALLY has no username
+lists.** `resolveTier` reads `appRoles.TALLY`: `admin` / `submitter`; anything else (including the old
+`access` value), or `apps` missing/without TALLY, is a 403. The old `ALLOWED_USERS` / `ALLOWED_ROLES` /
+`PM_APPROVERS` / `PM_SUBMITTERS` / `RECEIPT_OVERRIDE_USERS` settings and the temporary
+`SUPER_ADMIN_USERS` are gone from `wrangler.jsonc`. "Is this the Super Admin?" is HELM's `isSuperAdmin`
+(on `/auth/app/users` rows) or `user.jobRole === "superadmin"`; a tool for specific people is a HELM tool
+permission (`user.appExtras.TALLY`). Self-approval is enforced in `handleApprove`
 (`selfApprovalReason`: employee email, the name Claude read off the form —
 stored separately as `form_employee_name`, `migration_006.sql` — and the
 employee name the push would use).
@@ -196,8 +197,7 @@ TALLY's two levels, as proposed:
   confirmed dropping both from full reviewer access is intended).
 - **submitter** — submit your own expenses, see only your own. Everyone else.
 
-This replaces `ALLOWED_USERS` / `ALLOWED_ROLES` / `PM_APPROVERS` /
-`PM_SUBMITTERS` in `wrangler.jsonc` with one `appRoles.TALLY` read.
+(That single `appRoles.TALLY` read replaced the old username lists.)
 
 **Receipt waiver (a HELM tool permission):** being able to waive the receipt requirement on a single line, so it still posts to Procore at someone's discretion, is the HELM tool permission `receipt_override` (label "Receipt waiver"). Ben turns it on per person in HELM → Role Matrix → Tool permissions, and it reaches TALLY as `user.appExtras.TALLY`. The waiver needs both the TALLY **admin** level and that permission, so Ben can approve a line someone has waived but can't waive one himself unless he gives himself the permission, and a submitter holding it still can't waive. Missing or malformed `appExtras` means no waiver. Every waiver is recorded per line (`line_items.receipt_override_by/_at`) and in the submission history. There are no names in TALLY for this any more (the old `RECEIPT_OVERRIDE_USERS` setting is gone).
 
@@ -243,8 +243,7 @@ expenses", switched on per person in HELM; Leela only today):
 - when the submitter holds the permission too (Leela's own expense), the other holders and the super
   admins can, so Leela's goes to Ben; super admins never approve their own either.
 Everyone listed must also be a TALLY admin. The assigned approver is checked again at Approve time.
-`SUPER_ADMIN_USERS` in `wrangler.jsonc` is a temporary stand-in until HELM's `/auth/app/users` rows say
-who a super admin is.
+The Super Admin is whoever HELM marks (`isSuperAdmin` / `jobRole`); nobody is named in TALLY.
 
 **Export PDF** (approved expenses; reviewers and the creator): one PDF with a summary table of the lines
 as TALLY has them, the original expense form, and every receipt (an image per page; a receipt that is some
