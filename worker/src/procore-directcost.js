@@ -207,3 +207,21 @@ export function alreadyPosted(existingLineItems, submission) {
   const hay = JSON.stringify(existingLineItems || []);
   return hay.includes(dedupToken(submission));
 }
+
+// Resuming a Direct Cost that got its header (and maybe some lines) but not all of them: which of the
+// line items we built are NOT on it yet? `have` is the DC's line_items as Procore returns them;
+// `built` is the array from buildDirectCostLineItem. A built line counts as present when a not-yet-used
+// existing line has the same description and amount (so two identical lines need two matches).
+export function missingLineItems(have, built) {
+  const pool = (Array.isArray(have) ? have : []).map((h) => ({
+    description: String(h?.description || ""),
+    amount: Number(h?.unit_cost ?? h?.amount),
+    used: false,
+  }));
+  return built.filter((li) => {
+    const want = li.data?.line_item || {};
+    const hit = pool.find((p) => !p.used && p.description === String(want.description || "") && Math.abs(p.amount - Number(want.unit_cost)) < 0.005);
+    if (hit) { hit.used = true; return false; }
+    return true;
+  });
+}

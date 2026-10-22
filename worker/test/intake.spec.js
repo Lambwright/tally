@@ -8,6 +8,9 @@ const {
   isPickableProject,
   pickApprovers,
   canApprovePortalExpense,
+  positiveInt,
+  resolveEmployeeId,
+  missingLineItems,
   normalizeCategory,
   salvageByFieldBoundaries,
   matchLinesToReceipts,
@@ -584,5 +587,68 @@ describe("canApprovePortalExpense", () => {
     expect(canApprovePortalExpense({ username: "ben@einbau.ca", isSuperAdmin: true })).toBe(true);
     expect(canApprovePortalExpense({ username: "josh@einbau.ca", appExtras: { TALLY: ["receipt_override"] } })).toBe(false);
     expect(canApprovePortalExpense({ username: "x" })).toBe(false);
+  });
+});
+
+describe("resolveEmployeeId with a picked Procore user", () => {
+  const env = { PROCORE_API_BASE: "https://p.test", PROCORE_COMPANY_ID: "1" };
+  const withFetch = async (handler, body) => {
+    const real = globalThis.fetch;
+    const urls = [];
+    globalThis.fetch = async (url) => { urls.push(String(url)); return handler(String(url)); };
+    try { return await body(urls); } finally { globalThis.fetch = real; }
+  };
+  const ok = (data) => ({ ok: true, status: 200, text: async () => JSON.stringify(data) });
+
+  it("uses the picked id when Procore still has that user under that name (no name search)", async () => {
+    await withFetch(() => ok({ id: 77, name: "Michael Sefeldas" }), async (urls) => {
+      const r = await resolveEmployeeId(env, "tok", "Michael Sefeldas", 77);
+      expect(r).toEqual({ id: 77, reason: null });
+      expect(urls.some((u) => u.includes("filters[search]"))).toBe(false);
+    });
+  });
+  it("falls back to the name search when the name was edited since the pick", async () => {
+    await withFetch((url) => (url.includes("/users/77") ? ok({ id: 77, name: "Michael Sefeldas" }) : ok([{ id: 99, name: "Pat Jones" }])), async (urls) => {
+      const r = await resolveEmployeeId(env, "tok", "Pat Jones", 77);
+      expect(r).toEqual({ id: 99, reason: null });
+      expect(urls.some((u) => u.includes("filters[search]"))).toBe(true);
+    });
+  });
+  it("falls back when the id lookup fails, and still reports no match with a reason", async () => {
+    await withFetch((url) => (url.includes("/users/77") ? { ok: false, status: 404, text: async () => "{}" } : ok([])), async () => {
+      const r = await resolveEmployeeId(env, "tok", "Nobody Here", 77);
+      expect(r.id).toBeNull();
+      expect(r.reason).toMatch(/No Procore user found/);
+    });
+  });
+});
+
+describe("positiveInt", () => {
+  it("accepts whole positive numbers or numeric strings, nothing else", () => {
+    expect(positiveInt(562949953508586)).toBe(562949953508586);
+    expect(positiveInt("123")).toBe(123);
+    for (const bad of [0, -3, 1.5, "abc", "", null, undefined, NaN, {}]) expect(positiveInt(bad)).toBeNull();
+  });
+});
+
+describe("missingLineItems (resuming a half-posted Direct Cost)", () => {
+  const built = (description, unit_cost) => ({ data: { line_item: { description, unit_cost } } });
+  it("posts everything when the Direct Cost has no lines yet", () => {
+    const b = [built("a [EXP:1]", "10.00"), built("b [EXP:1]", "5.00")];
+    expect(missingLineItems([], b)).toEqual(b);
+    expect(missingLineItems(undefined, b)).toEqual(b);
+  });
+  it("skips the lines already there and posts only the rest", () => {
+    const b = [built("a [EXP:1]", "10.00"), built("b [EXP:1]", "5.00"), built("c [EXP:1]", "7.25")];
+    const have = [{ description: "a [EXP:1]", unit_cost: "10.00" }, { description: "c [EXP:1]", unit_cost: 7.25 }];
+    expect(missingLineItems(have, b)).toEqual([b[1]]);
+  });
+  it("two identical lines need two existing matches", () => {
+    const b = [built("x [EXP:1]", "4.00"), built("x [EXP:1]", "4.00")];
+    expect(missingLineItems([{ description: "x [EXP:1]", unit_cost: "4.00" }], b)).toEqual([b[1]]);
+  });
+  it("a line with a different amount is not a match", () => {
+    const b = [built("a [EXP:1]", "10.00")];
+    expect(missingLineItems([{ description: "a [EXP:1]", unit_cost: "9.00" }], b)).toEqual(b);
   });
 });

@@ -63,6 +63,11 @@ export default function UploadSubmission({ onClose, onCreated }) {
     addFiles(e.dataTransfer.files);
   }
 
+  // The Procore user behind the typed name, when it is exactly one entry on the list (two people with the
+  // same name can't be told apart here, so no id: Approve falls back to its name search and flags it).
+  const matches = users.filter((x) => String(x.name || "").trim().toLowerCase() === employeeName.trim().toLowerCase());
+  const pickedUserId = matches.length === 1 ? matches[0].id : null;
+
   async function handleParse() {
     if (!files.length || !employeeName.trim()) return;
     setBusy(true);
@@ -77,6 +82,7 @@ export default function UploadSubmission({ onClose, onCreated }) {
       );
       const result = await api.uploadSubmission({
         employee_name: employeeName.trim() || undefined,
+        employee_procore_id: pickedUserId || undefined,
         project_number: projectNumber.trim() || undefined,
         attachments,
       });

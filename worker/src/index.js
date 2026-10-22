@@ -63,7 +63,8 @@ import { neon } from "@neondatabase/serverless";
 import {
   CATEGORY_TO_WBS_CODE,
   DIRECTCOST_VERIFIED,
-  alreadyPosted,
+  dedupToken,
+  missingLineItems,
   buildDirectCostHeader,
   buildDirectCostLineItem,
   listProjectWbsCodes,
@@ -774,8 +775,40 @@ const normalizeName = (s) => String(s || "").toLowerCase().replace(/\s+/g, " ").
 // the employee, and matching on it silently tags the wrong person. Better to
 // tag nobody than tag the wrong one, so this only returns an id when the match
 // is unambiguous.
-async function resolveEmployeeId(env, token, employeeName) {
+// A Direct Cost that already holds this expense's invoice number on the same vendor and date and is
+// OURS to resume: it has no lines, or only lines tagged with this expense's [EXP:...] token. Looks through
+// the project's Direct Costs (rare path: only after a "invoice_number already exists" refusal).
+async function findOwnDirectCost(env, token, sub, headerItem) {
+  for (let page = 1; page <= 20; page++) {
+    const rows = await procoreFetch(env, token, `/rest/v1.0/projects/${sub.project_procore_id}/direct_costs?per_page=100&page=${page}`).catch(() => []);
+    if (!Array.isArray(rows) || !rows.length) return null;
+    const hit = rows.find((r) =>
+      String(r.invoice_number || "") === String(headerItem.invoice_number) &&
+      String(r.vendor?.id || r.vendor_id || "") === String(headerItem.vendor_id) &&
+      String(r.direct_cost_date || "").slice(0, 10) === String(headerItem.direct_cost_date).slice(0, 10));
+    if (hit) {
+      const full = await procoreFetch(env, token, `/rest/v1.0/projects/${sub.project_procore_id}/direct_costs/${hit.id}`).catch(() => null);
+      const lines = Array.isArray(full?.line_items) ? full.line_items : [];
+      const ours = lines.every((l) => String(l.description || "").includes(dedupToken(sub)));
+      return ours ? { id: hit.id, line_items: lines } : null;
+    }
+    if (rows.length < 100) return null;
+  }
+  return null;
+}
+
+async function resolveEmployeeId(env, token, employeeName, pickedId = null) {
   if (!employeeName) return { id: null, reason: "No employee name on the form to search Procore with." };
+
+  // The employee was picked from the Procore company-user list (or is a HELM-linked person): use that
+  // id, after checking Procore still has that user under this name. If the name on the expense was edited
+  // since, or the lookup fails, fall back to the name search below.
+  if (pickedId && Number.isFinite(Number(pickedId))) {
+    const user = await procoreFetch(env, token, `/rest/v1.0/companies/${env.PROCORE_COMPANY_ID}/users/${Number(pickedId)}`).catch(() => null);
+    const pickedName = user && (user.name || `${user.first_name || ""} ${user.last_name || ""}`);
+    if (pickedName && normalizeName(pickedName) === normalizeName(employeeName)) return { id: Number(pickedId), reason: null };
+  }
+
   const results = await procoreFetch(
     env, token,
     `/rest/v1.0/companies/${env.PROCORE_COMPANY_ID}/users?filters[search]=${encodeURIComponent(employeeName)}`
@@ -1072,7 +1105,7 @@ function computeLineFlags(line, receipt, formProvince, project, { shared = false
 // Automate from timing out at ~2min and retrying the whole thing 7 times; for
 // the app it's what lets the UI navigate to the review page immediately.
 async function createSubmissionFromAttachments(env, sql, ctx, {
-  atts, employeeName = null, employeeEmail = null, province = null, projectNumber = null,
+  atts, employeeName = null, employeeProcoreId = null, employeeEmail = null, province = null, projectNumber = null,
   rawEmail = null, expenseIdHint = null, historyText, origin = "email", createdBy = null,
 }) {
   // Nobody tells us what each file is: Claude reads them all and says which one is the
@@ -1101,10 +1134,10 @@ async function createSubmissionFromAttachments(env, sql, ctx, {
   const history = [historyEvent("intake", historyText)];
   const [sub] = await sql`
     insert into submissions
-      (expense_id, employee_name, employee_email, province, project_number, project_procore_id, project_name, project_stage,
+      (expense_id, employee_name, employee_procore_id, employee_email, province, project_number, project_procore_id, project_name, project_stage,
        status, flags, raw_email, history, submitted_at, origin, created_by)
     values
-      (${expenseId}, ${employeeName}, ${employeeEmail}, ${(province || "").toUpperCase().slice(0, 2) || null},
+      (${expenseId}, ${employeeName}, ${employeeProcoreId}, ${employeeEmail}, ${(province || "").toUpperCase().slice(0, 2) || null},
        ${projectNumber}, ${project?.procore_id || null}, ${project?.name || null}, ${project?.stage || null},
        ${origin === "email" ? "needs_review" : "draft"}, ${JSON.stringify([{ code: "parsing", severity: "low", detail: "Reading the form and receipts — refresh in a minute." }])}::jsonb,
        ${rawEmail}, ${JSON.stringify(history)}::jsonb, now(), ${origin}, ${createdBy})
@@ -1166,7 +1199,7 @@ async function handleIntake(request, env, sql, ctx) {
     historyText: `Received from ${fromEmail || "(unknown)"}.`,
   });
 
-  return json({ created: true, submission: { id: sub.id, expense_id: sub.expense_id, status: "needs_review", parsing: true } }, 201);
+  return json({ created: true, submission: { id: sub.id, expense_id: sub.expense_id, status: sub.status, parsing: true } }, 201);
 }
 
 // POST /submissions/upload (Einbau ID) — upload the form + receipts straight
@@ -1178,6 +1211,12 @@ async function handleIntake(request, env, sql, ctx) {
 // expense with no PDF form — origin/created_by/employee_name are forced
 // rather than taken from the body, so they can't claim someone else's name
 // or spoof a reviewer-style "upload" row.
+// A whole positive integer from a request or from HELM (ids can arrive as numbers or strings), else null.
+function positiveInt(v) {
+  const n = Number(v);
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+
 async function handleUpload(request, env, sql, ctx, auth) {
   const body = await parseBody(request);
   const atts = normalizeAttachments(body);
@@ -1195,6 +1234,9 @@ async function handleUpload(request, env, sql, ctx, auth) {
     employeeName: isPmSubmission
       ? (auth.user.displayName || auth.user.username)
       : (body.employee_name || "").toString().trim() || null,
+    // the Procore user picked in the employee dropdown, or (a submitter expensing for themselves) the one
+    // HELM links to them; Approve re-checks it against the name before using it
+    employeeProcoreId: positiveInt(isPmSubmission ? auth.user.fields?.procoreUser?.id : body.employee_procore_id),
     projectNumber: (body.project_number && String(body.project_number).trim()) || null,
     historyText: isPmSubmission
       ? `Submitted by ${auth.user.username} for their own reimbursement.`
@@ -2040,7 +2082,7 @@ async function handleApprove(subId, url, request, env, sql, user, isPmApprover) 
 
   const token = await getProcoreToken(env);
 
-  const employeeResolution = await resolveEmployeeId(env, token, sub.employee_name);
+  const employeeResolution = await resolveEmployeeId(env, token, sub.employee_name, sub.employee_procore_id);
   const employeeId = employeeResolution.id;
 
   // Tax code: whatever the reviewer picked per-line, else the form's own
@@ -2092,18 +2134,41 @@ async function handleApprove(subId, url, request, env, sql, user, isPmApprover) 
     }, 501);
   }
 
-  const existing = await procoreFetch(env, token, `/rest/v1.0/projects/${sub.project_procore_id}/direct_costs/line_items`).catch(() => []);
-  if (alreadyPosted(existing, sub)) {
-    return json({ error: "already_in_procore", detail: "A Direct Cost line item tagged with this Expense ID already exists on the project." }, 409);
+  // Posting is safe to repeat. The Direct Cost's id is saved the moment the header exists, so if a line
+  // fails (or the request dies) the next Approve resumes on the same Direct Cost instead of creating a
+  // second one or colliding with the first ("invoice_number ... already exists").
+  let dcId = sub.procore_direct_cost_id ? String(sub.procore_direct_cost_id) : "";
+  let headerResult = null;
+  if (!dcId) {
+    try {
+      headerResult = await procoreFetch(env, token, header.path, { method: "POST", body: header.data });
+      dcId = String(headerResult.id || headerResult.item?.id || "");
+      if (!dcId) throw new Error(`Direct Cost header POST returned no id: ${JSON.stringify(headerResult).slice(0, 300)}`);
+    } catch (e) {
+      // Procore already has a Direct Cost with this vendor + invoice number + date: most likely an earlier
+      // attempt of THIS expense that created the header and then stopped. Adopt it if it is ours.
+      if (!(e.status === 422 && /invoice_number/i.test(JSON.stringify(e.body || "")))) throw e;
+      const found = await findOwnDirectCost(env, token, sub, header.data.item);
+      if (!found) {
+        return json({ error: "duplicate_in_procore", detail: `Procore already has a Direct Cost with invoice number ${sub.expense_id} on this vendor and date, and it isn't a half-finished copy of this expense. Open it in Procore and delete it (or approve this one by hand).` }, 409);
+      }
+      dcId = String(found.id);
+    }
+    await sql`update submissions set procore_direct_cost_id = ${dcId}, updated_at = now() where id = ${subId}`;
   }
 
-  const headerResult = await procoreFetch(env, token, header.path, { method: "POST", body: header.data });
-  const dcId = String(headerResult.id || headerResult.item?.id || "");
-  if (!dcId) throw new Error(`Direct Cost header POST returned no id: ${JSON.stringify(headerResult).slice(0, 300)}`);
-
+  const current = await procoreFetch(env, token, `/rest/v1.0/projects/${sub.project_procore_id}/direct_costs/${dcId}`).catch(() => null);
+  const toPost = missingLineItems(current?.line_items, lineItems);
   const posted = [];
-  for (const li of lineItems) {
-    posted.push(await procoreFetch(env, token, li.pathTemplate.replace("{dc_id}", dcId), { method: "POST", body: li.data }));
+  for (const li of toPost) {
+    try {
+      posted.push(await procoreFetch(env, token, li.pathTemplate.replace("{dc_id}", dcId), { method: "POST", body: li.data }));
+    } catch (e) {
+      return json({
+        error: "line_post_failed", direct_cost_id: dcId,
+        detail: `The Direct Cost (${dcId}) was created in Procore but a line couldn't be added: ${e.message}. Nothing is lost: fix the cause and press Approve again and it carries on from the same Direct Cost.`,
+      }, 502);
+    }
   }
 
   // Attach the form + every receipt so the Direct Cost carries its backup, not
@@ -2543,6 +2608,9 @@ export const _test = {
   readAttachments,
   pageRange,
   pickApprovers,
+  positiveInt,
+  resolveEmployeeId,
+  missingLineItems,
   canApprovePortalExpense,
   isPickableProject,
   extractExpenseId,
