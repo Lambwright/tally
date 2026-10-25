@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { _test } from "../src/index.js";
+import worker, { _test } from "../src/index.js";
 
 const {
   extractExpenseId,
@@ -7,6 +7,9 @@ const {
   pageRange,
   expenseIdFor,
   buildExpenseFormPdf,
+  refusalCount,
+  refusalOutcome,
+  visitorHeaders,
   isPickableProject,
   pickApprovers,
   canApprovePortalExpense,
@@ -727,5 +730,80 @@ describe("buildExpenseFormPdf", () => {
     const { PDFDocument } = await import("pdf-lib");
     expect((await PDFDocument.load(small)).getPageCount()).toBe(1);
     expect((await PDFDocument.load(big)).getPageCount()).toBeGreaterThan(1);
+  });
+});
+
+describe("reporting refused requests to auth-worker", () => {
+  it("refusalCount: one event per key per minute, carrying the count held back", () => {
+    const k = "1.1.1.1|no_token|/x";
+    expect(refusalCount(k, 1000)).toBe(1);
+    expect(refusalCount(k, 5000)).toBe(0);
+    expect(refusalCount(k, 9000)).toBe(0);
+    expect(refusalCount(k, 62000)).toBe(3); // this one + the two held back
+    expect(refusalCount("2.2.2.2|no_token|/x", 62000)).toBe(1); // another ip is separate
+  });
+  it("refusalOutcome maps status and a hint", () => {
+    expect(refusalOutcome(401, false)).toBe("no_token");
+    expect(refusalOutcome(401, true)).toBe("bad_session");
+    expect(refusalOutcome(403, true)).toBe("forbidden");
+    expect(refusalOutcome(429, true)).toBe("rate_limited");
+    expect(refusalOutcome(401, false, "bad_service_key")).toBe("bad_service_key");
+  });
+
+  const makeEnv = () => {
+    const sent = [];
+    return {
+      sent,
+      env: {
+        DATABASE_URL: "postgres://u:p@localhost/db", AUTH_SERVICE_KEY: "svc-key", TALLY_SERVICE_KEY: "right-key",
+        AUTH_WORKER: { fetch: async (url, init) => { sent.push({ url: String(url), init }); return new Response(JSON.stringify({ ok: true, stored: 1 })); } },
+      },
+      ctx: { waitUntil: (p) => { sent.push({ pending: p }); } },
+    };
+  };
+  const events = async (sent) => {
+    await Promise.all(sent.filter((s) => s.pending).map((s) => s.pending));
+    return sent.filter((s) => s.url).map((s) => ({ url: s.url, key: s.init.headers["X-Auth-Service-Key"], body: JSON.parse(s.init.body) }));
+  };
+
+  it("a request with no token is refused AND reported, without the response changing", async () => {
+    const { env, ctx, sent } = makeEnv();
+    const res = await worker.fetch(new Request("https://t.test/submissions?x=1", { headers: { "CF-Connecting-IP": "9.9.9.1", "User-Agent": "test-agent" } }), env, ctx);
+    expect(res.status).toBe(401);
+    const ev = await events(sent);
+    expect(ev).toHaveLength(1);
+    expect(ev[0].url).toBe("https://auth.ben-a90.workers.dev/auth/security/report");
+    expect(ev[0].key).toBe("svc-key");
+    expect(ev[0].body.events[0]).toMatchObject({ outcome: "no_token", route: "/submissions", method: "GET", ip: "9.9.9.1", count: 1 });
+    expect(JSON.stringify(ev[0].body)).not.toMatch(/x=1|Bearer/); // no query string, no tokens
+  });
+  it("a wrong intake key is reported as bad_service_key; repeats within a minute are held back", async () => {
+    const { env, ctx, sent } = makeEnv();
+    const req = () => new Request("https://t.test/intake", { method: "POST", headers: { "X-Tally-Service-Key": "wrong", "CF-Connecting-IP": "9.9.9.2" }, body: "{}" });
+    expect((await worker.fetch(req(), env, ctx)).status).toBe(401);
+    expect((await worker.fetch(req(), env, ctx)).status).toBe(401);
+    const ev = await events(sent);
+    expect(ev).toHaveLength(1);
+    expect(ev[0].body.events[0].outcome).toBe("bad_service_key");
+  });
+  it("OPTIONS preflights are not reported, and a missing AUTH_SERVICE_KEY just skips reporting", async () => {
+    const a = makeEnv();
+    await worker.fetch(new Request("https://t.test/submissions", { method: "OPTIONS" }), a.env, a.ctx);
+    expect(await events(a.sent)).toHaveLength(0);
+    const b = makeEnv();
+    delete b.env.AUTH_SERVICE_KEY;
+    const res = await worker.fetch(new Request("https://t.test/submissions", { headers: { "CF-Connecting-IP": "9.9.9.3" } }), b.env, b.ctx);
+    expect(res.status).toBe(401);
+    expect(await events(b.sent)).toHaveLength(0);
+  });
+});
+
+describe("visitorHeaders (sent to auth-worker on /auth/verify)", () => {
+  it("forwards the visitor's IP, location and browser, and leaves out what is empty", () => {
+    const req = new Request("https://t.test/x", { headers: { "CF-Connecting-IP": "5.6.7.8", "User-Agent": "Mozilla/5.0" } });
+    expect(visitorHeaders(req)).toEqual({ "X-Einbau-Client-IP": "5.6.7.8", "X-Einbau-Client-UA": "Mozilla/5.0" });
+  });
+  it("gives nothing for a bare request", () => {
+    expect(visitorHeaders(new Request("https://t.test/x", { headers: { "User-Agent": "" } }))).toEqual({});
   });
 });

@@ -248,6 +248,20 @@ function resolveTier(user) {
   return denied(NO_TALLY_ACCESS);
 }
 
+// The visitor's details for auth-worker's own failed-verify rows (a service-binding call carries no IP of its
+// own). Only on /auth/verify; empty ones are left out.
+function visitorHeaders(request) {
+  const cf = request.cf || {};
+  const h = {
+    "X-Einbau-Client-IP": request.headers.get("CF-Connecting-IP"),
+    "X-Einbau-Client-Country": cf.country,
+    "X-Einbau-Client-City": cf.city,
+    "X-Einbau-Client-Org": cf.asOrganization,
+    "X-Einbau-Client-UA": (request.headers.get("User-Agent") || "").slice(0, 200),
+  };
+  return Object.fromEntries(Object.entries(h).filter(([, v]) => v));
+}
+
 async function requireLogin(request, env) {
   const header = request.headers.get("Authorization") || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : null;
@@ -257,7 +271,7 @@ async function requireLogin(request, env) {
     // *.workers.dev URL directly is blocked with Cloudflare error 1042.
     const res = await env.AUTH_WORKER.fetch("https://auth.ben-a90.workers.dev/auth/verify", {
       method: "POST",
-      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", "X-Einbau-App": "TALLY", ...visitorHeaders(request) },
       body: "{}",
     });
     if (!res.ok) {
@@ -269,7 +283,7 @@ async function requireLogin(request, env) {
     if (!data.user) return { ok: false, reason: "auth-worker returned no user for this session." };
 
     const tier = resolveTier(data.user);
-    if (!tier.ok) return tier;
+    if (!tier.ok) return { ...tier, username: data.user.username };
     return { ...tier, user: data.user, refreshedToken: data.refreshedToken || null };
   } catch (e) {
     return { ok: false, reason: `Couldn't reach auth-worker: ${e.message}` };
@@ -2065,7 +2079,7 @@ async function fetchTallyUsers(env, request) {
   const header = request.headers.get("Authorization") || "";
   const res = await env.AUTH_WORKER.fetch("https://auth.ben-a90.workers.dev/auth/app/users", {
     method: "POST",
-    headers: { Authorization: header, "Content-Type": "application/json" },
+    headers: { Authorization: header, "Content-Type": "application/json", "X-Einbau-App": "TALLY" },
     body: JSON.stringify({ app: "TALLY" }),
   });
   if (!res.ok) throw new Error(`auth-worker /auth/app/users answered HTTP ${res.status}`);
@@ -2592,8 +2606,57 @@ async function handleSubmissionDelete(subId, env, sql, user) {
 
 const isUuid = (s) => /^[0-9a-f-]{36}$/i.test(s || "");
 
-export default {
-  async fetch(request, env, ctx) {
+// Refused requests are reported to auth-worker (HELM's Security tab) so the ones TALLY turns away itself
+// (no token, a wrong intake key, a 403 on a level) are visible too. Fire-and-forget via waitUntil: it never
+// delays or fails the response. At most one event per ip+outcome+route per minute per isolate, carrying a
+// count of the ones held back. Never sends tokens, keys, bodies or query strings.
+const refusalSeen = new Map(); // "ip|outcome|route" -> { at, held }
+function refusalCount(key, now = Date.now()) {
+  const e = refusalSeen.get(key);
+  if (!e || now - e.at >= 60000) {
+    const n = (e ? e.held : 0) + 1;
+    refusalSeen.set(key, { at: now, held: 0 });
+    if (refusalSeen.size > 500) for (const [k, v] of refusalSeen) if (now - v.at >= 60000) refusalSeen.delete(k);
+    return n;
+  }
+  e.held += 1;
+  return 0;
+}
+
+function refusalOutcome(status, hasBearer, hint) {
+  if (hint) return hint;
+  if (status === 429) return "rate_limited";
+  if (status === 403) return "forbidden";
+  return hasBearer ? "bad_session" : "no_token";
+}
+
+function reportRefusal(request, env, ctx, res, sec) {
+  if (!env.AUTH_SERVICE_KEY || request.method === "OPTIONS") return;
+  if (![401, 403, 429].includes(res.status)) return;
+  const url = new URL(request.url);
+  const hasBearer = /^Bearer\s+\S/.test(request.headers.get("Authorization") || "");
+  const outcome = refusalOutcome(res.status, hasBearer, sec.outcome);
+  const ip = request.headers.get("CF-Connecting-IP") || "";
+  const count = refusalCount(`${ip}|${outcome}|${url.pathname}`);
+  if (!count) return;
+  const cf = request.cf || {};
+  const event = {
+    outcome, route: url.pathname, method: request.method, ip, count,
+    username: sec.username || undefined,
+    country: cf.country, city: cf.city, org: cf.asOrganization,
+    ua: (request.headers.get("User-Agent") || "").slice(0, 200),
+    detail: String(sec.reason || `HTTP ${res.status}`).slice(0, 120),
+  };
+  ctx.waitUntil(
+    env.AUTH_WORKER.fetch("https://auth.ben-a90.workers.dev/auth/security/report", {
+      method: "POST",
+      headers: { "X-Auth-Service-Key": env.AUTH_SERVICE_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify({ events: [event] }),
+    }).catch(() => {})
+  );
+}
+
+async function routeRequest(request, env, ctx, sec) {
     if (request.method === "OPTIONS") return new Response(null, { headers: corsHeaders() });
 
     const url = new URL(request.url);
@@ -2603,12 +2666,17 @@ export default {
     try {
       // /intake — service key only
       if (url.pathname === "/intake" && request.method === "POST") {
-        if (!isServiceCaller(request, env)) return json({ error: "unauthorized" }, 401);
+        if (!isServiceCaller(request, env)) {
+          sec.outcome = request.headers.get("X-Tally-Service-Key") ? "bad_service_key" : "no_token";
+          return json({ error: "unauthorized" }, 401);
+        }
         return await handleIntake(request, env, sql, ctx);
       }
 
       // everything else needs an Einbau ID session
       const auth = await requireLogin(request, env);
+      sec.username = auth.user?.username || auth.username || null;
+      sec.reason = auth.ok ? null : auth.reason;
       if (!auth.ok) {
         return auth.status === 403
           ? json({ error: "forbidden", detail: auth.reason, reason: auth.reason }, 403)
@@ -2743,6 +2811,18 @@ export default {
       console.log("tally-worker error:", e.message, e.stack);
       return json({ error: "internal_error", detail: e.message }, 500);
     }
+}
+
+export default {
+  async fetch(request, env, ctx) {
+    const sec = {};
+    const res = await routeRequest(request, env, ctx, sec);
+    try {
+      reportRefusal(request, env, ctx, res, sec);
+    } catch {
+      // reporting must never affect the response
+    }
+    return res;
   },
 
   async scheduled(event, env, ctx) {
@@ -2757,6 +2837,9 @@ export default {
 
 // Exported for unit tests.
 export const _test = {
+  visitorHeaders,
+  refusalCount,
+  refusalOutcome,
   isoDate,
   procoreFetch,
   resolveWbsFromCodes,
