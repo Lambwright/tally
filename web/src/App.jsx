@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { getStoredToken, verify, logout as doLogout } from "./auth.js";
 import { api } from "./api.js";
 import { applyAccentPreset } from "./accentPresets.js";
@@ -19,6 +19,15 @@ const CAMEO_EVERY = 7;
 const STATUSES = [
   { key: "draft", label: "My Drafts" },
   { key: "needs_review", label: "Needs Review" },
+  { key: "needs_revision", label: "Needs Revision" },
+  { key: "approved", label: "Approved" },
+  { key: "rejected", label: "Rejected" },
+];
+
+// A general user (no review rights) sees only their own expenses, split by where each one is.
+const MY_STATUSES = [
+  { key: "draft", label: "My Drafts" },
+  { key: "needs_review", label: "Under Review" },
   { key: "needs_revision", label: "Needs Revision" },
   { key: "approved", label: "Approved" },
   { key: "rejected", label: "Rejected" },
@@ -87,13 +96,20 @@ export default function App() {
   // queue — one "My expenses" list of their own rows, status on each row. The
   // server already scopes the list to their rows; this just drops the tabs.
   const isSubmitterOnly = !!me?.isPmSubmitter && !me?.isReviewer;
+  const startedOnDrafts = useRef(false);
+  useEffect(() => {
+    if (isSubmitterOnly && !startedOnDrafts.current) {
+      startedOnDrafts.current = true;
+      setStatus("draft");
+    }
+  }, [isSubmitterOnly]);
 
   const loadList = useCallback(() => {
     if (authState !== "in") return;
     setLoadingList(true);
     setListError(null);
     api
-      .listSubmissions(isSubmitterOnly ? null : status, { mine: status === "needs_review" && !showEveryones, filters: isSubmitterOnly ? {} : applied })
+      .listSubmissions(status, { mine: !isSubmitterOnly && status === "needs_review" && !showEveryones, filters: isSubmitterOnly ? {} : applied })
       .then((data) => setSubmissions(data.submissions || []))
       .catch((e) => {
         if (e.unauthorized) handleLogout();
@@ -159,8 +175,7 @@ export default function App() {
         ) : (
           <>
             <div className="tabs">
-              {me?.isPmSubmitter && !me?.isReviewer && <span className="card-title" style={{ margin: 0, alignSelf: "center" }}>My expenses</span>}
-              {me?.isReviewer && STATUSES.map((s) => (
+              {(me?.isReviewer ? STATUSES : MY_STATUSES).map((s) => (
                 <button
                   key={s.key}
                   className={`tab ${status === s.key ? "active" : ""}`}
@@ -195,7 +210,7 @@ export default function App() {
                 netTotal={submissions.reduce((a, s) => a + (Number(s.net_total) || 0), 0)} />
             )}
             {listError && <div className="card" style={{ color: "var(--red)" }}>{listError}</div>}
-            <QueueList submissions={submissions} loading={loadingList} onSelect={selectSubmission} showStatus={isSubmitterOnly} />
+            <QueueList submissions={submissions} loading={loadingList} onSelect={selectSubmission} />
           </>
         )}
       </div>
