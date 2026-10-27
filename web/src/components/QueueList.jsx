@@ -18,6 +18,8 @@ const SUBMITTER_STATUS = {
   rejected: "rejected",
 };
 
+import { shownExpenseId } from "../expenseLabel.js";
+
 export default function QueueList({ submissions, loading, onSelect, showStatus = false }) {
   if (loading) return <div className="empty-state">Loading…</div>;
   if (!submissions.length) return <div className="empty-state">Nothing here.</div>;
@@ -30,7 +32,7 @@ export default function QueueList({ submissions, loading, onSelect, showStatus =
           <div className="row-item" key={s.id} onClick={() => onSelect(s.id)}>
             <div>
               <div className="row-primary">{s.employee_name || s.employee_email || "(unknown employee)"}</div>
-              <div className="row-secondary">{s.expense_id}</div>
+              <div className="row-secondary">{shownExpenseId(s)}</div>
               {s.resubmitted_at && s.status === "needs_review" && (
                 <div><span className="badge badge-resubmitted" title="Sent back for a revision and re-submitted">Re-submitted</span></div>
               )}

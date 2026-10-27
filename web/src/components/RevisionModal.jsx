@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { api } from "../api.js";
+import { shownExpenseId } from "../expenseLabel.js";
 
 // Asking the person who made an expense to change something. The message stays in TALLY: when they open the
 // expense it pops up with your name on it, they can reopen it from the page while they fix things, and their reply
@@ -29,7 +30,7 @@ export default function RevisionModal({ submission, onClose, onDone }) {
         <form onSubmit={handleSend}>
           <div className="card-title" style={{ marginBottom: 4 }}>Request revision</div>
           <p className="row-secondary" style={{ marginBottom: 12 }}>
-            What does {submission.employee_name || "the submitter"} need to change on {submission.expense_id}? They'll see
+            What does {submission.employee_name || "the submitter"} need to change on {shownExpenseId(submission)}? They'll see
             this message, with your name on it, when they open the expense.
           </p>
           <div className="field">

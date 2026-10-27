@@ -1,10 +1,15 @@
 import { describe, it, expect } from "vitest";
+import { readFileSync } from "node:fs";
 import worker, { _test } from "../src/index.js";
 
 const {
   extractExpenseId,
   readAttachments,
   pageRange,
+  buildFormFromTemplate,
+  mdy,
+  viewerIdentity,
+  isAboutViewer,
   handleRequestRevision,
   bumpForm,
   historyEvent,
@@ -942,10 +947,13 @@ describe("handleList filters and sorting", () => {
     expect(odd).toContain("order by coalesce(s.reviewed_at, s.created_at) desc");
     expect(odd).not.toContain("drop table");
   });
-  it("a submitter-only caller stays scoped to their own", async () => {
-    const { text, params } = await run("", "josh@einbau.ca");
-    expect(text).toContain("s.created_by = $1");
-    expect(params[0]).toBe("josh@einbau.ca");
+  it("a general user sees what they created or what is about them, never other people's", async () => {
+    const viewer = viewerIdentity({ username: "Scot@Einbau.ca", displayName: "Scot Carter-Nichols", firstName: "Scot", lastName: "Carter-Nichols", fields: { procoreUser: { id: 13628396 } } });
+    const { text, params } = await run("?status=needs_review", viewer);
+    expect(text).toContain("lower(s.created_by) = $");
+    expect(text).toContain("= any($");
+    expect(text).toContain("s.employee_procore_id = $");
+    expect(params).toEqual(expect.arrayContaining(["scot@einbau.ca", ["scot carter-nichols"], 13628396]));
   });
 });
 
@@ -1008,5 +1016,52 @@ describe("bumpForm only records history", () => {
   });
   it("historyEvent can carry who and what was said", () => {
     expect(historyEvent("revision_reply", "t", { by: "ben", message: "m" })).toMatchObject({ type: "revision_reply", text: "t", by: "ben", message: "m" });
+  });
+});
+
+describe("an expense that is about a general user (viewerIdentity / isAboutViewer)", () => {
+  const scot = viewerIdentity({ username: "scot@einbau.ca", displayName: "Scot Carter-Nichols", firstName: "Scot", lastName: "Carter-Nichols", fields: { procoreUser: { id: "13628396" } } });
+  it("matches by the employee name, ignoring case and spacing, on either name field", () => {
+    expect(isAboutViewer(scot, { employee_name: "SCOT  Carter-Nichols" })).toBe(true);
+    expect(isAboutViewer(scot, { employee_name: "someone else", form_employee_name: "scot carter-nichols" })).toBe(true);
+    expect(isAboutViewer(scot, { employee_name: "Scott Carter" })).toBe(false);
+  });
+  it("matches by the Procore user id when the name differs", () => {
+    expect(isAboutViewer(scot, { employee_name: "S. C-N", employee_procore_id: "13628396" })).toBe(true);
+    expect(isAboutViewer(scot, { employee_name: "S. C-N", employee_procore_id: "999" })).toBe(false);
+  });
+  it("never matches blanks, and a user with no Procore link relies on the name", () => {
+    expect(isAboutViewer(scot, { employee_name: "", form_employee_name: null })).toBe(false);
+    const nobody = viewerIdentity({ username: "x", displayName: "Pat Jones" });
+    expect(nobody.procoreId).toBeNull();
+    expect(isAboutViewer(nobody, { employee_name: "Pat Jones" })).toBe(true);
+    expect(isAboutViewer(nobody, { employee_name: "Pat Jones", employee_procore_id: null }) && !isAboutViewer(nobody, { employee_name: "Sam" })).toBe(true);
+  });
+});
+
+describe("the real Einbau form, filled in", () => {
+  const template = readFileSync(new URL("../assets/employee-expense-form-template.pdf", import.meta.url));
+  const sub = { employee_name: "Ben Wright", project_number: "2026_0183", province: "ON", expense_id: "271026-260183-BEWR" };
+  const mk = (i, category = "other") => ({ row_index: i, category, line_date: "2026-10-12", description: "Line " + i, gross_amount: 10 + i, net_amount: 9 + i });
+  it("dates are written the way the form shows them (M/D/YY)", () => {
+    expect(mdy("2026-10-05")).toBe("10/5/26");
+    expect(mdy(new Date("2026-01-30T00:00:00Z"))).toBe("1/30/26");
+    expect(mdy(null)).toBe("");
+  });
+  it("fills one page for up to 11 lines, more pages beyond that, and one for none", async () => {
+    const { PDFDocument } = await import("pdf-lib");
+    const pages = async (lines, extra = {}) => (await PDFDocument.load(await buildFormFromTemplate({ templateBytes: template, sub, lines, ...extra }))).getPageCount();
+    expect(await pages([mk(1), mk(2, "fuel"), mk(3, "mileage"), mk(4, "per_diem")], { authorizedBy: "Leela", authorizedDate: "2026-10-28" })).toBe(1);
+    expect(await pages(Array.from({ length: 11 }, (_, i) => mk(i + 1)))).toBe(1);
+    expect(await pages(Array.from({ length: 12 }, (_, i) => mk(i + 1)))).toBe(2);
+    expect(await pages(Array.from({ length: 25 }, (_, i) => mk(i + 1)))).toBe(3);
+    expect(await pages([])).toBe(1);
+  });
+  it("copes with a long description, an unknown category and an odd province", async () => {
+    const bytes = await buildFormFromTemplate({
+      templateBytes: template, sub: { ...sub, province: "XX" },
+      lines: [{ ...mk(1, "weird"), description: "A very long description ".repeat(20) }],
+    });
+    expect(String.fromCharCode(...bytes.slice(0, 5))).toBe("%PDF-");
   });
 });

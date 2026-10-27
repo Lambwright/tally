@@ -60,7 +60,7 @@
 //  - Procore receives the NET (pre-tax) amount. Tax is applied downstream in NetSuite.
 
 import { neon } from "@neondatabase/serverless";
-import { buildExpenseFormPdf, expenseIdFor, torontoDate, GENERATED_FORM_NOTE } from "./expenseForm.js";
+import { buildExpenseFormPdf, buildFormFromTemplate, TEMPLATE_KEY, mdy, expenseIdFor, torontoDate, GENERATED_FORM_NOTE } from "./expenseForm.js";
 import {
   CATEGORY_TO_WBS_CODE,
   DIRECTCOST_VERIFIED,
@@ -330,6 +330,22 @@ function selfApprovalReason(user, sub) {
     return "the employee on this expense is you";
   }
   return null;
+}
+
+// "Whose expense is this?" for a general user: the ones they created, plus the ones where THEY are the employee,
+// even when it came in by email or somebody else submitted it for them. Matched by name (the same names-only rule as
+// the self-approval check, case and spacing ignored) or by the Procore user id HELM links to them / the one picked
+// in the employee dropdown. No migration: it works on expenses that already exist.
+const normName = (s) => String(s || "").toLowerCase().replace(/\s+/g, " ").trim();
+function viewerIdentity(user) {
+  const names = [...new Set([user?.displayName, `${user?.firstName || ""} ${user?.lastName || ""}`].map(normName).filter(Boolean))];
+  return { username: String(user?.username || "").toLowerCase(), names, procoreId: positiveInt(user?.fields?.procoreUser?.id) };
+}
+function isAboutViewer(viewer, sub) {
+  if (!viewer || !sub) return false;
+  const emp = [normName(sub.employee_name), normName(sub.form_employee_name)].filter(Boolean);
+  if (emp.some((n) => viewer.names.includes(n))) return true;
+  return !!viewer.procoreId && Number(sub.employee_procore_id) === viewer.procoreId;
 }
 
 function isServiceCaller(request, env) {
@@ -1582,14 +1598,24 @@ function likePattern(text) {
 //   project  part of a project number or name      employee  part of the employee's name
 //   from/to  YYYY-MM-DD, against the approved date (or created date if not approved), Toronto time
 //   sort     date | employee | project | amount | expense      dir  asc | desc
-async function handleList(url, sql, ownerFilter, me = null) {
+async function handleList(url, sql, viewer, me = null) {
   const sp = url.searchParams;
   const params = [];
   const add = (v) => { params.push(v); return "$" + params.length; };
   const where = [];
 
   if (sp.get("status")) where.push(`s.status = ${add(sp.get("status"))}`);
-  if (ownerFilter) where.push(`s.created_by = ${add(ownerFilter)}`);
+  if (viewer) {
+    // a general user: what they created, or what is about them (see viewerIdentity)
+    const u = add(viewer.username);
+    const names = add(viewer.names);
+    const pid = add(viewer.procoreId);
+    const squash = (col) => `lower(regexp_replace(trim(coalesce(${col}, '')), '\\s+', ' ', 'g'))`;
+    where.push(`(lower(s.created_by) = ${u}
+      or ${squash("s.employee_name")} = any(${names}::text[])
+      or ${squash("s.form_employee_name")} = any(${names}::text[])
+      or (${pid}::bigint is not null and s.employee_procore_id = ${pid}::bigint))`);
+  }
   where.push(`(s.status <> 'draft' or lower(s.created_by) = ${add(String(me || "").toLowerCase())})`);
   if (sp.get("mine") === "1") {
     const who = add(String(me || "").toLowerCase());
@@ -1623,6 +1649,7 @@ async function handleList(url, sql, ownerFilter, me = null) {
   // v1 of the Neon driver only takes tagged templates; a built-up query with $1 placeholders goes through sql.query
   const rows = await sql.query(
     `select ${SUB_SUMMARY},
+            (select count(*)::int from submissions x where x.created_by = s.created_by and x.created_at <= s.created_at) as creator_seq,
             coalesce(li.n, 0) as line_count, coalesce(li.net_total, 0) as net_total,
             coalesce(li.flag_count, 0) as line_flag_count
      from submissions s
@@ -1687,7 +1714,9 @@ async function handleExport(url, sql) {
 }
 
 async function handleDetail(id, sql, user) {
-  const [sub] = await sql`select * from submissions where id = ${id}`;
+  const [sub] = await sql`
+    select s.*, (select count(*)::int from submissions x where x.created_by = s.created_by and x.created_at <= s.created_at) as creator_seq
+    from submissions s where s.id = ${id}`;
   if (!sub) return json({ error: "not_found" }, 404);
   const line_items = await sql`select * from line_items where submission_id = ${id} order by row_index asc nulls last, created_at asc`;
   const receipts = await sql`
@@ -2122,7 +2151,19 @@ async function assignExpenseId(sql, sub) {
 async function writeExpenseForm(env, sql, sub, lines, { authorizedBy = null, authorizedDate = null } = {}) {
   const forms = await sql`select * from receipts where submission_id = ${sub.id} and kind = 'form'`;
   if (forms.some((f) => f.note !== GENERATED_FORM_NOTE)) return { kept: true };
-  const bytes = await buildExpenseFormPdf({ sub, lines, authorizedBy, authorizedDate });
+  // The form's date is the day it was made (the same day as its Expense ID), also when it is redrawn at approval.
+  const formDate = sub.submitted_for_review_at ? torontoDate(new Date(sub.submitted_for_review_at)) : torontoDate();
+  let bytes;
+  try {
+    // The real Einbau form, filled in (the blank lives in R2 at TEMPLATE_KEY)...
+    const template = await env.RECEIPTS.get(TEMPLATE_KEY);
+    if (!template) throw new Error(`the blank form isn't in R2 at ${TEMPLATE_KEY}`);
+    bytes = await buildFormFromTemplate({ templateBytes: new Uint8Array(await template.arrayBuffer()), sub, lines, authorizedBy, authorizedDate, formDate });
+  } catch (e) {
+    // ...and if that can't be done, a look-alike drawn from scratch rather than no form at all.
+    console.error("filling the real form failed, drawing the fallback:", e && e.message);
+    bytes = await buildExpenseFormPdf({ sub, lines, authorizedBy, authorizedDate, formDate });
+  }
   const key = `${crypto.randomUUID()}/Employee Expense Form - ${sub.expense_id}.pdf`;
   await env.RECEIPTS.put(key, bytes, { httpMetadata: { contentType: "application/pdf" } });
   for (const f of forms) {
@@ -2898,7 +2939,7 @@ async function routeRequest(request, env, ctx, sec) {
         const pmScoped = auth.isPmSubmitter && !auth.isReviewer;
 
         if (parts.length === 1 && request.method === "GET") {
-          return withRefresh(await handleList(url, sql, pmScoped ? auth.user.username : null, auth.user.username));
+          return withRefresh(await handleList(url, sql, pmScoped ? viewerIdentity(auth.user) : null, auth.user.username));
         }
         if (parts[1] === "upload" && parts.length === 2 && request.method === "POST") {
           return withRefresh(await handleUpload(request, env, sql, ctx, auth));
@@ -2912,9 +2953,10 @@ async function routeRequest(request, env, ctx, sec) {
           // everything past this point (view, edit, approve-attempt, delete,
           // line CRUD, receipts) is scoped by this one check.
           if (pmScoped) {
-            const [owned] = await sql`select created_by, status from submissions where id = ${subId}`;
+            const [owned] = await sql`select created_by, status, employee_name, form_employee_name, employee_procore_id from submissions where id = ${subId}`;
             if (!owned) return json({ error: "not_found" }, 404);
-            if ((owned.created_by || "").toLowerCase() !== auth.user.username.toLowerCase()) {
+            const isCreator = (owned.created_by || "").toLowerCase() === auth.user.username.toLowerCase();
+            if (!isCreator && !(request.method === "GET" && isAboutViewer(viewerIdentity(auth.user), owned))) {
               return json({ error: "forbidden", reason: "Not your submission." }, 403);
             }
             const denial = submitterDenial(request.method, seg === "approve" && url.searchParams.get("dryRun") === "1" ? "approve-preview" : seg, owned.status);
@@ -2987,6 +3029,8 @@ export default {
 
 // Exported for unit tests.
 export const _test = {
+  viewerIdentity,
+  isAboutViewer,
   handleRequestRevision,
   bumpForm,
   historyEvent,
@@ -3007,6 +3051,8 @@ export const _test = {
   pickApprovers,
   expenseIdFor,
   buildExpenseFormPdf,
+  buildFormFromTemplate,
+  mdy,
   torontoDate,
   positiveInt,
   resolveEmployeeId,

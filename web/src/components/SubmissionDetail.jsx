@@ -2,6 +2,8 @@ import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } fro
 import { api, fetchReceiptObjectUrl } from "../api.js";
 import RevisionModal from "./RevisionModal.jsx";
 import RevisionPopup, { revisionThread } from "./RevisionPopup.jsx";
+import DialogModal from "./DialogModal.jsx";
+import { shownExpenseId, isPendingId } from "../expenseLabel.js";
 import EditableText from "./EditableText.jsx";
 import DirectCostPreview from "./DirectCostPreview.jsx";
 import ParseProgress, { STALL_MS } from "./ParseProgress.jsx";
@@ -144,6 +146,7 @@ export default function SubmissionDetail({ id, onClose, onChanged, me }) {
   const cols = useLineColumnWidths();
   const [showSubmit, setShowSubmit] = useState(false);
   const [showThread, setShowThread] = useState(false);
+  const [dialog, setDialog] = useState(null); // TALLY's own confirm / ask-a-reason dialog (see DialogModal)
   const threadAutoShown = useRef(false);
   const [selectedLineIds, setSelectedLineIds] = useState(new Set());
   const [bulkCostCodeText, setBulkCostCodeText] = useState("");
@@ -210,9 +213,12 @@ export default function SubmissionDetail({ id, onClose, onChanged, me }) {
   }, [isParsing, load]);
   const lines = data?.line_items || [];
   const receipts = data?.receipts || [];
-  const actionable = sub && sub.status !== "approved" && sub.status !== "rejected";
   // Submit Expense replaces Approve for the person who made the expense: a draft, or one sent back to them.
   const isCreator = !!sub && !!me?.username && String(sub.created_by || "").toLowerCase() === String(me.username).toLowerCase();
+  // A general user can open an expense that is ABOUT them (it came in by email, or someone submitted it for them),
+  // but only its creator changes it.
+  const viewOnly = !!sub && !!me?.isPmSubmitter && !me?.isReviewer && !isCreator;
+  const actionable = sub && sub.status !== "approved" && sub.status !== "rejected" && !viewOnly;
   const canSubmit = !!sub && isCreator && (sub.status === "draft" || sub.status === "needs_revision");
   const canReassign = !!sub && !!me?.isReviewer && sub.status === "needs_review" && (!!sub.approver || isCreator);
 
@@ -366,25 +372,39 @@ export default function SubmissionDetail({ id, onClose, onChanged, me }) {
       setBusy(false);
     }
   }
-  async function handleReject() {
-    const reason = window.prompt("Reason for rejecting this form?");
-    if (!reason || !reason.trim()) return;
-    setBusy(true);
-    await mutate(() => api.reject(id, reason.trim()));
-    setBusy(false);
+  function handleReject() {
+    setDialog({
+      title: "Reject this expense",
+      body: "Say why. The reason stays on the expense, and the person who made it will see it.",
+      reason: { label: "Reason for rejecting", placeholder: "What's wrong with it?" },
+      confirmLabel: "Reject expense",
+      danger: true,
+      run: async (reason) => {
+        setBusy(true);
+        await mutate(() => api.reject(id, reason));
+        setBusy(false);
+      },
+    });
   }
-  async function handleDelete() {
-    if (!window.confirm(`Permanently delete ${sub.expense_id}? This removes the row, its lines, and the stored files — and frees the Expense ID.`)) return;
-    setBusy(true);
-    setActionError(null);
-    try {
-      await api.deleteSubmission(id);
-      onChanged?.();
-      onClose();
-    } catch (e) {
-      setActionError(e.data?.detail || e.message);
-      setBusy(false);
-    }
+  function handleDelete() {
+    setDialog({
+      title: "Delete this expense?",
+      body: `This permanently removes ${shownExpenseId(sub)}, its lines and its stored files, and frees its Expense ID. It can't be undone.`,
+      confirmLabel: "Delete it",
+      danger: true,
+      run: async () => {
+        setBusy(true);
+        setActionError(null);
+        try {
+          await api.deleteSubmission(id);
+          onChanged?.();
+          onClose();
+        } catch (e) {
+          setActionError(e.data?.detail || e.message);
+          setBusy(false);
+        }
+      },
+    });
   }
   async function handleRetryParse() {
     setBusy(true);
@@ -424,7 +444,7 @@ export default function SubmissionDetail({ id, onClose, onChanged, me }) {
       const url = URL.createObjectURL(new Blob([bytes], { type: "application/pdf" }));
       const a = document.createElement("a");
       a.href = url;
-      a.download = `${(sub.employee_name || "expense").replace(/[^A-Za-z0-9]+/g, "-")}_${sub.expense_id}.pdf`;
+      a.download = `${(sub.employee_name || "expense").replace(/[^A-Za-z0-9]+/g, "-")}_${isPendingId(sub) ? "pending" : sub.expense_id}.pdf`;
       a.click();
       setTimeout(() => URL.revokeObjectURL(url), 2000);
     } catch (e) {
@@ -455,26 +475,34 @@ export default function SubmissionDetail({ id, onClose, onChanged, me }) {
     }
   }
   async function handleReceiptOverride(line, enable) {
-    if (enable && !window.confirm(
-      `Post line ${line.row_index ?? ""} to Procore WITHOUT a receipt?
-
-This is recorded under your name, and the net is estimated from the claimed amount at the province tax rate.`
-    )) return;
-    await mutate(() => api.receiptOverride(id, line.id, enable));
+    if (!enable) return mutate(() => api.receiptOverride(id, line.id, enable));
+    setDialog({
+      title: `Post line ${line.row_index ?? ""} without a receipt?`,
+      body: "It posts to Procore with no receipt. This is recorded under your name, and the net is estimated from the claimed amount at the province tax rate.",
+      confirmLabel: "Waive the receipt",
+      run: () => mutate(() => api.receiptOverride(id, line.id, enable)),
+    });
   }
-  async function handleDeleteReceipt(receiptId) {
-    if (!window.confirm("Remove this attachment? Any line matched to it goes back to unmatched.")) return;
-    setBusy(true);
-    setActionError(null);
-    try {
-      await api.deleteReceipt(id, receiptId);
-      onChanged?.();
-      load();
-    } catch (e) {
-      setActionError(e.data?.detail || e.message);
-    } finally {
-      setBusy(false);
-    }
+  function handleDeleteReceipt(receiptId) {
+    setDialog({
+      title: "Remove this attachment?",
+      body: "Any line matched to it goes back to unmatched.",
+      confirmLabel: "Remove it",
+      danger: true,
+      run: async () => {
+        setBusy(true);
+        setActionError(null);
+        try {
+          await api.deleteReceipt(id, receiptId);
+          onChanged?.();
+          load();
+        } catch (e) {
+          setActionError(e.data?.detail || e.message);
+        } finally {
+          setBusy(false);
+        }
+      },
+    });
   }
 
   const toggleLineSelected = (lineId) =>
@@ -528,8 +556,10 @@ This is recorded under your name, and the net is estimated from the claimed amou
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 16 }}>
           <div>
             <div className="expense-id-heading">
-              <EditableText value={sub.expense_id} disabled={!actionable || isSubmitter}
-                onSave={(v) => v && mutate(() => api.patchSubmission(id, { expense_id: v }))} />
+              {isPendingId(sub)
+                ? <span title="It gets its real Expense ID when it is submitted">{shownExpenseId(sub)}</span>
+                : <EditableText value={sub.expense_id} disabled={!actionable || isSubmitter}
+                    onSave={(v) => v && mutate(() => api.patchSubmission(id, { expense_id: v }))} />}
             </div>
             <div style={{ fontSize: 17, marginTop: 6 }}>
               <EditableText value={sub.employee_name} placeholder="(no employee)" disabled={!actionable || isSubmitter}
@@ -549,7 +579,12 @@ This is recorded under your name, and the net is estimated from the claimed amou
         </div>
       </div>
 
-      {isSubmitter && (
+      {viewOnly && (
+        <div className="card row-secondary">
+          This expense is for you, but {sub.created_by ? `${String(sub.created_by).split("@")[0]} submitted it` : "it came in by email"}. You can follow it here; they're the one who changes it.
+        </div>
+      )}
+      {isSubmitter && !viewOnly && (
         <div className="card" style={{ color: sub.status === "approved" ? "var(--green)" : sub.status === "needs_revision" || sub.status === "rejected" ? "var(--red)" : "var(--yellow)" }}>
           {sub.status === "needs_review" && "Submitted — waiting on an admin's approval. Add a line for each expense and attach its receipt."}
           {sub.status === "approved" && "Approved and posted. It can't be changed now."}
@@ -896,7 +931,7 @@ This is recorded under your name, and the net is estimated from the claimed amou
             <button className="btn btn-danger" disabled={busy} onClick={handleReject}>Reject</button>
           </>
         )}
-        {!(isSubmitter && sub.status === "approved") && (
+        {!viewOnly && !(isSubmitter && sub.status === "approved") && (
           <button className="btn btn-danger" disabled={busy} onClick={handleDelete}
             title="Permanently remove this submission and free its Expense ID" style={{ marginLeft: "auto" }}>
             Delete
@@ -965,7 +1000,9 @@ This is recorded under your name, and the net is estimated from the claimed amou
         </div>
       )}
 
-      {showThread && <RevisionPopup thread={thread} expenseId={sub.expense_id} onClose={() => setShowThread(false)} />}
+      {dialog && <DialogModal dialog={dialog} onClose={() => setDialog(null)} />}
+
+      {showThread && <RevisionPopup thread={thread} expenseId={shownExpenseId(sub)} onClose={() => setShowThread(false)} />}
 
       {showRevision && (
         <RevisionModal

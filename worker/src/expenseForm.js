@@ -187,3 +187,122 @@ export async function buildExpenseFormPdf({ sub, lines, authorizedBy = null, aut
 
   return doc.save();
 }
+
+// ---------------------------------------------------------------------------
+// The REAL form, filled in. The blank Einbau Employee Expense Form is a fillable PDF (Procore Forms), kept in R2 at
+// TEMPLATE_KEY (source copy: worker/assets/employee-expense-form-template.pdf). TALLY fills its fields, so the result
+// looks exactly like a form the submitter filled in themselves. buildExpenseFormPdf above (a look-alike drawn from
+// scratch) is only the fallback when the template can't be read.
+// ---------------------------------------------------------------------------
+
+export const TEMPLATE_KEY = "templates/employee-expense-form.pdf";
+const FORM_ROWS = 11; // the form has eleven line rows; more lines go on further copies of the form
+
+// the form's category columns -> its field names
+const FORM_COLS = [
+  { key: "parking", value: "Parking Value", sub: "ParkingSubtotal", net: "ParkingNetTotal" },
+  { key: "materials", value: "Materials Value", sub: "MaterialsSubtotal", net: "Materials Net Total" },
+  { key: "fuel", value: "Fuel Value", sub: "FuelSubtotal", net: "Fuel Net Total" },
+  { key: "mileage", value: "Mileage Value", sub: "MileageSubtotal", net: "Mileage Net Total", plain: true },
+  { key: "per_diem", value: "Per Diem Value", sub: "PerDiemSubtotal", net: "Per Diem Net Total" },
+  { key: "other", value: "Other Value", sub: "OtherSubtotal", net: "Other Net Total" },
+];
+
+// M/D/YY, the way the form shows dates
+export function mdy(v) {
+  const iso = isoDate(v);
+  if (!iso) return "";
+  const [y, m, d] = iso.split("-");
+  return `${Number(m)}/${Number(d)}/${y.slice(2)}`;
+}
+const dollars = (n) => `$ ${Number(n || 0).toFixed(2)}`;
+
+// templateBytes: the blank form. Returns the filled form as PDF bytes (one page per 11 lines, flattened, so it
+// looks the same in any viewer and the numbers can't be edited by accident).
+export async function buildFormFromTemplate({ templateBytes, sub, lines, authorizedBy = null, authorizedDate = null, formDate = null }) {
+  const ordered = [...lines].sort((a, b) => (a.row_index ?? 0) - (b.row_index ?? 0));
+  const chunks = [];
+  for (let i = 0; i < ordered.length; i += FORM_ROWS) chunks.push(ordered.slice(i, i + FORM_ROWS));
+  if (!chunks.length) chunks.push([]);
+
+  const out = await PDFDocument.create();
+  const outFont = await out.embedFont(StandardFonts.Helvetica);
+  const known = new Set(FORM_COLS.map((c) => c.key));
+  const grand = { gross: 0, net: 0 };
+  const prov = String(sub.province || "").toUpperCase();
+  const provinceName = prov === "PE" ? "PEI" : PROVINCES[prov] || "";
+
+  for (let page = 0; page < chunks.length; page++) {
+    const doc = await PDFDocument.load(templateBytes, { ignoreEncryption: true });
+    const font = await doc.embedFont(StandardFonts.Helvetica);
+    const form = doc.getForm();
+    // an explicit type size on every field: left on auto, the form shrinks short values to a speck
+    const set = (name, value, size = 8) => {
+      const tf = form.getTextField(name);
+      tf.acroField.setDefaultAppearance(`/Helv ${size} Tf 0 g`);
+      tf.setText(String(value ?? ""));
+    };
+
+    set("UserName", safe(sub.employee_name || ""));
+    set("Date", mdy(formDate) || mdy(torontoDate()));
+    set("JobNumber", safe(sub.project_number || ""));
+    set("AutoID", safe(sub.expense_id || ""));
+    const dd = form.getDropdown("Dropdown17");
+    if (provinceName && dd.getOptions().includes(provinceName)) dd.select(provinceName);
+    if (authorizedDate) set("Date Authorized", mdy(authorizedDate));
+
+    const gross = Object.fromEntries(FORM_COLS.map((c) => [c.key, 0]));
+    const net = Object.fromEntries(FORM_COLS.map((c) => [c.key, 0]));
+    chunks[page].forEach((l, i) => {
+      const r = i + 1;
+      const key = known.has(l.category) ? l.category : "other";
+      const col = FORM_COLS.find((c) => c.key === key);
+      const g = Number(l.gross_amount) || 0;
+      gross[key] += g;
+      net[key] += Number(l.net_amount) || 0;
+      set(`Date ${r}`, mdy(l.line_date), 7.5);
+      // the description box is one line, 198 pt wide: shrink the type a little, then cut it with an ellipsis
+      const desc = form.getTextField(`Description ${r}`);
+      let text = safe(l.description || "");
+      let size = 7;
+      while (size > 5.5 && font.widthOfTextAtSize(text, size) > 192) size -= 0.5;
+      while (text.length > 1 && font.widthOfTextAtSize(text, size) > 192) text = text.slice(0, -1);
+      if (text !== safe(l.description || "")) text = text.slice(0, -1) + "…";
+      desc.acroField.setDefaultAppearance(`/Helv ${size} Tf 0 g`); // these boxes have no default appearance of their own
+      desc.setText(text.replace(/…/g, "..."));
+      set(`${col.value} ${r}`, col.plain ? Number(g).toFixed(2) : dollars(g), 7.5);
+    });
+    for (const c of FORM_COLS) {
+      set(c.sub, c.plain ? gross[c.key].toFixed(2) : dollars(gross[c.key]), 7.5);
+      set(c.net, c.plain ? net[c.key].toFixed(2) : dollars(net[c.key]), 7.5);
+    }
+    const pageGross = FORM_COLS.reduce((a, c) => a + (c.plain ? 0 : gross[c.key]), 0);
+    const pageNet = FORM_COLS.reduce((a, c) => a + (c.plain ? 0 : net[c.key]), 0);
+    grand.gross += pageGross;
+    grand.net += pageNet;
+    set("Expense Total", dollars(pageGross), 8.5);
+
+    // Authorized By is a signature field: it can't hold text, so write the name where it sits
+    const sig = form.getSignature("Signature13");
+    const rect = sig.acroField.getWidgets()[0].getRectangle();
+    form.removeField(sig);
+    form.updateFieldAppearances(font);
+    form.flatten();
+    const p = doc.getPage(0);
+    if (authorizedBy) p.drawText(safe(authorizedBy), { x: rect.x + 3, y: rect.y + 2, size: 8, font, color: rgb(0, 0, 0) });
+
+    const [copied] = await out.copyPages(doc, [0]);
+    out.addPage(copied);
+  }
+
+  if (chunks.length > 1) {
+    out.getPages().forEach((p, i) => {
+      const label = `Page ${i + 1} of ${chunks.length}. Each page totals its own lines.`;
+      p.drawText(label, { x: 54, y: 24, size: 8, font: outFont, color: rgb(0.35, 0.35, 0.35) });
+      if (i === chunks.length - 1) {
+        p.drawText(`All ${chunks.length} pages: ${dollars(grand.gross)} gross, ${dollars(grand.net)} net`, { x: 54, y: 13, size: 8, font: outFont, color: rgb(0.35, 0.35, 0.35) });
+      }
+    });
+  }
+  return out.save();
+}
