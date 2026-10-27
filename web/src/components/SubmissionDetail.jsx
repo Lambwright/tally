@@ -61,6 +61,55 @@ function money(n, currency = "CAD") {
   }
 }
 
+// The lines table's columns. `w` is the starting width in px; drag the edge of a header to resize (double-click
+// the edge to put one back). Widths are remembered in this browser. The tick box and delete columns are fixed.
+const LINE_COLS = [
+  { key: "sel", w: 38, fixed: true },
+  { key: "date", label: "Date", w: 150 },
+  { key: "desc", label: "Description", w: 230 },
+  { key: "cat", label: "Category", w: 110 },
+  { key: "gross", label: "Gross", w: 90 },
+  { key: "receipt", label: "Receipt", w: 180 },
+  { key: "net", label: "Net", w: 90 },
+  { key: "code", label: "Cost code", w: 170 },
+  { key: "tax", label: "Tax code", w: 120 },
+  { key: "flags", label: "Flags", w: 170 },
+  { key: "del", w: 42, fixed: true },
+];
+const COLS_KEY = "tally_line_cols_v1";
+const MIN_COL = 56;
+
+function useLineColumnWidths() {
+  const defaults = useMemo(() => Object.fromEntries(LINE_COLS.map((c) => [c.key, c.w])), []);
+  const [widths, setWidths] = useState(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem(COLS_KEY) || "{}");
+      return { ...defaults, ...Object.fromEntries(Object.entries(saved).filter(([k, v]) => k in defaults && Number.isFinite(v) && v >= MIN_COL)) };
+    } catch {
+      return defaults;
+    }
+  });
+  const save = (next) => {
+    try { localStorage.setItem(COLS_KEY, JSON.stringify(next)); } catch { /* storage blocked: it just won't be remembered */ }
+  };
+  const startResize = (key) => (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const startX = e.clientX;
+    const startW = widths[key];
+    const move = (ev) => setWidths((w) => ({ ...w, [key]: Math.max(MIN_COL, Math.round(startW + ev.clientX - startX)) }));
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      setWidths((w) => { save(w); return w; });
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  };
+  const reset = (key) => setWidths((w) => { const next = { ...w, [key]: defaults[key] }; save(next); return next; });
+  return { widths, startResize, reset };
+}
+
 function FlagList({ flags }) {
   if (!flags || !flags.length) return null;
   return (
@@ -91,6 +140,7 @@ export default function SubmissionDetail({ id, onClose, onChanged, me }) {
   const [lightboxIdx, setLightboxIdx] = useState(null);
   const [newLine, setNewLine] = useState({ line_date: "", description: "", category: "materials", gross_amount: "" });
   const [addOpen, setAddOpen] = useState(false);
+  const cols = useLineColumnWidths();
   const [showSubmit, setShowSubmit] = useState(false);
   const [selectedLineIds, setSelectedLineIds] = useState(new Set());
   const [bulkCostCodeText, setBulkCostCodeText] = useState("");
@@ -553,15 +603,25 @@ This is recorded under your name, and the net is estimated from the claimed amou
         )}
 
         <div style={{ overflowX: "auto" }}>
-          <table className="lines-table">
+          <table className="lines-table is-resizable"
+            style={{ width: LINE_COLS.reduce((a, c) => a + cols.widths[c.key], 0), minWidth: 0 }}>
+            <colgroup>
+              {LINE_COLS.map((c) => <col key={c.key} style={{ width: cols.widths[c.key] }} />)}
+            </colgroup>
             <thead>
               <tr>
                 <th>{actionable && (
                   <input type="checkbox" checked={allLinesSelected} onChange={toggleSelectAllLines}
                     aria-label="Select all lines" />
                 )}</th>
-                <th>Date</th><th>Description</th><th>Category</th><th>Gross</th>
-                <th>Receipt</th><th>Net</th><th>Cost code</th><th>Tax code</th><th>Flags</th><th></th>
+                {LINE_COLS.filter((c) => !c.fixed).map((c) => (
+                  <th key={c.key}>
+                    {c.label}
+                    <span className="col-resizer" title="Drag to resize · double-click to reset"
+                      onPointerDown={cols.startResize(c.key)} onDoubleClick={() => cols.reset(c.key)} />
+                  </th>
+                ))}
+                <th></th>
               </tr>
             </thead>
             <tbody>

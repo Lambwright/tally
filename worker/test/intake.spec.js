@@ -5,6 +5,7 @@ const {
   extractExpenseId,
   readAttachments,
   pageRange,
+  attachSubmissionFiles,
   compareCodes,
   expenseIdFor,
   buildExpenseFormPdf,
@@ -844,5 +845,58 @@ describe("compareCodes (cost codes in numeric order)", () => {
     const w = (id, code, cc) => ({ id, flat_code: code, segment_items: [seg("cost_code", cc), seg("line_item_type", 1)] });
     const out = budgetedCodes([w(1, "59-01-06-10.O", 3), w(2, "49-01-05-05.L", 1), w(3, "55.MH", 2)], [1, 2, 3].map((n) => ({ cost_code: { id: n }, line_item_type: { id: 1 } })));
     expect(out.map((x) => x.code)).toEqual(["49-01-05-05.L", "55.MH", "59-01-06-10.O"]);
+  });
+});
+
+describe("attachSubmissionFiles (checks the Direct Cost really shows the files)", () => {
+  const rows = [{ r2_key: "k/Form.pdf" }, { r2_key: "k/Receipts.pdf" }, { r2_key: "k/Receipts.pdf" }]; // two files, one shared by two receipts
+  const makeEnv = () => ({
+    PROCORE_API_BASE: "https://p.test", PROCORE_COMPANY_ID: "1", ATTACH_SETTLE_MS: 0,
+    RECEIPTS: { get: async () => ({ arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer, httpMetadata: { contentType: "application/pdf" } }) },
+  });
+  // a pretend Procore: counts attachments; "mode" decides which attach style actually links files
+  const pretendProcore = (mode) => {
+    const calls = [];
+    let attached = 0;
+    globalThis.fetch = async (url, init = {}) => {
+      url = String(url);
+      calls.push(`${init.method || "GET"} ${url.replace("https://p.test", "")}`);
+      const ok = (body) => ({ ok: true, status: 200, headers: { get: () => null }, text: async () => JSON.stringify(body) });
+      if (url.includes("/uploads")) return ok({ url: "https://store.test/up", uuid: "u-" + calls.length, fields: {} });
+      if (url.startsWith("https://store.test")) return ok({});
+      if (init.method === "PATCH") {
+        if (init.body instanceof FormData) { if (mode === "multipart") attached += init.body.getAll("attachments[]").length; }
+        else if (mode === "upload_ids") attached += JSON.parse(init.body).item.upload_ids.length;
+        return ok({});
+      }
+      return ok({ id: 1, attachments_count: attached });
+    };
+    return calls;
+  };
+  const real = globalThis.fetch;
+
+  it("multipart works: both files attached once each, no second way tried", async () => {
+    const calls = pretendProcore("multipart");
+    try {
+      const r = await attachSubmissionFiles(makeEnv(), "tok", "p1", "dc1", rows);
+      expect(r.map((x) => x.ok)).toEqual([true, true]);
+      expect(calls.some((c) => c.includes("/uploads"))).toBe(false);
+    } finally { globalThis.fetch = real; }
+  });
+  it("multipart is accepted but nothing links: falls back to upload + upload_ids and reports success if that shows up", async () => {
+    pretendProcore("upload_ids");
+    try {
+      const r = await attachSubmissionFiles(makeEnv(), "tok", "p1", "dc1", rows);
+      expect(r.map((x) => x.ok)).toEqual([true, true]);
+    } finally { globalThis.fetch = real; }
+  });
+  it("neither way links the files: both reported failed, with both reasons", async () => {
+    pretendProcore("none");
+    try {
+      const r = await attachSubmissionFiles(makeEnv(), "tok", "p1", "dc1", rows);
+      expect(r.every((x) => x.ok === false)).toBe(true);
+      expect(r[0].error).toMatch(/Neither way attached/);
+      expect(r[0].error).toMatch(/multipart attach answered OK/);
+    } finally { globalThis.fetch = real; }
   });
 });

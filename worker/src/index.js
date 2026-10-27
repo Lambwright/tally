@@ -724,44 +724,93 @@ async function procoreAttachUploadsToDirectCost(env, token, projectId, directCos
   return text ? JSON.parse(text) : {};
 }
 
-// Upload every stored file for a submission and attach them to its Direct
-// Cost, batched into one association call. Per-file create/upload failures
-// don't block the others; if the final association call itself fails, every
-// otherwise-successful file is marked failed too since none of them actually
-// ended up on the Direct Cost.
+// How many files the Direct Cost shows. Procore can answer 200 to an attach and still not link the files, so
+// every attach is checked by reading this back.
+async function directCostAttachmentCount(env, token, projectId, directCostId) {
+  const dc = await procoreFetch(env, token, `/rest/v1.0/projects/${projectId}/direct_costs/${directCostId}`).catch(() => null);
+  const n = Number(dc?.attachments_count ?? (Array.isArray(dc?.attachments) ? dc.attachments.length : NaN));
+  return Number.isFinite(n) ? n : null;
+}
+
+// Strategy 1 (Procore's documented way): update the Direct Cost with the files themselves as multipart
+// `attachments[]`. files: [{ bytes, contentType, filename }].
+async function procoreAttachMultipart(env, token, projectId, directCostId, files) {
+  const form = new FormData();
+  for (const f of files) form.append("attachments[]", new Blob([f.bytes], { type: f.contentType || "application/octet-stream" }), f.filename);
+  const res = await fetchWith429Retry(`${env.PROCORE_API_BASE}/rest/v1.0/projects/${projectId}/direct_costs/${directCostId}`, {
+    method: "PATCH",
+    headers: { Accept: "application/json", Authorization: `Bearer ${token}`, "Procore-Company-Id": env.PROCORE_COMPANY_ID },
+    body: form, // no Content-Type: fetch sets the multipart boundary itself
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    const err = new Error(`Procore multipart attach PATCH -> ${res.status}: ${text.slice(0, 300)}`);
+    err.status = res.status;
+    throw err;
+  }
+}
+
+// Upload every stored file for a submission and attach it to the Direct Cost, then CHECK that the Direct Cost
+// really shows them. Two ways, in order: the files straight onto the Direct Cost (multipart), and if that doesn't
+// show up, the Uploads API two-step (upload, then link by upload_ids). Whichever doesn't verify says why.
 async function attachSubmissionFiles(env, token, projectId, directCostId, receiptRows) {
   const attachResults = [];
-  const uploaded = []; // { key, uuid }
-  // several receipt records can share one stored file — attach each file once
+  // several receipt records can share one stored file: attach each file once
   const onePerFile = [...new Map(receiptRows.map((r) => [r.r2_key, r])).values()];
+  const files = [];
   for (const r of onePerFile) {
     try {
       const obj = await env.RECEIPTS.get(r.r2_key);
       if (!obj) throw new Error("object missing from R2");
-      const bytes = new Uint8Array(await obj.arrayBuffer());
-      const uuid = await procoreCreateAndUploadFile(env, token, projectId, {
-        bytes, contentType: obj.httpMetadata?.contentType, filename: r.r2_key.split("/").pop(),
+      files.push({
+        key: r.r2_key, bytes: new Uint8Array(await obj.arrayBuffer()),
+        contentType: obj.httpMetadata?.contentType, filename: r.r2_key.split("/").pop(),
       });
-      uploaded.push({ key: r.r2_key, uuid });
     } catch (e) {
       attachResults.push({ key: r.r2_key, ok: false, error: e.message });
     }
   }
-  if (uploaded.length) {
+  if (!files.length) return attachResults;
+
+  const before = (await directCostAttachmentCount(env, token, projectId, directCostId)) ?? 0;
+  const expected = before + files.length;
+  const settle = () => new Promise((r) => setTimeout(r, Number(env.ATTACH_SETTLE_MS ?? 2000))); // Procore links files a moment after the call
+  const failAll = (error) => files.forEach((f) => attachResults.push({ key: f.key, ok: false, error }));
+  const okAll = () => files.forEach((f) => attachResults.push({ key: f.key, ok: true }));
+
+  // 1. multipart
+  let why1;
+  try {
+    await procoreAttachMultipart(env, token, projectId, directCostId, files);
+    await settle();
+    const shown = await directCostAttachmentCount(env, token, projectId, directCostId);
+    if (shown === null || shown >= expected) { okAll(); return attachResults; }
+    why1 = `multipart attach answered OK but the Direct Cost shows ${shown} file(s), expected ${expected}`;
+  } catch (e) {
+    why1 = e.message;
+  }
+
+  // 2. Uploads API + upload_ids
+  const uploaded = [];
+  for (const f of files) {
     try {
-      await procoreAttachUploadsToDirectCost(env, token, projectId, directCostId, uploaded.map((u) => u.uuid));
-      // Procore can answer 200 and still not link the files, so look: the Direct Cost must now show them.
-      await new Promise((r) => setTimeout(r, 1500));
-      const dc = await procoreFetch(env, token, `/rest/v1.0/projects/${projectId}/direct_costs/${directCostId}`).catch(() => null);
-      const shown = Number(dc?.attachments_count ?? (Array.isArray(dc?.attachments) ? dc.attachments.length : NaN));
-      if (Number.isFinite(shown) && shown < uploaded.length) {
-        uploaded.forEach((u) => attachResults.push({ key: u.key, ok: false, error: `Procore accepted the upload but the Direct Cost shows ${shown} attachment(s), expected ${uploaded.length}` }));
-      } else {
-        uploaded.forEach((u) => attachResults.push({ key: u.key, ok: true }));
-      }
+      uploaded.push({ key: f.key, uuid: await procoreCreateAndUploadFile(env, token, projectId, f) });
     } catch (e) {
-      uploaded.forEach((u) => attachResults.push({ key: u.key, ok: false, error: `Uploaded but not attached — ${e.message}` }));
+      attachResults.push({ key: f.key, ok: false, error: `${e.message} (after: ${why1})` });
     }
+  }
+  if (!uploaded.length) return attachResults;
+  try {
+    await procoreAttachUploadsToDirectCost(env, token, projectId, directCostId, uploaded.map((u) => u.uuid));
+    await settle();
+    const shown = await directCostAttachmentCount(env, token, projectId, directCostId);
+    if (shown === null || shown >= expected) {
+      uploaded.forEach((u) => attachResults.push({ key: u.key, ok: true }));
+    } else {
+      uploaded.forEach((u) => attachResults.push({ key: u.key, ok: false, error: `Neither way attached the file. (1) ${why1}. (2) the upload-and-link way answered OK but the Direct Cost shows ${shown} file(s), expected ${expected}.` }));
+    }
+  } catch (e) {
+    uploaded.forEach((u) => attachResults.push({ key: u.key, ok: false, error: `Neither way attached the file. (1) ${why1}. (2) ${e.message}` }));
   }
   return attachResults;
 }
@@ -2857,6 +2906,7 @@ export default {
 
 // Exported for unit tests.
 export const _test = {
+  attachSubmissionFiles,
   compareCodes,
   budgetedCodes,
   visitorHeaders,
