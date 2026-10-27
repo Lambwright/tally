@@ -31,6 +31,9 @@ export default function QueueList({ submissions, loading, onSelect, showStatus =
             <div>
               <div className="row-primary">{s.employee_name || s.employee_email || "(unknown employee)"}</div>
               <div className="row-secondary">{s.expense_id}</div>
+              {s.resubmitted_at && s.status === "needs_review" && (
+                <div><span className="badge badge-resubmitted" title="Sent back for a revision and re-submitted">Re-submitted</span></div>
+              )}
               {s.approver && s.status === "needs_review" && (
                 <div className="row-secondary">→ {String(s.approver).split("@")[0].replace(/^./, (c) => c.toUpperCase())}</div>
               )}

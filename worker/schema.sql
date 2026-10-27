@@ -51,6 +51,8 @@ create table submissions (
   -- Who must approve it, set by Submit Expense (Einbau ID username); null = any admin (email intake).
   approver text,
   submitted_for_review_at timestamptz,
+  -- Set when the creator re-submits after a revision request (see migration_011.sql).
+  resubmitted_at timestamptz,
 
   -- Where this row came from. 'pm_direct' is a PM submitting their own cost
   -- with no PDF form — Approve is gated to PM_APPROVERS for those (see

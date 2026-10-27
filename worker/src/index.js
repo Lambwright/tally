@@ -1030,8 +1030,8 @@ function sumTaxLines(taxLines) {
   return Math.round(taxLines.reduce((s, t) => s + (Number(t.amount) || 0), 0) * 100) / 100;
 }
 
-function historyEvent(type, text) {
-  return { at: new Date().toISOString(), type, text };
+function historyEvent(type, text, extra = {}) {
+  return { at: new Date().toISOString(), type, text, ...extra };
 }
 
 const round2 = (n) => Math.round(n * 100) / 100;
@@ -1556,7 +1556,7 @@ async function parseSubmission(env, sql, submissionId, { files }) {
 const SUB_SUMMARY = `
   s.id, s.expense_id, s.employee_name, s.employee_email, s.province,
   s.project_number, s.project_name, s.project_stage, s.status, s.flags,
-  s.origin, s.created_by, s.approver, s.submitted_for_review_at,
+  s.origin, s.created_by, s.approver, s.submitted_for_review_at, s.resubmitted_at,
   s.reviewed_by, s.reviewed_at, s.procore_direct_cost_id, s.submitted_at, s.created_at, s.updated_at`;
 
 // `ownerFilter`: a username to scope the list to (submitter-level callers
@@ -1842,11 +1842,12 @@ async function resyncLinesForReceipt(sql, subId, receiptId, province, project) {
   }
 }
 
+// Adds a history entry. It does NOT change the status: it used to flip any open expense to needs_review on every
+// edit, which silently turned drafts into queue items and un-sent-back revision requests.
 async function bumpForm(sql, submissionId, event) {
   await sql`
     update submissions
     set history = coalesce(history, '[]'::jsonb) || ${JSON.stringify([event])}::jsonb,
-        status = case when status in ('approved', 'rejected') then status else 'needs_review' end,
         updated_at = now()
     where id = ${submissionId}`;
 }
@@ -2233,6 +2234,14 @@ async function handleSubmitForReview(subId, request, env, sql, user, isReviewer)
   const chosen = eligible.find((r) => r.username.toLowerCase() === wanted);
   if (!chosen) return json({ error: "not_an_approver", detail: "That person can't approve this expense (they aren't a TALLY approver, or the expense is theirs)." }, 422);
 
+  // Sent back for a revision: the creator says what they changed (or why it stands), and that reply goes to the
+  // approver with the expense.
+  const isResubmit = sub.status === "needs_revision";
+  const reply = String(body.reply || "").trim().slice(0, 4000);
+  if (isResubmit && !reply) {
+    return json({ error: "reply_required", detail: "Tell the approver what you changed, or why it's fine as it is. They'll see your reply when they open it." }, 400);
+  }
+
   if ((sub.flags || []).some((f) => f.code === "parsing")) return json({ error: "still_parsing", detail: "Claude is still reading the files. Wait for it to finish." }, 409);
   const dupFlag = (sub.flags || []).find((f) => f.code === "duplicate_expense_id");
   if (dupFlag) return json({ error: "duplicate_expense_id", detail: dupFlag.detail }, 409);
@@ -2291,7 +2300,12 @@ async function handleSubmitForReview(subId, request, env, sql, user, isReviewer)
   }
 
   const verb = sub.status === "needs_review" ? "reassigned to" : sub.status === "needs_revision" ? "resubmitted to" : "submitted to";
-  await sql`update submissions set status = 'needs_review', approver = ${chosen.username}, submitted_for_review_at = now(), updated_at = now() where id = ${subId}`;
+  await sql`update submissions set status = 'needs_review', approver = ${chosen.username}, submitted_for_review_at = now(),
+    resubmitted_at = case when ${isResubmit} then now() else resubmitted_at end, updated_at = now() where id = ${subId}`;
+  if (isResubmit) {
+    const who = user.displayName || user.username;
+    await bumpForm(sql, subId, historyEvent("revision_reply", `${who} replied: ${reply}`, { by: user.username, name: who, message: reply }));
+  }
   await bumpForm(sql, subId, historyEvent("submitted", `${user.username} ${verb} ${chosen.displayName} for approval`));
   const [fresh] = await sql`select * from submissions where id = ${subId}`;
   return json({ submission: fresh, approver: chosen });
@@ -2329,6 +2343,9 @@ async function handleApprove(subId, url, request, env, sql, user, isPmApprover) 
   // A draft has not been submitted yet, and a submitted one is for its chosen approver to approve.
   if (!dryRun && sub.status === "draft") {
     return json({ error: "not_submitted", detail: "This expense is still a draft — submit it first." }, 409);
+  }
+  if (!dryRun && sub.status === "needs_revision") {
+    return json({ error: "sent_back", detail: "This expense was sent back for a revision. It can be approved once its creator re-submits it." }, 409);
   }
   if (!dryRun && sub.approver && !canApprovePortalExpense(user)) {
     return json({ error: "not_portal_approver", detail: "You no longer have the permission to approve portal expenses." }, 403);
@@ -2557,30 +2574,32 @@ async function handleRetryAttachments(subId, env, sql, user) {
   return json({ submission: row, attachments: attachResults });
 }
 
+// POST /submissions/:id/request-revision { note } — for expenses submitted in the TALLY portal only. The note goes
+// back to the person who made the expense as a message they see in TALLY (a pop-up when they open it), and is kept
+// in the expense's history together with who sent it. Emailed expenses go back by email, outside this button.
 async function handleRequestRevision(subId, request, sql, user) {
   const body = await parseBody(request).catch(() => ({}));
-  const note = (body.note || "").trim();
-  if (!note) return json({ error: "note_required" }, 400);
+  const note = String(body.note || "").trim().slice(0, 4000);
+  if (!note) return json({ error: "note_required", detail: "Say what needs to change." }, 400);
   const [sub] = await sql`select * from submissions where id = ${subId}`;
   if (!sub) return json({ error: "not_found" }, 404);
+  if (sub.origin === "email") {
+    return json({ error: "email_expense", detail: "This expense came in by email, so a revision goes back by email too. This button is for expenses submitted in the TALLY portal." }, 422);
+  }
+  if (sub.status !== "needs_review") {
+    return json({ error: "wrong_status", detail: `This expense is ${sub.status}; a revision can only be requested while it is waiting for review.` }, 409);
+  }
+  if (sub.approver && String(sub.approver).toLowerCase() !== String(user.username || "").toLowerCase()) {
+    return json({ error: "not_assigned", detail: `This expense is assigned to ${sub.approver}, so they ask for the revision.` }, 409);
+  }
 
-  const replySubject = `RE: Expense ${sub.expense_id} — revision requested`;
-  const hist = [...(sub.history || []), historyEvent("revision_requested", `${user.username}: ${note}`)];
+  const name = user.displayName || user.username;
+  const hist = [...(sub.history || []), historyEvent("revision_requested", `${name} asked for a revision: ${note}`, { by: user.username, name, message: note })];
   const [row] = await sql`
     update submissions set status = 'needs_revision', revision_note = ${note},
       reviewed_by = ${user.username}, reviewed_at = now(), history = ${JSON.stringify(hist)}::jsonb, updated_at = now()
-    where id = ${subId} returning id, status, expense_id`;
-
-  // The worker does NOT send mail (PA is intake-only). The reviewer sends this
-  // reply from Outlook; keeping the Expense ID in the subject is what routes the
-  // employee's reply back onto this form.
-  return json({
-    submission: row,
-    reply: {
-      subject: replySubject,
-      body: `Hi${sub.employee_name ? " " + sub.employee_name.split(" ")[0] : ""},\n\nWe need a revision on expense ${sub.expense_id} before we can process it:\n\n${note}\n\nPlease reply to this email (keep the subject line as-is) with the corrected form or receipts.\n\nThanks.`,
-    },
-  });
+    where id = ${subId} returning id, status, expense_id, created_by`;
+  return json({ submission: row });
 }
 
 async function handleReject(subId, request, sql, user) {
@@ -2968,6 +2987,9 @@ export default {
 
 // Exported for unit tests.
 export const _test = {
+  handleRequestRevision,
+  bumpForm,
+  historyEvent,
   chooseExpenseId,
   handleList,
   likePattern,

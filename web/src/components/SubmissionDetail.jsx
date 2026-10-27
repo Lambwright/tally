@@ -1,6 +1,7 @@
 import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, fetchReceiptObjectUrl } from "../api.js";
 import RevisionModal from "./RevisionModal.jsx";
+import RevisionPopup, { revisionThread } from "./RevisionPopup.jsx";
 import EditableText from "./EditableText.jsx";
 import DirectCostPreview from "./DirectCostPreview.jsx";
 import ParseProgress, { STALL_MS } from "./ParseProgress.jsx";
@@ -142,6 +143,8 @@ export default function SubmissionDetail({ id, onClose, onChanged, me }) {
   const [addOpen, setAddOpen] = useState(false);
   const cols = useLineColumnWidths();
   const [showSubmit, setShowSubmit] = useState(false);
+  const [showThread, setShowThread] = useState(false);
+  const threadAutoShown = useRef(false);
   const [selectedLineIds, setSelectedLineIds] = useState(new Set());
   const [bulkCostCodeText, setBulkCostCodeText] = useState("");
 
@@ -212,6 +215,17 @@ export default function SubmissionDetail({ id, onClose, onChanged, me }) {
   const isCreator = !!sub && !!me?.username && String(sub.created_by || "").toLowerCase() === String(me.username).toLowerCase();
   const canSubmit = !!sub && isCreator && (sub.status === "draft" || sub.status === "needs_revision");
   const canReassign = !!sub && !!me?.isReviewer && sub.status === "needs_review" && (!!sub.approver || isCreator);
+
+  // The revision conversation (requests and replies, oldest first). It pops up by itself for whoever the expense is
+  // waiting on: the creator when it was sent back, the approver when it came back re-submitted.
+  const thread = useMemo(() => revisionThread(sub?.history), [sub?.history]);
+  const sentBackToMe = !!sub && isCreator && sub.status === "needs_revision";
+  const resubmittedToMe = !!sub && !!me?.isReviewer && !isCreator && sub.status === "needs_review" && !!sub.resubmitted_at;
+  useEffect(() => {
+    if (threadAutoShown.current || !thread.length || !(sentBackToMe || resubmittedToMe)) return;
+    threadAutoShown.current = true;
+    setShowThread(true);
+  }, [thread.length, sentBackToMe, resubmittedToMe]);
 
   // cost codes
   useEffect(() => {
@@ -538,12 +552,27 @@ This is recorded under your name, and the net is estimated from the claimed amou
       {isSubmitter && (
         <div className="card" style={{ color: sub.status === "approved" ? "var(--green)" : sub.status === "needs_revision" || sub.status === "rejected" ? "var(--red)" : "var(--yellow)" }}>
           {sub.status === "needs_review" && "Submitted — waiting on an admin's approval. Add a line for each expense and attach its receipt."}
-          {sub.status === "needs_revision" && "Sent back for changes — fix what's noted below and it goes back for review."}
           {sub.status === "approved" && "Approved and posted. It can't be changed now."}
           {sub.status === "rejected" && "Rejected."}
           {sub.revision_note && (sub.status === "needs_revision" || sub.status === "rejected") && (
             <div style={{ marginTop: 6 }}>{sub.revision_note}</div>
           )}
+        </div>
+      )}
+
+      {sub.status === "needs_revision" && (
+        <div className="card" style={{ color: "var(--red)", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
+          <span>
+            Sent back for a revision{thread.length ? ` by ${[...thread].reverse().find((m) => m.kind === "request")?.name || "the approver"}` : ""}.
+            {isCreator ? " Make the changes, then Resubmit Expense and tell them what you did." : ""}
+          </span>
+          {thread.length > 0 && <button className="btn btn-ghost btn-sm" onClick={() => setShowThread(true)}>View the message</button>}
+        </div>
+      )}
+      {sub.status === "needs_review" && sub.resubmitted_at && (
+        <div className="card" style={{ color: "var(--yellow)", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
+          <span>Re-submitted after a revision request.</span>
+          {thread.length > 0 && <button className="btn btn-ghost btn-sm" onClick={() => setShowThread(true)}>View the conversation</button>}
         </div>
       )}
 
@@ -855,12 +884,15 @@ This is recorded under your name, and the net is estimated from the claimed amou
         )}
         {actionable && !isSubmitter && !canSubmit && (
           <>
-            <button className="btn btn-orange" disabled={busy || !allComplete || !!dupFlag || needsPmApproval || !!selfBlock} onClick={handleApprove}
+            <button className="btn btn-orange" disabled={busy || !allComplete || !!dupFlag || needsPmApproval || !!selfBlock || sub.status === "needs_revision"} onClick={handleApprove}
               title={selfBlock ? `You can't approve this one — ${selfBlock}.` : dupFlag ? dupFlag.detail : needsPmApproval ? "Needs an admin's approval first." : undefined}>
               {busy ? "Working…" : "Approve"}
             </button>
             <button className="btn btn-ghost" disabled={busy} onClick={handleDryRun}>Preview payload</button>
-            <button className="btn btn-ghost" disabled={busy} onClick={() => setShowRevision(true)}>Request Revision</button>
+            {sub.origin !== "email" && (
+              <button className="btn btn-ghost" disabled={busy || sub.status !== "needs_review"} onClick={() => setShowRevision(true)}
+                title={sub.status !== "needs_review" ? "Only an expense waiting for review can be sent back." : undefined}>Request Revision</button>
+            )}
             <button className="btn btn-danger" disabled={busy} onClick={handleReject}>Reject</button>
           </>
         )}
@@ -915,6 +947,25 @@ This is recorded under your name, and the net is estimated from the claimed amou
           )}
         </div>
       )}
+
+      {thread.length > 0 && (
+        <div className="card">
+          <div className="card-title">Revision history</div>
+          <div style={{ display: "grid", gap: 8, marginTop: 6 }}>
+            {thread.map((m, i) => (
+              <div key={i}>
+                <div className="row-secondary">
+                  <strong style={{ color: "var(--text-primary)" }}>{m.name}</strong>{m.kind === "request" ? " asked for a revision" : " replied"} ·{" "}
+                  {new Date(m.at).toLocaleString("en-CA", { dateStyle: "medium", timeStyle: "short" })}
+                </div>
+                <div style={{ whiteSpace: "pre-wrap" }}>{m.message}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {showThread && <RevisionPopup thread={thread} expenseId={sub.expense_id} onClose={() => setShowThread(false)} />}
 
       {showRevision && (
         <RevisionModal

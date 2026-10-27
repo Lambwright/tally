@@ -1,17 +1,13 @@
 import { useState } from "react";
 import { api } from "../api.js";
 
-// The worker never sends mail itself (Power Automate is intake-only per the
-// kickoff) — it hands back a copy-ready reply whose subject carries the invoice
-// number, and a human sends it from Outlook. The employee's reply keeps that
-// token in the subject, so when PA forwards it back to /intake it merges onto
-// this same submission instead of creating a duplicate.
+// Asking the person who made an expense to change something. The message stays in TALLY: when they open the
+// expense it pops up with your name on it, they can reopen it from the page while they fix things, and their reply
+// comes back to you the same way when they resubmit. (Emailed expenses go back by email, outside this button.)
 export default function RevisionModal({ submission, onClose, onDone }) {
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
-  const [reply, setReply] = useState(null);
-  const [copied, setCopied] = useState(false);
 
   async function handleSend(e) {
     e.preventDefault();
@@ -19,76 +15,35 @@ export default function RevisionModal({ submission, onClose, onDone }) {
     setBusy(true);
     setError(null);
     try {
-      const result = await api.requestRevision(submission.id, note.trim());
-      setReply(result.reply);
+      await api.requestRevision(submission.id, note.trim());
+      onDone();
     } catch (err) {
-      setError(err.message);
-    } finally {
+      setError(err.data?.detail || err.message);
       setBusy(false);
     }
   }
 
-  async function handleCopy() {
-    const text = `Subject: ${reply.subject}\n\n${reply.body}`;
-    try {
-      await navigator.clipboard.writeText(text);
-      setCopied(true);
-    } catch {
-      // Clipboard API unavailable — the text is still visible to select by hand.
-    }
-  }
-
   return (
-    <div className="modal-backdrop" onClick={onClose}>
+    <div className="modal-backdrop" onClick={busy ? undefined : onClose}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
-        {!reply ? (
-          <form onSubmit={handleSend}>
-            <div className="card-title" style={{ marginBottom: 4 }}>Request Revision</div>
-            <p className="row-secondary" style={{ marginBottom: 12 }}>
-              What does {submission.employee_name || "the employee"} need to fix on {submission.expense_id}?
-            </p>
-            <div className="field">
-              <label htmlFor="revision-note">Note</label>
-              <textarea
-                id="revision-note"
-                rows={4}
-                autoFocus
-                value={note}
-                onChange={(e) => setNote(e.target.value)}
-              />
-            </div>
-            {error && <div className="login-error">{error}</div>}
-            <div className="modal-actions">
-              <button type="button" className="btn btn-ghost" onClick={onClose}>Cancel</button>
-              <button type="submit" className="btn btn-orange" disabled={busy || !note.trim()}>
-                {busy ? "Saving…" : "Save & Get Reply"}
-              </button>
-            </div>
-          </form>
-        ) : (
-          <div>
-            <div className="card-title" style={{ marginBottom: 4 }}>Reply ready</div>
-            <p className="row-secondary" style={{ marginBottom: 12 }}>
-              Send this from Outlook — keep the subject exactly as-is so the employee's reply routes back here.
-            </p>
-            <div className="field" style={{ marginBottom: 10 }}>
-              <label>Subject</label>
-              <input readOnly value={reply.subject} />
-            </div>
-            <div className="field">
-              <label>Body</label>
-              <textarea readOnly rows={6} value={reply.body} />
-            </div>
-            <div className="modal-actions">
-              <button type="button" className="btn btn-ghost" onClick={handleCopy}>
-                {copied ? "Copied" : "Copy"}
-              </button>
-              <button type="button" className="btn btn-orange" onClick={() => onDone(reply)}>
-                Done
-              </button>
-            </div>
+        <form onSubmit={handleSend}>
+          <div className="card-title" style={{ marginBottom: 4 }}>Request revision</div>
+          <p className="row-secondary" style={{ marginBottom: 12 }}>
+            What does {submission.employee_name || "the submitter"} need to change on {submission.expense_id}? They'll see
+            this message, with your name on it, when they open the expense.
+          </p>
+          <div className="field">
+            <label htmlFor="revision-note">Your message</label>
+            <textarea id="revision-note" rows={5} autoFocus value={note} disabled={busy} onChange={(e) => setNote(e.target.value)} />
           </div>
-        )}
+          {error && <div className="login-error">{error}</div>}
+          <div className="modal-actions">
+            <button type="button" className="btn btn-ghost" onClick={onClose} disabled={busy}>Cancel</button>
+            <button type="submit" className="btn btn-orange" disabled={busy || !note.trim()}>
+              {busy ? "Sending…" : "Send back for revision"}
+            </button>
+          </div>
+        </form>
       </div>
     </div>
   );

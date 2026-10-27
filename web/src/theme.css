@@ -199,6 +199,7 @@ body {
   padding: 3px 8px;
   border-radius: 3px;
 }
+.badge-resubmitted { background: rgba(226,135,26,0.18); color: var(--orange); }
 .badge-draft { background: rgba(255,255,255,0.06); color: var(--text-secondary); }
 .badge-needs_review { background: rgba(209,169,63,0.15); color: var(--yellow); }
 .badge-needs_revision { background: rgba(209,67,67,0.12); color: var(--red); }

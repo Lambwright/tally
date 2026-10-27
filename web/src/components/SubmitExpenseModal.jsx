@@ -18,6 +18,7 @@ export default function SubmitExpenseModal({ id, sub, costCodes, resubmit = fals
   const [error, setError] = useState(null);
   const [duplicates, setDuplicates] = useState(false); // the server found receipts already submitted
   const [confirmDupes, setConfirmDupes] = useState(false);
+  const [reply, setReply] = useState(""); // re-submitting after a revision request: what changed
 
   useEffect(() => {
     let cancelled = false;
@@ -39,7 +40,7 @@ export default function SubmitExpenseModal({ id, sub, costCodes, resubmit = fals
     setBusy(true);
     setError(null);
     try {
-      await api.submitExpense(id, approver, { allowDuplicates: confirmDupes });
+      await api.submitExpense(id, approver, { allowDuplicates: confirmDupes, reply: reply.trim() });
       onSubmitted();
     } catch (e) {
       setDuplicates(e.data?.error === "duplicate_receipts");
@@ -49,7 +50,7 @@ export default function SubmitExpenseModal({ id, sub, costCodes, resubmit = fals
   }
 
   const chosen = (approvers || []).find((a) => a.username === approver);
-  const ready = !!preview && !previewError && !!chosen;
+  const ready = !!preview && !previewError && !!chosen && (!resubmit || !!reply.trim());
 
   return (
     <div className="modal-backdrop" onClick={busy ? undefined : onClose}>
@@ -80,6 +81,14 @@ export default function SubmitExpenseModal({ id, sub, costCodes, resubmit = fals
                 {a.isSuperAdmin && !a.canApprovePortal && <span className="combobox-sub">super admin</span>}
               </label>
             ))}
+          </div>
+        )}
+
+        {resubmit && (
+          <div className="field" style={{ marginTop: 16 }}>
+            <label htmlFor="resubmit-reply">3 · Your reply to the approver (required)</label>
+            <textarea id="resubmit-reply" rows={3} value={reply} disabled={busy} onChange={(e) => setReply(e.target.value)}
+              placeholder="What did you change, or why is it fine as it is? They see this when they open the expense." />
           </div>
         )}
 

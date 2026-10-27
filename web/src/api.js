@@ -79,8 +79,8 @@ export const api = {
   approve: (id, { dryRun = false } = {}) =>
     request(`/submissions/${id}/approve${dryRun ? "?dryRun=1" : ""}`, { method: "POST", body: {} }),
   listApprovers: (id) => request(`/submissions/${id}/approvers`), // { approvers: [{ username, displayName, hasWaiver, isDefault }] }
-  submitExpense: (id, approver, { allowDuplicates = false } = {}) =>
-    request(`/submissions/${id}/submit`, { method: "POST", body: { approver, allow_duplicates: allowDuplicates || undefined } }),
+  submitExpense: (id, approver, { allowDuplicates = false, reply } = {}) =>
+    request(`/submissions/${id}/submit`, { method: "POST", body: { approver, allow_duplicates: allowDuplicates || undefined, reply: reply || undefined } }),
   requestRevision: (id, note) => request(`/submissions/${id}/request-revision`, { method: "POST", body: { note } }),
   reject: (id, reason) => request(`/submissions/${id}/reject`, { method: "POST", body: { reason } }),
   listProjects: () => request("/projects"),

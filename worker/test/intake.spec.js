@@ -5,6 +5,9 @@ const {
   extractExpenseId,
   readAttachments,
   pageRange,
+  handleRequestRevision,
+  bumpForm,
+  historyEvent,
   chooseExpenseId,
   handleList,
   likePattern,
@@ -958,5 +961,52 @@ describe("chooseExpenseId (what the preview shows and Submit assigns)", () => {
   it("leaves email expenses and ones that already have a real id alone", async () => {
     expect(await chooseExpenseId(fakeSql([]), { ...sub, origin: "email" })).toBe("pending-abc");
     expect(await chooseExpenseId(fakeSql([]), { ...sub, expense_id: "210926-260183-BEWR" })).toBe("210926-260183-BEWR");
+  });
+});
+
+describe("revision requests (portal expenses only, message kept in the history)", () => {
+  const user = { username: "leela@einbau.ca", displayName: "Leela Senthilnathan" };
+  const makeSql = (sub) => {
+    const calls = [];
+    const sql = async (strings, ...vals) => {
+      const text = strings.join("?");
+      calls.push({ text, vals });
+      if (text.includes("select * from submissions")) return sub ? [sub] : [];
+      if (text.includes("update submissions set status = 'needs_revision'")) return [{ id: "s1", status: "needs_revision", expense_id: "X", created_by: "ben@einbau.ca" }];
+      return [];
+    };
+    return { sql, calls };
+  };
+  const req = (note) => new Request("https://t.test/x", { method: "POST", body: JSON.stringify({ note }), headers: { "Content-Type": "application/json" } });
+  const portal = { id: "s1", origin: "upload", status: "needs_review", approver: "leela@einbau.ca", history: [], expense_id: "X" };
+
+  it("sends a portal expense back with the message, who sent it, and no email", async () => {
+    const { sql, calls } = makeSql(portal);
+    const res = await handleRequestRevision("s1", req("  Wrong project on line 2  "), sql, user);
+    const body = await res.json();
+    expect(res.status).toBe(200);
+    expect(body.reply).toBeUndefined();
+    const update = calls.find((c) => c.text.includes("needs_revision"));
+    const history = JSON.parse(update.vals.find((v) => typeof v === "string" && v.startsWith("[{")));
+    expect(history.at(-1)).toMatchObject({ type: "revision_requested", by: "leela@einbau.ca", name: "Leela Senthilnathan", message: "Wrong project on line 2" });
+  });
+  it("refuses an emailed expense, an empty note, a wrong status, and someone other than the assigned approver", async () => {
+    expect((await handleRequestRevision("s1", req("x"), makeSql({ ...portal, origin: "email" }).sql, user)).status).toBe(422);
+    expect((await handleRequestRevision("s1", req("   "), makeSql(portal).sql, user)).status).toBe(400);
+    expect((await handleRequestRevision("s1", req("x"), makeSql({ ...portal, status: "approved" }).sql, user)).status).toBe(409);
+    expect((await handleRequestRevision("s1", req("x"), makeSql({ ...portal, approver: "other@einbau.ca" }).sql, user)).status).toBe(409);
+    expect((await handleRequestRevision("s1", req("x"), makeSql(null).sql, user)).status).toBe(404);
+  });
+});
+
+describe("bumpForm only records history", () => {
+  it("never changes the status (drafts stay drafts, sent-back stays sent back)", async () => {
+    const seen = [];
+    await bumpForm(async (strings) => { seen.push(strings.join("?")); return []; }, "s1", historyEvent("line_edited", "x"));
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).not.toMatch(/status/);
+  });
+  it("historyEvent can carry who and what was said", () => {
+    expect(historyEvent("revision_reply", "t", { by: "ben", message: "m" })).toMatchObject({ type: "revision_reply", text: "t", by: "ben", message: "m" });
   });
 });
