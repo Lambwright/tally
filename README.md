@@ -245,9 +245,10 @@ expenses", switched on per person in HELM; Leela only today):
 Everyone listed must also be a TALLY admin. The assigned approver is checked again at Approve time.
 The Super Admin is whoever HELM marks (`isSuperAdmin` / `jobRole`); nobody is named in TALLY.
 
-**Export PDF** (approved expenses; reviewers and the creator): one PDF with a summary table of the lines
-as TALLY has them, the original expense form, and every receipt (an image per page; a receipt that is some
-pages of a PDF brings just those pages). Built in the browser, `web/src/exportPdf.js`.
+**Export PDF** (approved expenses; reviewers and the creator): one PDF with the Employee Expense Form (the real one, or the
+one TALLY drew, authorized) followed by every receipt (an image per page; a receipt that is some pages of a PDF
+brings just those pages). TALLY's own summary page is only drawn for an expense that has no form at all.
+Built in the browser, `web/src/exportPdf.js`.
 
 ## The Employee Expense Form (2026-10-22)
 

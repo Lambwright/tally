@@ -1,8 +1,7 @@
 import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
 
-// Builds the expense package an approver can file or send: page 1+ is a summary with a clean table
-// of the lines as TALLY has them, followed by the original expense form (if there was one) and
-// every receipt, each in full (an image gets its own page; a receipt that is some pages of a bigger
+// Builds the expense package an approver can file or send: the Employee Expense Form (the real one, or the one
+// TALLY drew), then every receipt (a summary page is drawn only when there is no form), each in full (an image gets its own page; a receipt that is some pages of a bigger
 // PDF brings just those pages). Everything is built in the browser from what the review page already
 // has, so nothing new is stored or sent anywhere.
 
@@ -75,6 +74,11 @@ export async function buildExpensePdf({ sub, lines, receipts, labels, getFile })
   const font = await doc.embedFont(StandardFonts.Helvetica);
   const bold = await doc.embedFont(StandardFonts.HelveticaBold);
   const generated = new Date().toISOString().slice(0, 10);
+
+  // The package is the Employee Expense Form followed by the receipts. TALLY's own summary page is only drawn
+  // for an expense that has no form at all (an older one), so there is always something that shows the lines.
+  const withSummary = !receipts.some((r) => r.kind === "form");
+  if (withSummary) {
 
   let page = doc.addPage([PAGE_W, PAGE_H]);
   let y = PAGE_H - M;
@@ -178,6 +182,8 @@ export async function buildExpensePdf({ sub, lines, receipts, labels, getFile })
   right(fmt(tg), 3); right(fmt(tt), 4); right(fmt(tn), 5);
   y -= 24;
   text("Net is the pre-tax amount posted to Procore.", x0, y, { size: 7.5, color: MUTED });
+
+  }
 
   // ---- the form, then the receipts in the order the lines use them
   const used = new Set();
