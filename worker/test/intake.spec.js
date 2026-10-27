@@ -5,6 +5,7 @@ const {
   extractExpenseId,
   readAttachments,
   pageRange,
+  compareCodes,
   expenseIdFor,
   buildExpenseFormPdf,
   refusalCount,
@@ -16,6 +17,7 @@ const {
   positiveInt,
   resolveEmployeeId,
   missingLineItems,
+  budgetedCodes,
   isoDate,
   procoreFetch,
   resolveWbsFromCodes,
@@ -687,13 +689,35 @@ describe("procoreFetch rate limiting", () => {
   });
 });
 
-describe("resolveWbsFromCodes", () => {
-  const codes = [{ id: "11", code: "59-01.O", description: "Other" }, { id: "12", code: "55.MC", description: "Materials" }];
-  it("honours an explicit id from the list", () => {
-    expect(resolveWbsFromCodes(codes, "p1", "other", "12")).toBe("12");
+describe("budgeted cost codes only (Procore: cost_code_id not chargeable)", () => {
+  const seg = (type, id) => ({ segment: { type }, id });
+  const wbs = (id, flat_code, cc, lt) => ({ id, flat_code, flat_name: flat_code + " name", status: "active", segment_items: [seg("cost_code", cc), seg("line_item_type", lt)] });
+  // the project has a budget line for 59-01-06-05 / Fo and 49-01-06-03 / F, but nothing for the 59-01.O branch
+  const rows = [wbs(1, "49-01-06-05.Fo", 501, 9), wbs(2, "59-01.O", 500, 7), wbs(3, "49-01-06-03.F", 502, 8), wbs(4, "59-01-06-06.P", 503, 6)];
+  const budget = [{ cost_code: { id: 501 }, line_item_type: { id: 9 } }, { cost_code: { id: 502 }, line_item_type: { id: 8 } }];
+
+  it("keeps only the codes the budget has a line for (both the cost code and the type must match)", () => {
+    const codes = budgetedCodes(rows, budget);
+    expect(codes.map((x) => x.code)).toEqual(["49-01-06-03.F", "49-01-06-05.Fo"]);
+    // right cost code, wrong type: not budgeted
+    expect(budgetedCodes([wbs(5, "59-01-06-05.L", 501, 99)], budget)).toEqual([]);
   });
-  it("says so when the project has no matching budget line", () => {
-    expect(() => resolveWbsFromCodes([], "p1", "other", "99-99.X")).toThrow(/no budget line/);
+  it("an empty budget means nothing can be charged", () => {
+    expect(budgetedCodes(rows, [])).toEqual([]);
+    expect(budgetedCodes(undefined, undefined)).toEqual([]);
+  });
+  const codes = budgetedCodes(rows, budget);
+  it("a pick must be one of the budgeted codes, by id or by code", () => {
+    expect(resolveWbsFromCodes(codes, "p1", "other", "1")).toBe("1");
+    expect(resolveWbsFromCodes(codes, "p1", "other", "49-01-06-03.F")).toBe("3");
+    expect(() => resolveWbsFromCodes(codes, "p1", "other", "2")).toThrow(/on project p1.s budget/); // the 59-01.O branch
+    expect(() => resolveWbsFromCodes(codes, "p1", "other", "59-01.O")).toThrow(/on project p1.s budget/);
+  });
+  it("a category default is used only when that exact code is budgeted, never a look-alike", () => {
+    expect(resolveWbsFromCodes(codes, "p1", "per_diem", null)).toBe("1");
+    expect(resolveWbsFromCodes(codes, "p1", "fuel", null)).toBe("3");
+    expect(() => resolveWbsFromCodes(codes, "p1", "parking", null)).toThrow(/budget has no line for 49-01-06-06.P/);
+    expect(() => resolveWbsFromCodes(codes, "p1", "other", null)).toThrow(/no default cost code/);
   });
 });
 
@@ -805,5 +829,20 @@ describe("visitorHeaders (sent to auth-worker on /auth/verify)", () => {
   });
   it("gives nothing for a bare request", () => {
     expect(visitorHeaders(new Request("https://t.test/x", { headers: { "User-Agent": "" } }))).toEqual({});
+  });
+});
+
+describe("compareCodes (cost codes in numeric order)", () => {
+  it("sorts by number, segment by segment, then by the cost-type letters", () => {
+    const codes = ["59-01-06-10.O", "55.MH", "49-01-05-11.L", "59-01-06-03.F", "49-01-05-05.L", "49-01-06-02.L", "56.MH", "59-01-06-05.Fo", "49-01-05-11.O", "9.X", "10.X"];
+    expect([...codes].sort(compareCodes)).toEqual([
+      "9.X", "10.X", "49-01-05-05.L", "49-01-05-11.L", "49-01-05-11.O", "49-01-06-02.L", "55.MH", "56.MH", "59-01-06-03.F", "59-01-06-05.Fo", "59-01-06-10.O",
+    ]);
+  });
+  it("budgetedCodes returns its list already in that order", () => {
+    const seg = (type, id) => ({ segment: { type }, id });
+    const w = (id, code, cc) => ({ id, flat_code: code, segment_items: [seg("cost_code", cc), seg("line_item_type", 1)] });
+    const out = budgetedCodes([w(1, "59-01-06-10.O", 3), w(2, "49-01-05-05.L", 1), w(3, "55.MH", 2)], [1, 2, 3].map((n) => ({ cost_code: { id: n }, line_item_type: { id: 1 } })));
+    expect(out.map((x) => x.code)).toEqual(["49-01-05-05.L", "55.MH", "59-01-06-10.O"]);
   });
 });

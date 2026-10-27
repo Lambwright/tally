@@ -321,10 +321,10 @@ body {
 .receipt-chip { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; }
 .receipt-chip img { width: 26px; height: 26px; object-fit: cover; border-radius: 3px; border: 1px solid var(--border-color); }
 .chip-x {
-  border: none; background: transparent; color: var(--text-tertiary); cursor: pointer;
-  font-size: 15px; line-height: 1; padding: 0 4px;
+  border: none; background: transparent; color: #D9D2C3; cursor: pointer;
+  font-size: 19px; font-weight: 700; line-height: 1; padding: 2px 6px; border-radius: var(--radius-sm);
 }
-.chip-x:hover { color: var(--red); }
+.chip-x:hover { color: #FF6B6B; background: rgba(209,67,67,0.15); }
 
 .line-flags-cell { display: flex; flex-direction: column; gap: 3px; max-width: 200px; }
 .flag-pill {

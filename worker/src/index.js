@@ -68,6 +68,8 @@ import {
   missingLineItems,
   isoDate,
   resolveWbsFromCodes,
+  budgetedCodes,
+  compareCodes,
   buildDirectCostHeader,
   buildDirectCostLineItem,
   listProjectWbsCodes,
@@ -1655,8 +1657,8 @@ async function handleReceipt(id, url, env, sql) {
   });
 }
 
-// Project WBS codes for the review UI's per-line cost-code pickers, plus the
-// resolved default for each category so a line pre-selects the right one.
+// The project's BUDGETED cost codes for the review UI's per-line pickers (only codes Procore will let a cost be
+// charged to), plus the default for each category when that default is itself budgeted.
 async function handleCostCodes(id, env, sql) {
   const [sub] = await sql`select * from submissions where id = ${id}`;
   if (!sub) return json({ error: "not_found" }, 404);
@@ -1665,7 +1667,7 @@ async function handleCostCodes(id, env, sql) {
   const token = await getProcoreToken(env);
   let codes = [];
   try {
-    codes = await listProjectWbsCodes(env, token, procoreFetch, sub.project_procore_id);
+    codes = await listProjectWbsCodes(env, token, procoreFetch, sub.project_procore_id, { fresh: true }); // a code just added to the budget shows up on the next open
   } catch (e) {
     return json({ error: "procore_lookup_failed", detail: e.message }, 502);
   }
@@ -1673,8 +1675,7 @@ async function handleCostCodes(id, env, sql) {
   const defaults = {};
   for (const [cat, flat] of Object.entries(CATEGORY_TO_WBS_CODE)) {
     if (!flat) { defaults[cat] = { flat_code: null, wbs_code_id: null }; continue; }
-    const hit = codes.find((c) => norm(c.code) === norm(flat)) ||
-                codes.find((c) => norm(c.code).startsWith(norm(flat).split(".")[0]));
+    const hit = codes.find((c) => norm(c.code) === norm(flat)); // exact and budgeted only, never "closest"
     defaults[cat] = { flat_code: flat, wbs_code_id: hit?.id || null };
   }
 
@@ -2161,6 +2162,25 @@ async function handleSubmitForReview(subId, request, env, sql, user, isReviewer)
     }
   }
 
+  // The cost codes must be ones Procore will accept (budgeted on this project), so a bad one is caught here, not
+  // by Procore's refusal at Approve.
+  try {
+    const projectCodes = await listProjectWbsCodes(env, await getProcoreToken(env), procoreFetch, sub.project_procore_id, { fresh: true });
+    const bad = [];
+    for (const l of lines) {
+      try {
+        resolveWbsFromCodes(projectCodes, sub.project_procore_id, l.category, l.cost_code || null);
+      } catch (e) {
+        bad.push(`line ${l.row_index}: ${e.message}`);
+      }
+    }
+    if (bad.length) {
+      return json({ error: "cost_code_unresolved", detail: `Some lines have a cost code this project can't be charged to. ${bad.join(" ")}` }, 422);
+    }
+  } catch (e) {
+    return json({ error: "cost_codes_unavailable", detail: `Couldn't check the cost codes against the project's budget: ${e.message}. Try again in a minute.` }, 502);
+  }
+
   const verb = sub.status === "needs_review" ? "reassigned to" : sub.status === "needs_revision" ? "resubmitted to" : "submitted to";
   await sql`update submissions set status = 'needs_review', approver = ${chosen.username}, submitted_for_review_at = now(), updated_at = now() where id = ${subId}`;
   await bumpForm(sql, subId, historyEvent("submitted", `${user.username} ${verb} ${chosen.displayName} for approval`));
@@ -2249,7 +2269,7 @@ async function handleApprove(subId, url, request, env, sql, user, isPmApprover) 
   const resolved = [];
   let projectCodes;
   try {
-    projectCodes = await listProjectWbsCodes(env, token, procoreFetch, sub.project_procore_id); // once, not per line
+    projectCodes = await listProjectWbsCodes(env, token, procoreFetch, sub.project_procore_id, { fresh: true }); // once, not per line; fresh so a just-added budget code counts
   } catch (e) {
     return json({ error: "cost_code_unresolved", detail: `Couldn't read the project's cost codes: ${e.message}` }, 502);
   }
@@ -2837,6 +2857,8 @@ export default {
 
 // Exported for unit tests.
 export const _test = {
+  compareCodes,
+  budgetedCodes,
   visitorHeaders,
   refusalCount,
   refusalOutcome,

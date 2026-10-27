@@ -77,26 +77,72 @@ function normalizeCode(s) {
 // project's active WBS lines, each with `id`, `flat_code` ("49-01-05-05.L") and
 // `flat_name` ("Millwork Install.Labor"). Note: the list always includes a
 // placeholder row with an empty flat_code — filtered out here.
-export async function listProjectWbsCodes(env, token, procoreFetch, projectId) {
-  const raw = await procoreFetch(
-    env, token,
-    `/rest/v1.0/projects/${projectId}/wbs_codes`,
-    { method: "GET" }
+// A project's WBS list includes codes that are NOT on its budget (parent levels like 59-01.O, and leaf codes
+// nobody added to this project's budget). Procore only lets you charge a cost to a BUDGETED code and refuses
+// anything else with 422 {"cost_code_id":["not chargeable"]}. A code is budgeted when the project's budget has
+// a line with the same cost code AND the same line-item type as the code's two segments.
+// Cost codes in the order people expect: by number, segment by segment (49-01-05-05.L, 49-01-05-11.L, 55.MH,
+// 59-01-06-03.F), not as text (where 55 would sort after 49-01-... only by luck and 6 after 10).
+export function compareCodes(a, b) {
+  const tok = (s) => String(s || "").match(/\d+|\D+/g) || [];
+  const x = tok(a), y = tok(b);
+  for (let i = 0; i < Math.max(x.length, y.length); i++) {
+    if (x[i] === undefined) return -1;
+    if (y[i] === undefined) return 1;
+    const nx = /^\d/.test(x[i]), ny = /^\d/.test(y[i]);
+    if (nx && ny) { const d = Number(x[i]) - Number(y[i]); if (d) return d; }
+    else { const c = x[i].toLowerCase().localeCompare(y[i].toLowerCase()); if (c) return c; }
+  }
+  return 0;
+}
+
+// wbsRows: GET .../wbs_codes rows; budgetLines: GET /budget_line_items?project_id= rows. Sorted with compareCodes.
+export function budgetedCodes(wbsRows, budgetLines) {
+  const keys = new Set(
+    (budgetLines || []).map((b) => `${b?.cost_code?.id}|${b?.line_item_type?.id}`)
   );
-  const rows = Array.isArray(raw) ? raw : raw?.data || [];
-  return rows
+  return (wbsRows || [])
     .filter((w) => w && w.status !== "inactive" && w.flat_code)
+    .filter((w) => {
+      const items = Array.isArray(w.segment_items) ? w.segment_items : [];
+      const cc = items.find((s) => s?.segment?.type === "cost_code");
+      const lt = items.find((s) => s?.segment?.type === "line_item_type");
+      return !!cc && !!lt && keys.has(`${cc.id}|${lt.id}`);
+    })
     .map((w) => ({
       id: String(w.id ?? ""),
       code: String(w.flat_code),
       description: String(w.flat_name || w.description || ""),
     }))
-    .filter((r) => r.id && r.code);
+    .filter((r) => r.id && r.code)
+    .sort((p, q) => compareCodes(p.code, q.code));
 }
 
-// Turn a chosen flat code (or the category default) into this project's
-// wbs_code_id. `explicitChoice` is what the reviewer picked in the app — either a
-// flat-code string or a raw wbs_code_id; both are accepted.
+async function listAllPages(env, token, procoreFetch, path) {
+  const all = [];
+  const sep = path.includes("?") ? "&" : "?";
+  for (let page = 1; page <= 20; page++) {
+    const rows = await procoreFetch(env, token, `${path}${sep}per_page=300&page=${page}`, { method: "GET" });
+    const list = Array.isArray(rows) ? rows : rows?.data || [];
+    all.push(...list);
+    if (list.length < 300) break;
+  }
+  return all;
+}
+
+// Cost codes that can really be charged on this project: its WBS codes narrowed to the budgeted ones. Cached
+// for two minutes per project, because one screen load, a submit and an approve all ask.
+const codeCache = new Map(); // projectId -> { at, codes }
+export async function listProjectWbsCodes(env, token, procoreFetch, projectId, { fresh = false } = {}) {
+  const hit = codeCache.get(String(projectId));
+  if (!fresh && hit && Date.now() - hit.at < 120000) return hit.codes;
+  const wbs = await listAllPages(env, token, procoreFetch, `/rest/v1.0/projects/${projectId}/wbs_codes`);
+  const budget = await listAllPages(env, token, procoreFetch, `/rest/v1.0/budget_line_items?project_id=${projectId}`);
+  const codes = budgetedCodes(wbs, budget);
+  codeCache.set(String(projectId), { at: Date.now(), codes });
+  return codes;
+}
+
 export async function resolveWbsCodeId(env, token, procoreFetch, projectId, category, explicitChoice) {
   return resolveWbsFromCodes(await listProjectWbsCodes(env, token, procoreFetch, projectId), projectId, category, explicitChoice);
 }
@@ -104,29 +150,27 @@ export async function resolveWbsCodeId(env, token, procoreFetch, projectId, cate
 // The same lookup against a code list you already fetched, so approving a 16-line expense reads the
 // project's cost codes once instead of sixteen times (that burst is what tripped Procore's rate limit).
 export function resolveWbsFromCodes(codes, projectId, category, explicitChoice) {
-
-  // Reviewer picked a raw id straight from the dropdown — trust it if it's real.
-  if (explicitChoice && codes.some((c) => c.id === String(explicitChoice))) {
-    return String(explicitChoice);
-  }
-
-  const wantedFlat = explicitChoice || CATEGORY_TO_WBS_CODE[category];
-  if (!wantedFlat) {
+  // Someone picked a code from the list: it must be one of this project's budgeted codes.
+  if (explicitChoice) {
+    const chosen = codes.find((c) => c.id === String(explicitChoice));
+    if (chosen) return chosen.id;
+    const byCode = codes.find((c) => normalizeCode(c.code) === normalizeCode(explicitChoice));
+    if (byCode) return byCode.id;
     throw new Error(
-      `Category "${category}" has no default cost code — pick one in the app before approving.`
+      `The cost code chosen for this line isn't on project ${projectId}'s budget (it may be an unfinished branch like 59-01.O, or a code nobody added to the budget). Pick one of the project's budgeted codes.`
     );
   }
 
-  const wanted = normalizeCode(wantedFlat);
-  const costPart = wanted.split(".")[0];
-  const hit =
-    codes.find((c) => normalizeCode(c.code) === wanted) ||
-    codes.find((c) => normalizeCode(c.code).startsWith(costPart));
-
+  const wantedFlat = CATEGORY_TO_WBS_CODE[category];
+  if (!wantedFlat) {
+    throw new Error(`Category "${category}" has no default cost code: pick one in the app before approving.`);
+  }
+  // Exactly the default, and only if it is budgeted. No "closest" or "starts with" guessing: a wrong code
+  // that happens to be budgeted is worse than asking.
+  const hit = codes.find((c) => normalizeCode(c.code) === normalizeCode(wantedFlat));
   if (!hit) {
     throw new Error(
-      `Project ${projectId} has no budget line matching "${wantedFlat}" (category "${category}"). ` +
-      `Its budget may not be set up for expense coding, or a different code needs to be selected.`
+      `Project ${projectId}'s budget has no line for ${wantedFlat} (the default for "${category}"). Pick one of the project's budgeted cost codes for this line.`
     );
   }
   return hit.id;
