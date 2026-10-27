@@ -295,7 +295,7 @@ async function requireLogin(request, env) {
 // What a submitter-only user may NOT do on their own row. Review and anything
 // that writes to Procore is admin-only; and once an expense is approved it's
 // frozen for them. Returns { status, error, detail } or null.
-const SUBMITTER_BLOCKED_ACTIONS = new Set(["approve", "reject", "request-revision", "reparse", "retry-attachments"]);
+const SUBMITTER_BLOCKED_ACTIONS = new Set(["approve", "reject", "request-revision", "reparse", "retry-attachments", "redraw-form"]);
 function submitterDenial(method, seg, status) {
   if (method === "POST" && SUBMITTER_BLOCKED_ACTIONS.has(seg)) {
     return { status: 403, error: "forbidden", detail: "Only admins can do that." };
@@ -2148,11 +2148,19 @@ async function assignExpenseId(sql, sub) {
 // (Re)draw TALLY's Employee Expense Form for this expense and store it as THE form. A form somebody attached
 // themselves (a real one from Procore) is left alone. Called at Submit, and again at Approve with the
 // approver's name and the date filled in under Authorized By / Date Authorized.
+// DDMMYY-... -> YYYY-MM-DD (the day the form was made), or null when the id isn't in that style.
+function dateFromExpenseId(id) {
+  const m = String(id || "").match(/^(\d{2})(\d{2})(\d{2})-/);
+  if (!m) return null;
+  const [dd, mm, yy] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  return dd >= 1 && dd <= 31 && mm >= 1 && mm <= 12 ? `20${m[3]}-${m[2]}-${m[1]}` : null;
+}
+
 async function writeExpenseForm(env, sql, sub, lines, { authorizedBy = null, authorizedDate = null } = {}) {
   const forms = await sql`select * from receipts where submission_id = ${sub.id} and kind = 'form'`;
   if (forms.some((f) => f.note !== GENERATED_FORM_NOTE)) return { kept: true };
   // The form's date is the day it was made (the same day as its Expense ID), also when it is redrawn at approval.
-  const formDate = sub.submitted_for_review_at ? torontoDate(new Date(sub.submitted_for_review_at)) : torontoDate();
+  const formDate = dateFromExpenseId(sub.expense_id) || (sub.submitted_for_review_at ? torontoDate(new Date(sub.submitted_for_review_at)) : torontoDate());
   let bytes;
   try {
     // The real Einbau form, filled in (the blank lives in R2 at TEMPLATE_KEY)...
@@ -2225,6 +2233,42 @@ function pickApprovers(users, caller, sub) {
 function canApprovePortalExpense(user) {
   const holds = Array.isArray(user?.appExtras?.TALLY) && user.appExtras.TALLY.includes(APPROVE_PORTAL_EXTRA);
   return holds || isSuperAdminUser(user);
+}
+
+// POST /submissions/:id/redraw-form — draw the expense's Employee Expense Form again from its current lines. For an
+// expense made before the real-form change (or after its lines were fixed). Only a form TALLY drew is replaced: the
+// real one that came in by email, or one somebody attached, is left alone. An approved expense keeps its Authorized
+// By / Date Authorized. (The copy already attached to a Procore Direct Cost is not touched.)
+async function handleRedrawForm(subId, request, env, sql, user) {
+  const [sub] = await sql`select * from submissions where id = ${subId}`;
+  if (!sub) return json({ error: "not_found" }, 404);
+  const forms = await sql`select note from receipts where submission_id = ${subId} and kind = 'form'`;
+  if (forms.some((f) => f.note !== GENERATED_FORM_NOTE)) {
+    return json({ error: "form_not_ours", detail: "This expense has the real form that came with it, so there is nothing to redraw." }, 422);
+  }
+  const lines = await sql`select * from line_items where submission_id = ${subId} order by row_index asc nulls last, created_at asc`;
+  if (!lines.length) return json({ error: "no_lines", detail: "There are no lines to put on the form." }, 422);
+
+  let authorizedBy = null, authorizedDate = null;
+  if (sub.status === "approved") {
+    authorizedDate = sub.reviewed_at ? torontoDate(new Date(sub.reviewed_at)) : null;
+    const who = String(sub.reviewed_by || "");
+    authorizedBy = who.split("@")[0].replace(/^./, (c) => c.toUpperCase());
+    try {
+      const people = await fetchTallyUsers(env, request);
+      const hit = people.find((p) => String(p.username || "").toLowerCase() === who.toLowerCase());
+      if (hit?.displayName) authorizedBy = hit.displayName;
+    } catch {
+      // the name is only cosmetic: keep the one made from the username
+    }
+  }
+  try {
+    await writeExpenseForm(env, sql, sub, lines, { authorizedBy, authorizedDate });
+  } catch (e) {
+    return json({ error: "form_failed", detail: `Couldn't redraw the form: ${e.message}` }, 500);
+  }
+  await bumpForm(sql, subId, historyEvent("form_redrawn", `${user.username} redrew the Employee Expense Form`));
+  return json({ ok: true });
 }
 
 async function fetchTallyUsers(env, request) {
@@ -2966,6 +3010,7 @@ async function routeRequest(request, env, ctx, sec) {
           if (!seg && request.method === "GET") return withRefresh(await handleDetail(subId, sql, auth.user));
           if (!seg && request.method === "PATCH") return withRefresh(await handleSubmissionPatch(subId, request, sql, auth.user, pmScoped));
           if (!seg && request.method === "DELETE") return withRefresh(await handleSubmissionDelete(subId, env, sql, auth.user));
+          if (seg === "redraw-form" && request.method === "POST") return withRefresh(await handleRedrawForm(subId, request, env, sql, auth.user));
           if (seg === "approvers" && request.method === "GET") return await handleApprovers(subId, request, env, sql, auth.user);
           if (seg === "submit" && request.method === "POST") return withRefresh(await handleSubmitForReview(subId, request, env, sql, auth.user, auth.isReviewer));
           if (seg === "reparse" && request.method === "POST") return withRefresh(await handleReparse(subId, env, sql, auth.user));
@@ -3029,6 +3074,7 @@ export default {
 
 // Exported for unit tests.
 export const _test = {
+  dateFromExpenseId,
   viewerIdentity,
   isAboutViewer,
   handleRequestRevision,

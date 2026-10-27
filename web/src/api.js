@@ -78,6 +78,7 @@ export const api = {
 
   approve: (id, { dryRun = false } = {}) =>
     request(`/submissions/${id}/approve${dryRun ? "?dryRun=1" : ""}`, { method: "POST", body: {} }),
+  redrawForm: (id) => request(`/submissions/${id}/redraw-form`, { method: "POST", body: {} }),
   listApprovers: (id) => request(`/submissions/${id}/approvers`), // { approvers: [{ username, displayName, hasWaiver, isDefault }] }
   submitExpense: (id, approver, { allowDuplicates = false, reply } = {}) =>
     request(`/submissions/${id}/submit`, { method: "POST", body: { approver, allow_duplicates: allowDuplicates || undefined, reply: reply || undefined } }),

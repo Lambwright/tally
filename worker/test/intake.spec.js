@@ -6,6 +6,7 @@ const {
   extractExpenseId,
   readAttachments,
   pageRange,
+  dateFromExpenseId,
   buildFormFromTemplate,
   mdy,
   viewerIdentity,
@@ -1063,5 +1064,15 @@ describe("the real Einbau form, filled in", () => {
       lines: [{ ...mk(1, "weird"), description: "A very long description ".repeat(20) }],
     });
     expect(String.fromCharCode(...bytes.slice(0, 5))).toBe("%PDF-");
+  });
+});
+
+describe("dateFromExpenseId (a redrawn form keeps its own date)", () => {
+  it("reads DDMMYY from the start of an Expense ID", () => {
+    expect(dateFromExpenseId("271026-000000-BEWR")).toBe("2026-10-27");
+    expect(dateFromExpenseId("310726-000005-DUMA")).toBe("2026-07-31");
+    expect(dateFromExpenseId("pending-abc")).toBeNull();
+    expect(dateFromExpenseId("991326-000000-XXXX")).toBeNull(); // not a real day or month
+    expect(dateFromExpenseId(null)).toBeNull();
   });
 });
