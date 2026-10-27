@@ -506,3 +506,17 @@ body {
 .approver-option:hover { background: rgba(226,135,26,0.08); }
 .approver-option.selected { border-color: var(--orange); background: rgba(226,135,26,0.12); }
 .approver-option input { accent-color: var(--orange); }
+
+/* review-list search / filters / sort */
+.filter-bar { display: grid; gap: 10px; padding: 12px 14px; }
+.filter-row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+.filter-bar input, .filter-bar select {
+  font-size: 12px; padding: 7px 9px; border: 1px solid var(--border-input); border-radius: var(--radius-sm);
+  background: var(--bg-input); color: var(--text-primary); font-family: inherit;
+}
+.filter-bar input:focus, .filter-bar select:focus { outline: none; border-color: var(--orange); box-shadow: 0 0 0 3px rgba(226,135,26,0.15); }
+.filter-search { flex: 1; min-width: 260px; }
+.filter-bar label { display: flex; align-items: center; gap: 6px; font-size: 11px; font-weight: 600; color: var(--text-secondary); }
+.filter-bar label input { font-weight: 400; width: 150px; }
+.filter-bar label input[type="date"] { width: 140px; }
+.filter-count { margin-left: auto; }

@@ -5,6 +5,7 @@ import { applyAccentPreset } from "./accentPresets.js";
 import Header from "./components/Header.jsx";
 import LoginScreen from "./components/LoginScreen.jsx";
 import QueueList from "./components/QueueList.jsx";
+import FilterBar, { EMPTY_FILTERS } from "./components/FilterBar.jsx";
 import SubmissionDetail from "./components/SubmissionDetail.jsx";
 import UploadSubmission from "./components/UploadSubmission.jsx";
 import SubmitExpense from "./components/SubmitExpense.jsx";
@@ -34,6 +35,12 @@ export default function App() {
   const [authState, setAuthState] = useState("checking"); // checking | out | in
   const [user, setUser] = useState(null);
   const [status, setStatus] = useState("needs_review");
+  const [filters, setFilters] = useState({ ...EMPTY_FILTERS }); // what the person has typed
+  const [applied, setApplied] = useState({ ...EMPTY_FILTERS }); // what the list is loaded with (after a typing pause)
+  useEffect(() => {
+    const t = setTimeout(() => setApplied(filters), 350);
+    return () => clearTimeout(t);
+  }, [filters]);
   const [showEveryones, setShowEveryones] = useState(false); // Needs Review: false = assigned to me or unassigned
   const [submissions, setSubmissions] = useState([]);
   const [loadingList, setLoadingList] = useState(false);
@@ -86,14 +93,14 @@ export default function App() {
     setLoadingList(true);
     setListError(null);
     api
-      .listSubmissions(isSubmitterOnly ? null : status, { mine: status === "needs_review" && !showEveryones })
+      .listSubmissions(isSubmitterOnly ? null : status, { mine: status === "needs_review" && !showEveryones, filters: isSubmitterOnly ? {} : applied })
       .then((data) => setSubmissions(data.submissions || []))
       .catch((e) => {
         if (e.unauthorized) handleLogout();
         else setListError(e.message);
       })
       .finally(() => setLoadingList(false));
-  }, [status, authState, isSubmitterOnly, showEveryones]);
+  }, [status, authState, isSubmitterOnly, showEveryones, applied]);
 
   useEffect(() => {
     loadList();
@@ -181,6 +188,12 @@ export default function App() {
                 <button className="btn btn-orange btn-sm" onClick={() => setShowSubmitExpense(true)}>+ Submit expense</button>
               )}
             </div>
+            {me?.isReviewer && (
+              <FilterBar filters={filters} onChange={setFilters}
+                dateLabel={status === "approved" ? "Approved" : "Created"}
+                count={submissions.length} truncated={submissions.length >= 500}
+                netTotal={submissions.reduce((a, s) => a + (Number(s.net_total) || 0), 0)} />
+            )}
             {listError && <div className="card" style={{ color: "var(--red)" }}>{listError}</div>}
             <QueueList submissions={submissions} loading={loadingList} onSelect={selectSubmission} showStatus={isSubmitterOnly} />
           </>

@@ -1561,25 +1561,80 @@ const SUB_SUMMARY = `
 
 // `ownerFilter`: a username to scope the list to (submitter-level callers
 // see only their own rows), or null for full access.
+// What the list can be sorted by. The values are SQL, never taken from the request: the request only picks a key.
+const LIST_SORTS = {
+  date: "coalesce(s.reviewed_at, s.created_at)", // approved date for approved ones, otherwise when it was created
+  employee: "lower(s.employee_name)",
+  project: "s.project_number",
+  amount: "coalesce(li.net_total, 0)",
+  expense: "s.expense_id",
+};
+
+// "50%" in a search box must mean 50 followed by a percent sign, not "50 and anything".
+function likePattern(text) {
+  const t = String(text || "").trim().slice(0, 80);
+  return t ? "%" + t.replace(/([%_\\])/g, "\\$1") + "%" : null;
+}
+
+// GET /submissions?status=&mine=1&q=&project=&employee=&from=&to=&sort=&dir=
+//   q        keywords (each word must match somewhere): expense id, employee, project number/name, Procore Direct
+//            Cost id, who created/approved it, any line's description, any receipt's vendor
+//   project  part of a project number or name      employee  part of the employee's name
+//   from/to  YYYY-MM-DD, against the approved date (or created date if not approved), Toronto time
+//   sort     date | employee | project | amount | expense      dir  asc | desc
 async function handleList(url, sql, ownerFilter, me = null) {
-  const status = url.searchParams.get("status") || null;
-  const mine = url.searchParams.get("mine") === "1" ? String(me || "").toLowerCase() : null;
-  const caller = String(me || "").toLowerCase();
-  const rows = await sql`
-    select ${sql.unsafe(SUB_SUMMARY)},
-           coalesce(li.n, 0) as line_count, coalesce(li.net_total, 0) as net_total,
-           coalesce(li.flag_count, 0) as line_flag_count
-    from submissions s
-    left join (
-      select submission_id, count(*) n, sum(net_amount) net_total, sum(jsonb_array_length(flags)) flag_count
-      from line_items group by submission_id
-    ) li on li.submission_id = s.id
-    where (${status}::text is null or s.status = ${status})
-      and (${ownerFilter}::text is null or s.created_by = ${ownerFilter})
-      and (s.status <> 'draft' or lower(s.created_by) = ${caller})
-      and (${mine}::text is null or s.approver is null or lower(s.approver) = ${mine})
-    order by s.created_at desc limit 500`;
-  return json({ submissions: rows });
+  const sp = url.searchParams;
+  const params = [];
+  const add = (v) => { params.push(v); return "$" + params.length; };
+  const where = [];
+
+  if (sp.get("status")) where.push(`s.status = ${add(sp.get("status"))}`);
+  if (ownerFilter) where.push(`s.created_by = ${add(ownerFilter)}`);
+  where.push(`(s.status <> 'draft' or lower(s.created_by) = ${add(String(me || "").toLowerCase())})`);
+  if (sp.get("mine") === "1") {
+    const who = add(String(me || "").toLowerCase());
+    where.push(`(s.approver is null or lower(s.approver) = ${who})`);
+  }
+
+  const words = String(sp.get("q") || "").trim().split(/\s+/).filter(Boolean).slice(0, 5);
+  for (const w of words) {
+    const p = add(likePattern(w));
+    where.push(`(s.expense_id ilike ${p} or s.employee_name ilike ${p} or s.project_number ilike ${p} or s.project_name ilike ${p}
+      or s.procore_direct_cost_id ilike ${p} or s.created_by ilike ${p} or s.reviewed_by ilike ${p}
+      or exists (select 1 from line_items x where x.submission_id = s.id and x.description ilike ${p})
+      or exists (select 1 from receipts r where r.submission_id = s.id and r.vendor ilike ${p}))`);
+  }
+  const project = likePattern(sp.get("project"));
+  if (project) { const p = add(project); where.push(`(s.project_number ilike ${p} or s.project_name ilike ${p})`); }
+  const employee = likePattern(sp.get("employee"));
+  if (employee) where.push(`s.employee_name ilike ${add(employee)}`);
+
+  const day = "(coalesce(s.reviewed_at, s.created_at) at time zone 'America/Toronto')::date";
+  const isDate = (v) => /^\d{4}-\d{2}-\d{2}$/.test(v || "");
+  if (isDate(sp.get("from"))) where.push(`${day} >= ${add(sp.get("from"))}::date`);
+  if (isDate(sp.get("to"))) where.push(`${day} <= ${add(sp.get("to"))}::date`);
+
+  const sortKey = Object.hasOwn(LIST_SORTS, sp.get("sort")) ? sp.get("sort") : null;
+  const dir = sp.get("dir") === "asc" ? "asc" : "desc";
+  const order = sortKey
+    ? `${LIST_SORTS[sortKey]} ${dir} nulls last, s.created_at desc`
+    : `${LIST_SORTS.date} desc`; // newest first, as before
+
+  // v1 of the Neon driver only takes tagged templates; a built-up query with $1 placeholders goes through sql.query
+  const rows = await sql.query(
+    `select ${SUB_SUMMARY},
+            coalesce(li.n, 0) as line_count, coalesce(li.net_total, 0) as net_total,
+            coalesce(li.flag_count, 0) as line_flag_count
+     from submissions s
+     left join (
+       select submission_id, count(*) n, sum(net_amount) net_total, sum(jsonb_array_length(flags)) flag_count
+       from line_items group by submission_id
+     ) li on li.submission_id = s.id
+     where ${where.join(" and ")}
+     order by ${order} limit 500`,
+    params
+  );
+  return json({ submissions: rows, truncated: rows.length === 500 });
 }
 
 // GET /export?from=YYYY-MM-DD&to=YYYY-MM-DD&status=approved (Einbau ID,
@@ -2041,18 +2096,23 @@ const holdsApprovePortal = (u) => Array.isArray(u?.extras) && u.extras.includes(
 // A portal expense starts with a placeholder Expense ID ("pending-<uuid>", which is far too long to be a
 // Procore invoice number). Submitting gives it a real one in the Procore form's format; a second form for
 // the same person, project and day gets -2, -3... Email expenses already carry the form's own ID.
-async function assignExpenseId(sql, sub) {
+// The ID Submit will give this expense (or the one it already has). Pure choice, writes nothing, so the payload
+// preview can show exactly the invoice number that will be posted.
+async function chooseExpenseId(sql, sub) {
   if (sub.origin === "email" || !/^pending-/.test(String(sub.expense_id || ""))) return sub.expense_id;
   const base = expenseIdFor({ date: torontoDate(), projectNumber: sub.project_number, employeeName: sub.employee_name });
   for (let n = 1; n < 50; n++) {
     const candidate = n === 1 ? base : `${base}-${n}`;
     const [clash] = await sql`select 1 as x from submissions where expense_id = ${candidate} and id <> ${sub.id} limit 1`;
-    if (!clash) {
-      await sql`update submissions set expense_id = ${candidate}, updated_at = now() where id = ${sub.id}`;
-      return candidate;
-    }
+    if (!clash) return candidate;
   }
   return sub.expense_id;
+}
+
+async function assignExpenseId(sql, sub) {
+  const id = await chooseExpenseId(sql, sub);
+  if (id !== sub.expense_id) await sql`update submissions set expense_id = ${id}, updated_at = now() where id = ${sub.id}`;
+  return id;
 }
 
 // (Re)draw TALLY's Employee Expense Form for this expense and store it as THE form. A form somebody attached
@@ -2334,13 +2394,15 @@ async function handleApprove(subId, url, request, env, sql, user, isPmApprover) 
   // Date Authorized (from the form) if we have one; otherwise the earliest
   // expense date on the form; today only as a last resort.
   const headerDate = isoDate(sub.date_authorized) || lines.map((l) => isoDate(l.line_date)).filter(Boolean).sort()[0] || new Date().toISOString().slice(0, 10);
+  // A draft still carries its placeholder id; the preview shows the Expense ID Submit is about to give it.
+  const postedId = dryRun && sub.status === "draft" ? await chooseExpenseId(sql, sub) : sub.expense_id;
   let header;
   try {
-    header = buildDirectCostHeader({ ...sub, header_date: headerDate }, { employeeId, env });
+    header = buildDirectCostHeader({ ...sub, expense_id: postedId, header_date: headerDate }, { employeeId, env });
   } catch (e) {
     return json({ error: "vendor_not_configured", detail: e.message }, 500);
   }
-  const lineItems = resolved.map(({ line, wbs }) => buildDirectCostLineItem(line, wbs, sub.expense_id, line.tax_code || taxCodeId));
+  const lineItems = resolved.map(({ line, wbs }) => buildDirectCostLineItem(line, wbs, postedId, line.tax_code || taxCodeId));
 
   if (dryRun) {
     return json({
@@ -2906,6 +2968,9 @@ export default {
 
 // Exported for unit tests.
 export const _test = {
+  chooseExpenseId,
+  handleList,
+  likePattern,
   attachSubmissionFiles,
   compareCodes,
   budgetedCodes,

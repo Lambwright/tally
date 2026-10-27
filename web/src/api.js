@@ -44,10 +44,16 @@ async function request(path, { method = "GET", body, headers } = {}) {
 
 export const api = {
   // mine = only what is assigned to me or unassigned (a reviewer's default queue)
-  listSubmissions: (status, { mine = false } = {}) => {
+  // filters: { q, project, employee, from, to, sort: "date:desc" } — all applied by the worker
+  listSubmissions: (status, { mine = false, filters = {} } = {}) => {
     const q = [];
     if (status) q.push(`status=${encodeURIComponent(status)}`);
     if (mine) q.push("mine=1");
+    for (const k of ["q", "project", "employee", "from", "to"]) if (filters[k]) q.push(`${k}=${encodeURIComponent(filters[k])}`);
+    if (filters.sort) {
+      const [key, dir] = filters.sort.split(":");
+      q.push(`sort=${encodeURIComponent(key)}`, `dir=${encodeURIComponent(dir || "desc")}`);
+    }
     return request(`/submissions${q.length ? `?${q.join("&")}` : ""}`);
   },
   getSubmission: (id) => request(`/submissions/${id}`), // { submission, line_items, receipts }

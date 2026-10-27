@@ -14,7 +14,7 @@ const VERBS = [
   "Philosophizing", "Puzzling", "Deciphering", "Rummaging", "Tabulating", "Concocting", "Cross-referencing",
   "Peering at the fine print", "Consulting the oracle", "Wrangling line items", "Reticulating", "Brewing",
 ];
-function useVerb(active) {
+export function useVerb(active) {
   const [i, setI] = useState(() => Math.floor(Math.random() * VERBS.length));
   useEffect(() => {
     if (!active) return undefined;

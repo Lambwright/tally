@@ -5,6 +5,9 @@ const {
   extractExpenseId,
   readAttachments,
   pageRange,
+  chooseExpenseId,
+  handleList,
+  likePattern,
   attachSubmissionFiles,
   compareCodes,
   expenseIdFor,
@@ -898,5 +901,62 @@ describe("attachSubmissionFiles (checks the Direct Cost really shows the files)"
       expect(r[0].error).toMatch(/Neither way attached/);
       expect(r[0].error).toMatch(/multipart attach answered OK/);
     } finally { globalThis.fetch = real; }
+  });
+});
+
+describe("handleList filters and sorting", () => {
+  const run = async (query, ownerFilter = null) => {
+    let captured = null;
+    const sql = { query: async (text, params) => { captured = { text, params }; return []; } };
+    const res = await handleList(new URL("https://t.test/submissions" + query), sql, ownerFilter, "Leela@Einbau.ca");
+    return { ...captured, body: await res.json() };
+  };
+  it("keeps drafts private and defaults to newest first", async () => {
+    const { text, params } = await run("?status=approved");
+    expect(text).toContain("s.status = $1");
+    expect(text).toContain("s.status <> 'draft' or lower(s.created_by) = $2");
+    expect(params.slice(0, 2)).toEqual(["approved", "leela@einbau.ca"]);
+    expect(text).toContain("order by coalesce(s.reviewed_at, s.created_at) desc");
+  });
+  it("every keyword must match somewhere, special characters are escaped, and values are parameters, not SQL", async () => {
+    const { text, params } = await run("?q=" + encodeURIComponent("park 50%; drop table"));
+    expect(params).toContain("%park%");
+    expect(params).toContain("%50\\%;%"); // the percent sign is escaped so it means a percent sign
+    expect(text).not.toContain("drop table");
+    expect((text.match(/ilike/g) || []).length).toBeGreaterThan(8);
+  });
+  it("project, employee and a date range narrow it; a bad date is ignored", async () => {
+    const { text, params } = await run("?project=Cumberland&employee=Ben&from=2026-10-01&to=2026-10-31");
+    expect(params).toEqual(expect.arrayContaining(["%Cumberland%", "%Ben%", "2026-10-01", "2026-10-31"]));
+    expect(text).toContain("America/Toronto");
+    const bad = await run("?from=yesterday");
+    expect(bad.params).not.toContain("yesterday");
+  });
+  it("sorts only by the known keys, asc or desc", async () => {
+    expect((await run("?sort=amount&dir=asc")).text).toContain("order by coalesce(li.net_total, 0) asc nulls last");
+    expect((await run("?sort=employee")).text).toContain("order by lower(s.employee_name) desc nulls last");
+    const odd = (await run("?sort=s.id;drop table x")).text;
+    expect(odd).toContain("order by coalesce(s.reviewed_at, s.created_at) desc");
+    expect(odd).not.toContain("drop table");
+  });
+  it("a submitter-only caller stays scoped to their own", async () => {
+    const { text, params } = await run("", "josh@einbau.ca");
+    expect(text).toContain("s.created_by = $1");
+    expect(params[0]).toBe("josh@einbau.ca");
+  });
+});
+
+describe("chooseExpenseId (what the preview shows and Submit assigns)", () => {
+  const sub = { id: "s1", origin: "upload", expense_id: "pending-abc", project_number: "2026_0183", employee_name: "Ben Wright" };
+  const fakeSql = (taken) => async (_strings, candidate) => (taken.includes(candidate) ? [{ x: 1 }] : []);
+  it("gives the form-style id, and numbers a second one for the same person, project and day", async () => {
+    const today = expenseIdFor({ projectNumber: "2026_0183", employeeName: "Ben Wright" });
+    expect(await chooseExpenseId(fakeSql([]), sub)).toBe(today);
+    expect(await chooseExpenseId(fakeSql([today]), sub)).toBe(today + "-2");
+    expect(await chooseExpenseId(fakeSql([today, today + "-2"]), sub)).toBe(today + "-3");
+  });
+  it("leaves email expenses and ones that already have a real id alone", async () => {
+    expect(await chooseExpenseId(fakeSql([]), { ...sub, origin: "email" })).toBe("pending-abc");
+    expect(await chooseExpenseId(fakeSql([]), { ...sub, expense_id: "210926-260183-BEWR" })).toBe("210926-260183-BEWR");
   });
 });

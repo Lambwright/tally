@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "../api.js";
 import DirectCostPreview from "./DirectCostPreview.jsx";
+import Thinking from "./Thinking.jsx";
 
 // Submit Expense: step 1 shows exactly what will be posted to Procore (the same preview as
 // Approve's dry run), step 2 picks who approves it. Only on "Submit" does the expense leave the
@@ -59,12 +60,12 @@ export default function SubmitExpenseModal({ id, sub, costCodes, resubmit = fals
         </p>
 
         <div className="card-title" style={{ fontSize: 11 }}>1 · Payload preview</div>
-        {!preview && !previewError && <div className="row-secondary" style={{ padding: "8px 0" }}>Building the preview…</div>}
+        {!preview && !previewError && <Thinking label="Checking the lines, the cost codes against the project's budget, and the invoice number…" />}
         {previewError && <div className="login-error">{previewError}</div>}
         {preview && <DirectCostPreview dryRun={preview} sub={sub} costCodes={costCodes} />}
 
         <div className="card-title" style={{ fontSize: 11, marginTop: 16 }}>2 · Who approves it</div>
-        {!approvers && !approversError && <div className="row-secondary">Loading approvers…</div>}
+        {!approvers && !approversError && <div className="row-secondary">Looking up who can approve it…</div>}
         {approversError && <div className="login-error">{approversError}</div>}
         {approvers && approvers.length === 0 && (
           <div className="login-error">No one else can approve this expense right now. (It needs a TALLY approver who isn't you or the employee it's for.)</div>
