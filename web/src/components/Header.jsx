@@ -48,6 +48,7 @@ export default function Header({ user, onLogout }) {
       <div className="header-badge app-switcher" ref={ref}>
         <span
           className="header-badge-name"
+          data-einbau-logo
           style={{ cursor: "pointer" }}
           onClick={(e) => { e.stopPropagation(); setOpen((v) => !v); }}
         >
