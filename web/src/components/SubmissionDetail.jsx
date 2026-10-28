@@ -3,6 +3,7 @@ import { api, fetchReceiptObjectUrl } from "../api.js";
 import RevisionModal from "./RevisionModal.jsx";
 import RevisionPopup, { revisionThread } from "./RevisionPopup.jsx";
 import DialogModal from "./DialogModal.jsx";
+import Loader, { workingText } from "./Loader.jsx";
 import { shownExpenseId, isPendingId } from "../expenseLabel.js";
 import EditableText from "./EditableText.jsx";
 import DirectCostPreview from "./DirectCostPreview.jsx";
@@ -146,6 +147,7 @@ export default function SubmissionDetail({ id, onClose, onChanged, me }) {
   const cols = useLineColumnWidths();
   const [showSubmit, setShowSubmit] = useState(false);
   const [showThread, setShowThread] = useState(false);
+  const [pushing, setPushing] = useState(false); // Approve is posting to Procore
   const [dialog, setDialog] = useState(null); // TALLY's own confirm / ask-a-reason dialog (see DialogModal)
   const threadAutoShown = useRef(false);
   const [selectedLineIds, setSelectedLineIds] = useState(new Set());
@@ -357,7 +359,9 @@ export default function SubmissionDetail({ id, onClose, onChanged, me }) {
 
   async function handleApprove() {
     setBusy(true);
+    setPushing(true);
     await mutate(() => api.approve(id));
+    setPushing(false);
     setBusy(false);
   }
   async function handleDryRun() {
@@ -547,7 +551,7 @@ export default function SubmissionDetail({ id, onClose, onChanged, me }) {
     }
   }
 
-  if (loading) return <div className="empty-state">Loading…</div>;
+  if (loading) return <div className="empty-state"><Loader size={110} /></div>;
   if (error)
     return (
       <div>
@@ -905,6 +909,9 @@ export default function SubmissionDetail({ id, onClose, onChanged, me }) {
         </div>
       </div>
 
+      {pushing && (
+        <div className="card"><Loader text="Posting to Procore and attaching the files. This can take a minute." size={100} /></div>
+      )}
       {actionError && <div className="card" style={{ color: "var(--red)" }}>{actionError}</div>}
 
       <div className="modal-actions" style={{ justifyContent: "flex-start", flexWrap: "wrap" }}>
@@ -941,7 +948,7 @@ export default function SubmissionDetail({ id, onClose, onChanged, me }) {
           <>
             <button className="btn btn-orange" disabled={busy || !allComplete || !!dupFlag || needsPmApproval || !!selfBlock || sub.status === "needs_revision"} onClick={handleApprove}
               title={selfBlock ? `You can't approve this one — ${selfBlock}.` : dupFlag ? dupFlag.detail : needsPmApproval ? "Needs an admin's approval first." : undefined}>
-              {busy ? "Working…" : "Approve"}
+              {busy ? workingText() : "Approve"}
             </button>
             <button className="btn btn-ghost" disabled={busy} onClick={handleDryRun}>Preview payload</button>
             {sub.origin !== "email" && (

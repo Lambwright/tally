@@ -42,6 +42,17 @@ function getHashId() {
 
 export default function App() {
   const [authState, setAuthState] = useState("checking"); // checking | out | in
+  // Seasonal decorations (cobwebs and bats at Halloween, snow at Christmas) from the suite's shared script. Run once the
+  // page and its header have rendered; harmless if the script isn't there.
+  const festiveStarted = useRef(false);
+  useEffect(() => {
+    if (festiveStarted.current || authState === "checking") return;
+    festiveStarted.current = true;
+    const t = setTimeout(() => {
+      try { window.EinbauFestive?.init({ app: "TALLY" }); } catch { /* decorations are optional */ }
+    }, 50);
+    return () => clearTimeout(t);
+  }, [authState]);
   const [user, setUser] = useState(null);
   const [status, setStatus] = useState("needs_review");
   const [filters, setFilters] = useState({ ...EMPTY_FILTERS }); // what the person has typed

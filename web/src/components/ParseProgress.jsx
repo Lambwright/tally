@@ -3,7 +3,7 @@
 // a heartbeat; if it goes quiet for STALL_MS the parse has died (e.g. the request was cut off)
 // and the person can restart it.
 import { useEffect, useState } from "react";
-import ClaudeTyping from "./ClaudeTyping.jsx";
+import Loader from "./Loader.jsx";
 
 export const STALL_MS = 120000;
 
@@ -14,7 +14,7 @@ const VERBS = [
   "Philosophizing", "Puzzling", "Deciphering", "Rummaging", "Tabulating", "Concocting", "Cross-referencing",
   "Peering at the fine print", "Consulting the oracle", "Wrangling line items", "Reticulating", "Brewing",
 ];
-export function useVerb(active) {
+export function useVerb(active) { // (kept for anything that still wants a word; the shared loader has its own lines)
   const [i, setI] = useState(() => Math.floor(Math.random() * VERBS.length));
   useEffect(() => {
     if (!active) return undefined;
@@ -41,12 +41,10 @@ function Step({ state, children }) {
 }
 
 export default function ParseProgress({ flag, now, onRestart, restarting, finished = false }) {
-  const verb = useVerb(!finished);
   if (finished) {
     return (
       <div className="card" style={{ display: "flex", alignItems: "center", gap: 16 }}>
-        <ClaudeTyping state="done" />
-        <div className="card-title" style={{ color: "var(--green)" }}>All done!</div>
+        <Loader state="done" doneText="All done!" size={110} />
       </div>
     );
   }
@@ -61,10 +59,10 @@ export default function ParseProgress({ flag, now, onRestart, restarting, finish
   return (
     <div className="card" style={{ borderColor: stalled ? "var(--red)" : undefined }}>
       <div style={{ display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" }}>
-      <ClaudeTyping state={stalled ? "stalled" : "working"} />
+      <Loader state={stalled ? "stalled" : "working"} size={110} stalledText="This looks stalled" />
       <div style={{ flex: 1, minWidth: 220 }}>
       <div className="card-title" style={{ color: stalled ? "var(--red)" : "var(--yellow)" }}>
-        {stalled ? "This looks stalled" : `${verb}…`}
+        {stalled ? "This looks stalled" : "Reading your files"}
         {started && !queued ? <span className="row-secondary" style={{ marginLeft: 10, fontWeight: 400 }}>{mmss(now - started)} elapsed</span> : null}
       </div>
 

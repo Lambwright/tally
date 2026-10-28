@@ -20,8 +20,10 @@ const SUBMITTER_STATUS = {
 
 import { shownExpenseId } from "../expenseLabel.js";
 
+import Loader from "./Loader.jsx";
+
 export default function QueueList({ submissions, loading, onSelect, showStatus = false }) {
-  if (loading) return <div className="empty-state">Loading…</div>;
+  if (loading) return <div className="empty-state"><Loader size={90} /></div>;
   if (!submissions.length) return <div className="empty-state">Nothing here.</div>;
 
   return (

@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { api } from "../api.js";
 import DirectCostPreview from "./DirectCostPreview.jsx";
 import Thinking from "./Thinking.jsx";
+import Loader from "./Loader.jsx";
 
 // Submit Expense: step 1 shows exactly what will be posted to Procore (the same preview as
 // Approve's dry run), step 2 picks who approves it. Only on "Submit" does the expense leave the
@@ -99,6 +100,8 @@ export default function SubmitExpenseModal({ id, sub, costCodes, resubmit = fals
             These are separate purchases, not the same receipts again. Submit anyway.
           </label>
         )}
+
+        {busy && <Loader text="Drawing the form and sending it to the approver…" size={90} />}
 
         <div className="modal-actions">
           <button type="button" className="btn btn-ghost" onClick={onClose} disabled={busy}>Cancel</button>

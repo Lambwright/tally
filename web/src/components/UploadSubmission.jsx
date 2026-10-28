@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../api.js";
 import Combobox from "./Combobox.jsx";
+import Loader from "./Loader.jsx";
 
 const MAX_FILES = 12;
 
@@ -142,6 +143,8 @@ export default function UploadSubmission({ onClose, onCreated }) {
         </div>
 
         {error && <div className="login-error">{error}</div>}
+
+        {busy && <Loader text="Uploading your files…" size={90} />}
 
         <div className="modal-actions">
           <button type="button" className="btn btn-ghost" onClick={onClose} disabled={busy}>Cancel</button>

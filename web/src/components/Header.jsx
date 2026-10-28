@@ -44,7 +44,7 @@ export default function Header({ user, onLogout }) {
   }, [open]);
 
   return (
-    <div className="header">
+    <div className="header" data-einbau-header>
       <div className="header-badge app-switcher" ref={ref}>
         <span
           className="header-badge-name"
