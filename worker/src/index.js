@@ -831,6 +831,414 @@ async function attachSubmissionFiles(env, token, projectId, directCostId, receip
   return attachResults;
 }
 
+// ---------------------------------------------------------------------------
+// Procore side panel: add files to a Direct Cost, including an ERP-locked one.
+// The page is HELM's (?panel=erp-tools); TALLY's worker does the Procore work.
+// ---------------------------------------------------------------------------
+
+// A TALLY admin may attach. Anyone else needs "dc_attach", switched on per person in
+// HELM -> Role Matrix -> Tool permissions. TALLY admin aside, this is deliberately NOT
+// "any TALLY access": the panel writes to Direct Costs TALLY never made, so a submitter
+// doesn't get it by default. Fails closed on a missing or malformed appExtras.
+const DC_ATTACH_EXTRA = "dc_attach";
+function canAttachToDirectCost(user, level) {
+  if (level === "admin") return true;
+  if (level !== "submitter") return false;
+  const extras = user && user.appExtras && typeof user.appExtras === "object" ? user.appExtras.TALLY : undefined;
+  return Array.isArray(extras) && extras.includes(DC_ATTACH_EXTRA);
+}
+
+const DC_ATTACH_MAX_FILES = 10;
+const DC_ATTACH_MAX_BYTES = 20 * 1024 * 1024; // the whole upload, matching LEDGER's 20 MB batches
+const procoreIdParam = (v) => (/^\d{1,20}$/.test(String(v ?? "")) ? String(v) : null);
+
+// What the panel shows so a person can check it's the right Direct Cost before uploading.
+function directCostSummary(dc) {
+  return {
+    id: String(dc.id),
+    number: dc.invoice_number || null,
+    status: dc.status || null,
+    type: dc.direct_cost_type || null,
+    vendor: dc.vendor_name || dc.vendor?.name || null,
+    date: dc.direct_cost_date || null,
+    description: dc.description || null,
+    total: dc.grand_total ?? null,
+    erpLinked: Boolean(dc.origin_id),
+    attachments: (dc.attachments || []).map((a) => ({ id: String(a.id), name: a.name || a.filename || "(unnamed)" })),
+  };
+}
+
+// Compare the Direct Cost's files before and after by id. Procore can answer 200 and link nothing, and a
+// name can legitimately repeat, so only ids count. `lost` should always be empty: on 2026-11-06 a multipart
+// PATCH added to the existing files, and this is what would catch that ever changing.
+function compareAttachments(before, after, expected) {
+  const ids = (dc) => (dc?.attachments || []).map((a) => String(a.id));
+  const beforeIds = ids(before), afterIds = ids(after);
+  const added = afterIds.filter((id) => !beforeIds.includes(id));
+  const lost = beforeIds.filter((id) => !afterIds.includes(id));
+  return { added: added.length, lost: lost.length, ok: added.length >= expected && lost.length === 0 };
+}
+
+const cleanFilename = (name) => String(name || "file").split(/[\\/]/).pop().replace(/[\u0000-\u001f]/g, "").slice(-180) || "file";
+
+async function ensureDcAttachmentLog(sql) {
+  await sql`create table if not exists dc_attachment_log (
+    id bigserial primary key,
+    created_at timestamptz not null default now(),
+    finished_at timestamptz,
+    username text not null,
+    display_name text,
+    project_id text not null,
+    direct_cost_id text not null,
+    direct_cost_number text,
+    origin_id text,
+    filename text not null,
+    content_type text,
+    size_bytes bigint,
+    status text not null default 'pending',
+    detail text
+  )`;
+}
+
+function procorePanelError(e) {
+  if (e.status === 404) return json({ error: "not_found", detail: "Procore can't find that Direct Cost." }, 404);
+  if (e.status === 403) return json({ error: "procore_forbidden", detail: "TALLY's Procore account isn't allowed to open that Direct Cost." }, 502);
+  return json({ error: "procore_error", detail: e.message.slice(0, 300) }, 502);
+}
+
+// GET /direct-cost-panel?project_id=&id=
+async function handleDirectCostPanelRead(url, env) {
+  const projectId = procoreIdParam(url.searchParams.get("project_id"));
+  const id = procoreIdParam(url.searchParams.get("id"));
+  if (!projectId || !id) return json({ error: "bad_request", detail: "A project and a Direct Cost are both needed." }, 400);
+  try {
+    const token = await getProcoreToken(env);
+    const dc = await procoreFetch(env, token, `/rest/v1.0/projects/${projectId}/direct_costs/${id}`);
+    return json({ directCost: directCostSummary(dc) });
+  } catch (e) {
+    return procorePanelError(e);
+  }
+}
+
+// POST /direct-cost-panel/attach, multipart: project_id, id, files (one or more).
+// Multipart attachments[] is the only method used: upload_ids answers 200 and links nothing on a Direct
+// Cost, and this write never touches origin_id. The log row goes in BEFORE the upload because Procore only
+// ever sees TALLY's service account, so no log means no upload.
+async function handleDirectCostPanelAttach(request, env, sql, user) {
+  if (Number(request.headers.get("Content-Length") || 0) > DC_ATTACH_MAX_BYTES + 1024 * 1024) {
+    return json({ error: "too_large", detail: "That's over the 20 MB limit for one upload." }, 413);
+  }
+  let form;
+  try {
+    form = await request.formData();
+  } catch {
+    return json({ error: "bad_request", detail: "The upload couldn't be read." }, 400);
+  }
+  const projectId = procoreIdParam(form.get("project_id"));
+  const id = procoreIdParam(form.get("id"));
+  const uploads = form.getAll("files").filter((f) => f && typeof f === "object" && f.size > 0);
+  if (!projectId || !id) return json({ error: "bad_request", detail: "A project and a Direct Cost are both needed." }, 400);
+  if (!uploads.length) return json({ error: "bad_request", detail: "No files were sent, or they were empty." }, 400);
+  if (uploads.length > DC_ATTACH_MAX_FILES) return json({ error: "too_many", detail: `Up to ${DC_ATTACH_MAX_FILES} files at a time.` }, 400);
+  if (uploads.reduce((n, f) => n + f.size, 0) > DC_ATTACH_MAX_BYTES) return json({ error: "too_large", detail: "That's over the 20 MB limit for one upload." }, 413);
+
+  const dcPath = `/rest/v1.0/projects/${projectId}/direct_costs/${id}`;
+  let token, before;
+  try {
+    token = await getProcoreToken(env);
+    before = await procoreFetch(env, token, dcPath);
+  } catch (e) {
+    return procorePanelError(e);
+  }
+
+  const files = await Promise.all(uploads.map(async (f) => ({
+    bytes: new Uint8Array(await f.arrayBuffer()),
+    contentType: f.type || "application/octet-stream",
+    filename: cleanFilename(f.name),
+  })));
+
+  const logIds = [];
+  try {
+    await ensureDcAttachmentLog(sql);
+    for (const f of files) {
+      const [row] = await sql`
+        insert into dc_attachment_log (username, display_name, project_id, direct_cost_id, direct_cost_number, origin_id, filename, content_type, size_bytes)
+        values (${user.username}, ${user.displayName || null}, ${projectId}, ${id}, ${before.invoice_number || null}, ${before.origin_id || null}, ${f.filename}, ${f.contentType}, ${f.bytes.length})
+        returning id`;
+      logIds.push(row.id);
+    }
+  } catch (e) {
+    console.error("dc_attachment_log write failed:", e);
+    return json({ error: "log_failed", detail: "Nothing was uploaded: the upload couldn't be logged. Try again in a minute." }, 503);
+  }
+  const finish = (status, detail) =>
+    sql`update dc_attachment_log set status = ${status}, detail = ${detail}, finished_at = now() where id = any(${logIds})`
+      .catch((e) => console.error("dc_attachment_log update failed:", e));
+
+  try {
+    await procoreAttachMultipart(env, token, projectId, id, files);
+  } catch (e) {
+    await finish("failed", e.message.slice(0, 500));
+    return json({ error: "attach_failed", detail: "Procore refused the upload, so nothing was added.", procore: e.message.slice(0, 300) }, 502);
+  }
+
+  // Procore links files a moment after the call, so check twice before calling it a failure.
+  let after = null, check = null;
+  for (let i = 0; i < 2; i++) {
+    await new Promise((r) => setTimeout(r, Number(env.ATTACH_SETTLE_MS ?? 2000)));
+    try {
+      after = await procoreFetch(env, token, dcPath);
+      check = compareAttachments(before, after, files.length);
+      if (check.ok) break;
+    } catch (e) {
+      console.error("dc attach read-back failed:", e);
+    }
+  }
+
+  if (!check) {
+    await finish("unverified", "Sent, but the Direct Cost couldn't be read back.");
+    return json({ error: "unverified", detail: "The upload was sent, but it couldn't be confirmed. Check the Direct Cost before trying again." }, 502);
+  }
+  if (!check.ok) {
+    const detail = check.lost
+      ? `${check.lost} existing file(s) no longer show on the Direct Cost.`
+      : `Procore accepted the upload, but only ${check.added} of ${files.length} file(s) show on the Direct Cost.`;
+    await finish("failed", detail);
+    return json({ error: "not_confirmed", detail: `${detail} Check the Direct Cost before trying again.`, directCost: directCostSummary(after) }, 502);
+  }
+  await finish("attached", null);
+  return json({ ok: true, attached: files.map((f) => f.filename), directCost: directCostSummary(after) });
+}
+
+// ---------------------------------------------------------------------------
+// Procore side panel: lock and unlock a record's ERP link (its origin_id).
+// Blanking origin_id takes the NetSuite link off; writing it puts one on, for a
+// record that synced across but never got its badge. Every path below was tested
+// live on 2026-11-06 with TALLY's account, on Test Project records.
+// ---------------------------------------------------------------------------
+
+// Dedicated on purpose (Ben): being a TALLY admin is NOT enough. Switched on per person in
+// HELM -> Role Matrix -> Tool permissions. Fails closed on a missing or malformed appExtras.
+const ERP_LINK_EXTRA = "erp_link";
+function canManageErpLinks(user) {
+  const extras = user && user.appExtras && typeof user.appExtras === "object" ? user.appExtras.TALLY : undefined;
+  return Array.isArray(extras) && extras.includes(ERP_LINK_EXTRA);
+}
+
+const vendorOf = (r) => r.vendor_name || (typeof r.vendor === "string" ? r.vendor : r.vendor?.name) || null;
+const projectScoped = (name, wrapper, row) => ({
+  list: (p) => `/rest/v1.0/${name}?project_id=${p}`,
+  show: (p, id) => `/rest/v1.0/${name}/${id}?project_id=${p}`,
+  patch: (p, id) => `/rest/v1.0/${name}/${id}?project_id=${p}`,
+  body: (p, value) => ({ project_id: Number(p), [wrapper]: { origin_id: value } }),
+  row,
+});
+const contractRow = (r) => ({ number: r.number ?? null, title: r.title || vendorOf(r), amount: r.grand_total ?? null });
+
+const ERP_TYPES = {
+  direct_cost: {
+    list: (p) => `/rest/v1.0/projects/${p}/direct_costs?`,
+    show: (p, id) => `/rest/v1.0/projects/${p}/direct_costs/${id}`,
+    patch: (p, id) => `/rest/v1.0/projects/${p}/direct_costs/${id}`,
+    body: (p, value) => ({ item: { origin_id: value } }),
+    row: (r) => ({ number: r.invoice_number || null, title: vendorOf(r) || String(r.description || "").trim() || null, amount: r.grand_total ?? null }),
+  },
+  change_order: projectScoped("change_order_packages", "change_order", contractRow),
+  work_order: projectScoped("work_order_contracts", "work_order_contract", contractRow),
+  purchase_order: projectScoped("purchase_order_contracts", "purchase_order_contract", contractRow),
+  sub_invoice: projectScoped("requisitions", "requisition", (r) => ({ number: r.invoice_number || r.number || null, title: vendorOf(r), amount: null })),
+  // Show is singular here: /prime_contracts/{id} is a 404 even for reads.
+  prime_contract: {
+    ...projectScoped("prime_contracts", "prime_contract", contractRow),
+    show: (p, id) => `/rest/v1.0/prime_contract/${id}?project_id=${p}`,
+    patch: (p, id) => `/rest/v1.0/prime_contract/${id}?project_id=${p}`,
+  },
+  // Owner invoices have no project-wide list, and PATCH only works nested under the contract.
+  owner_invoice: {
+    needsParent: true,
+    show: (p, id) => `/rest/v1.0/payment_applications/${id}?project_id=${p}`,
+    patch: (p, id, parent) => `/rest/v1.0/prime_contracts/${parent}/payment_applications/${id}?project_id=${p}`,
+    body: (p, value) => ({ project_id: Number(p), payment_application: { origin_id: value } }),
+    row: (r) => ({ number: r.invoice_number || r.number || null, title: r.formatted_contract_company || null, amount: r.total_amount_accrued_this_period ?? null }),
+  },
+};
+
+const ERP_MAX_ROWS = 500;
+const ERP_MAX_CHANGES = 5; // per request: ~5 subrequests each, and this account's per-invocation ceiling is low
+const ERP_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_\-+.:#/ ]{0,99}$/;
+const originOf = (r) => (r?.origin_id == null ? "" : String(r.origin_id));
+
+async function ensureErpLinkLog(sql) {
+  await sql`create table if not exists erp_link_log (
+    id bigserial primary key,
+    created_at timestamptz not null default now(),
+    finished_at timestamptz,
+    username text not null,
+    display_name text,
+    project_id text not null,
+    record_type text not null,
+    record_id text not null,
+    record_number text,
+    action text not null,
+    old_origin_id text,
+    new_origin_id text,
+    reason text not null,
+    status text not null default 'pending',
+    detail text
+  )`;
+}
+
+async function fetchErpPages(env, token, path) {
+  const rows = [];
+  const sep = path.endsWith("?") ? "" : "&";
+  for (let page = 1; rows.length < ERP_MAX_ROWS; page++) {
+    const batch = await procoreFetch(env, token, `${path}${sep}per_page=100&page=${page}`);
+    if (!Array.isArray(batch)) break;
+    rows.push(...batch);
+    if (batch.length < 100) break;
+  }
+  return rows;
+}
+
+function erpRow(type, r, parentId) {
+  return { id: String(r.id), parentId: parentId || null, status: r.status || null, originId: originOf(r), ...ERP_TYPES[type].row(r) };
+}
+
+// GET /erp-links?project_id=&type=
+async function handleErpLinkList(url, env, sql) {
+  const projectId = procoreIdParam(url.searchParams.get("project_id"));
+  const type = url.searchParams.get("type");
+  if (!projectId || !Object.hasOwn(ERP_TYPES, type || "")) return json({ error: "bad_request", detail: "A project and a record type are both needed." }, 400);
+  let rows = [];
+  try {
+    const token = await getProcoreToken(env);
+    if (type === "owner_invoice") {
+      const contracts = await fetchErpPages(env, token, ERP_TYPES.prime_contract.list(projectId));
+      for (const c of contracts.slice(0, 10)) {
+        const invoices = await fetchErpPages(env, token, `/rest/v1.0/prime_contracts/${c.id}/payment_applications?project_id=${projectId}`);
+        rows.push(...invoices.map((r) => erpRow(type, r, String(c.id))));
+      }
+    } else {
+      rows = (await fetchErpPages(env, token, ERP_TYPES[type].list(projectId))).map((r) => erpRow(type, r));
+    }
+  } catch (e) {
+    return procorePanelError(e);
+  }
+
+  // The ID each record had when it was last unlocked here, to offer back when re-locking. A nicety: never block on it.
+  const lastOriginIds = {};
+  try {
+    await ensureErpLinkLog(sql);
+    const past = await sql`
+      select distinct on (record_id) record_id, old_origin_id from erp_link_log
+      where project_id = ${projectId} and record_type = ${type} and action = 'unlock' and status = 'done'
+      order by record_id, created_at desc`;
+    for (const p of past) lastOriginIds[p.record_id] = p.old_origin_id;
+  } catch (e) {
+    console.error("erp_link_log read failed:", e);
+  }
+  return json({ rows: rows.map((r) => ({ ...r, lastOriginId: lastOriginIds[r.id] || null })), truncated: rows.length >= ERP_MAX_ROWS });
+}
+
+// One record: read it, log the intent, write, read it back. The log row comes first because
+// Procore only sees the service account, so no log means no change.
+async function applyErpChange(env, token, sql, user, { projectId, type, reason }, change) {
+  const def = ERP_TYPES[type];
+  const { id, action } = change;
+  const wanted = action === "lock" ? change.originId : "";
+  const fail = (error) => ({ id, ok: false, error });
+
+  let current;
+  try {
+    current = await procoreFetch(env, token, def.show(projectId, id));
+  } catch (e) {
+    return fail(e.status === 404 ? "Procore can't find this record." : e.message.slice(0, 300));
+  }
+  const old = originOf(current);
+  if (action === "unlock" && !old) return fail("It's already unlocked.");
+  if (action === "lock" && old) return fail(`It's already linked to ${old}. Unlock it first to change the ID.`);
+
+  const number = def.row(current).number;
+  let logId;
+  try {
+    const [row] = await sql`
+      insert into erp_link_log (username, display_name, project_id, record_type, record_id, record_number, action, old_origin_id, new_origin_id, reason)
+      values (${user.username}, ${user.displayName || null}, ${projectId}, ${type}, ${id}, ${number == null ? null : String(number)}, ${action}, ${old}, ${wanted}, ${reason})
+      returning id`;
+    logId = row.id;
+  } catch (e) {
+    console.error("erp_link_log write failed:", e);
+    return fail("Nothing was changed: this couldn't be logged. Try again in a minute.");
+  }
+  const finish = (status, detail) =>
+    sql`update erp_link_log set status = ${status}, detail = ${detail}, finished_at = now() where id = ${logId}`
+      .catch((e) => console.error("erp_link_log update failed:", e));
+
+  try {
+    await procoreFetch(env, token, def.patch(projectId, id, change.parentId), { method: "PATCH", body: def.body(projectId, wanted) });
+  } catch (e) {
+    await finish("failed", e.message.slice(0, 500));
+    return fail(`Procore refused this: ${e.message.slice(0, 200)}`);
+  }
+  let after;
+  try {
+    after = await procoreFetch(env, token, def.show(projectId, id));
+  } catch (e) {
+    await finish("unverified", e.message.slice(0, 500));
+    return fail("The change was sent, but it couldn't be confirmed. Check this record.");
+  }
+  if (originOf(after) !== wanted) {
+    const detail = `Procore answered OK, but the record shows "${originOf(after)}".`;
+    await finish("failed", detail);
+    return fail(detail);
+  }
+  await finish("done", null);
+  return { id, ok: true, originId: wanted };
+}
+
+// POST /erp-links { project_id, type, reason, changes: [{ id, parent_id?, action: 'lock'|'unlock', origin_id? }] }
+// The whole request is checked before anything is written, so a bad row can't leave a half-done batch.
+async function handleErpLinkChange(request, env, sql, user) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "bad_request", detail: "The request couldn't be read." }, 400);
+  }
+  const projectId = procoreIdParam(body?.project_id);
+  const type = body?.type;
+  const reason = String(body?.reason || "").trim().slice(0, 300);
+  if (!projectId || !Object.hasOwn(ERP_TYPES, type || "")) return json({ error: "bad_request", detail: "A project and a record type are both needed." }, 400);
+  if (reason.length < 3) return json({ error: "bad_request", detail: "Say why you're making this change." }, 400);
+  const raw = Array.isArray(body?.changes) ? body.changes : [];
+  if (!raw.length || raw.length > ERP_MAX_CHANGES) return json({ error: "bad_request", detail: `Send 1 to ${ERP_MAX_CHANGES} changes at a time.` }, 400);
+
+  const changes = [];
+  for (const c of raw) {
+    const id = procoreIdParam(c?.id);
+    const parentId = procoreIdParam(c?.parent_id);
+    const originId = String(c?.origin_id ?? "").trim();
+    if (!id || !["lock", "unlock"].includes(c?.action)) return json({ error: "bad_request", detail: "One of the changes isn't valid." }, 400);
+    if (ERP_TYPES[type].needsParent && !parentId) return json({ error: "bad_request", detail: "An owner invoice needs its contract." }, 400);
+    if (c.action === "lock" && !ERP_ID_RE.test(originId)) return json({ error: "bad_id", detail: `"${originId.slice(0, 40)}" doesn't look like a NetSuite ID.` }, 400);
+    changes.push({ id, parentId, action: c.action, originId });
+  }
+
+  let token;
+  try {
+    token = await getProcoreToken(env);
+    await ensureErpLinkLog(sql);
+  } catch (e) {
+    console.error("erp link setup failed:", e);
+    return json({ error: "setup_failed", detail: "Nothing was changed. Try again in a minute." }, 503);
+  }
+  const results = [];
+  for (const change of changes) {
+    results.push(await applyErpChange(env, token, sql, user, { projectId, type, reason }, change));
+  }
+  return json({ results });
+}
+
 async function fetchProcoreProjects(env, token) {
   const projects = [];
   let page = 1;
@@ -2979,6 +3387,24 @@ async function routeRequest(request, env, ctx, sec) {
         }
       }
 
+      if (parts[0] === "erp-links" && parts.length === 1) {
+        if (!canManageErpLinks(auth.user)) {
+          return json({ error: "forbidden", detail: "You don't have permission to change ERP links. Ask an admin to switch it on in HELM." }, 403);
+        }
+        if (request.method === "GET") return withRefresh(await handleErpLinkList(url, env, sql));
+        if (request.method === "POST") return withRefresh(await handleErpLinkChange(request, env, sql, auth.user));
+      }
+
+      if (parts[0] === "direct-cost-panel") {
+        if (!canAttachToDirectCost(auth.user, auth.level)) {
+          return json({ error: "forbidden", detail: "You don't have permission to add files to Direct Costs. Ask an admin to switch it on in HELM." }, 403);
+        }
+        if (parts.length === 1 && request.method === "GET") return withRefresh(await handleDirectCostPanelRead(url, env));
+        if (parts.length === 2 && parts[1] === "attach" && request.method === "POST") {
+          return withRefresh(await handleDirectCostPanelAttach(request, env, sql, auth.user));
+        }
+      }
+
       if (parts[0] === "submissions") {
         const pmScoped = auth.isPmSubmitter && !auth.isReviewer;
 
@@ -3074,6 +3500,15 @@ export default {
 
 // Exported for unit tests.
 export const _test = {
+  canAttachToDirectCost,
+  compareAttachments,
+  directCostSummary,
+  cleanFilename,
+  handleDirectCostPanelAttach,
+  canManageErpLinks,
+  handleErpLinkChange,
+  handleErpLinkList,
+  ERP_TYPES,
   dateFromExpenseId,
   viewerIdentity,
   isAboutViewer,

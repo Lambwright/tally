@@ -273,3 +273,33 @@ without a form isn't possible; a form someone attached themselves is left alone.
   form is redrawn at that moment, just before it is attached to Procore.
 - **Not the same receipts twice:** at Submit, receipts that match another (not rejected) expense for the same
   employee (same vendor, date and total) block the submission unless the person confirms they are separate.
+
+## Procore side panel: files onto locked Direct Costs
+
+A Procore side panel lets people drop files onto a Direct Cost, including one locked by its NetSuite link. It's
+registered on TALLY's Procore app, the page is HELM's (`https://lambwright.github.io/helm/?panel=erp-tools`, code in
+`HELM/web/src/panel/`), and this worker does the Procore work, so uploads use TALLY's Procore limits.
+
+- **Routes:** `GET /direct-cost-panel?project_id=&id=` and `POST /direct-cost-panel/attach` (multipart: `project_id`,
+  `id`, `files`). Up to 10 files and 20 MB per upload.
+- **Who:** a TALLY admin, or anyone given the `dc_attach` tool permission in HELM -> Role Matrix -> Tool permissions.
+- **How:** multipart `attachments[]` on the Direct Cost, the only method that links a file (`upload_ids` answers 200
+  and links nothing). It adds to the existing files and doesn't touch `origin_id`.
+- **Checked every time:** the Direct Cost is read back and compared by attachment id. A 200 that linked nothing, or an
+  existing file going missing, is reported as a failure.
+- **Log:** Procore only sees the service account, so `dc_attachment_log` records the person. The row is written before
+  the upload, and no log means no upload. `pending` is left behind only if a run is cut off, so check that Direct Cost.
+
+### ERP links: lock and unlock
+
+The panel's ERP links tab sets or blanks a record's `origin_id`, one at a time or in bulk with checkboxes.
+
+- **Who:** only people with the `erp_link` tool permission in HELM. Being a TALLY admin doesn't include it.
+- **Records:** Direct Costs, Prime Change Orders, Prime Contracts, Owner Invoices, Subcontracts, Purchase Orders and
+  Subcontractor Invoices. Paths and body shapes are in `ERP_TYPES`, each tested live on 2026-11-06.
+- **Routes:** `GET /erp-links?project_id=&type=` and `POST /erp-links` with `{project_id, type, reason, changes}`. Up to
+  5 changes per request, because of this account's subrequest ceiling. The panel sends larger batches 5 at a time.
+- **Safety:** the whole request is validated first. Each record is re-read, so it won't unlock what's already unlocked or
+  overwrite an existing link. The change is logged, written, then read back. A reason is required.
+- **Log:** `erp_link_log` holds who, why, and the old and new `origin_id`, written before the change. No log means no
+  change. The panel uses it to offer a record's old ID back when re-locking.
