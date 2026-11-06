@@ -23,7 +23,12 @@ describe("ERP_TYPES paths, as tested live on 2026-11-06", () => {
   it("uses the singular Prime Contract path", () => expect(ERP_TYPES.prime_contract.patch("7", "9")).toBe("/rest/v1.0/prime_contract/9?project_id=7"));
   it("nests owner invoices under the contract", () =>
     expect(ERP_TYPES.owner_invoice.patch("7", "9", "3")).toBe("/rest/v1.0/prime_contracts/3/payment_applications/9?project_id=7"));
-  it("wraps a Direct Cost in item", () => expect(ERP_TYPES.direct_cost.body("7", "X")).toEqual({ item: { origin_id: "X" } }));
+  it("changes a Direct Cost through the sync endpoint, the only thing that moves `synced`", () => {
+    expect(ERP_TYPES.direct_cost.patch("7", "9")).toBe("/rest/v1.0/projects/7/direct_costs/sync");
+    expect(ERP_TYPES.direct_cost.body("7", "X", "9")).toEqual({ updates: [{ id: 9, origin_id: "X" }] });
+  });
+  it("reads a Direct Cost from v1.1, the only version that shows `synced`", () =>
+    expect(ERP_TYPES.direct_cost.show("7", "9")).toBe("/rest/v1.1/projects/7/direct_costs/9"));
   it("wraps a CO in change_order with the project id", () =>
     expect(ERP_TYPES.change_order.body("7", "")).toEqual({ project_id: 7, change_order: { origin_id: "" } }));
 });
@@ -166,6 +171,71 @@ describe("ERP link changes", () => {
       { changes: unlock, type: "owner_invoice" },
     ]) expect((await send(body)).status).toBe(400);
     expect(calls.patches).toHaveLength(0);
+  });
+
+  describe("Direct Costs and the synced flag", () => {
+    // dc: the record. onSync: what a sync call does to it.
+    function dcProcore(dc, onSync) {
+      const calls = { syncs: [] };
+      globalThis.fetch = async (url, init = {}) => {
+        const u = String(url);
+        if (!u.includes("/rest/")) return jsonRes({ access_token: "tok" });
+        if ((init.method || "GET") === "PATCH") {
+          calls.syncs.push({ url: u, body: JSON.parse(init.body) });
+          onSync(dc, JSON.parse(init.body).updates[0]);
+          return jsonRes({ entities: [], errors: [] });
+        }
+        return jsonRes({ id: 9, ...dc });
+      };
+      return calls;
+    }
+    const real = (dc, u) => { dc.origin_id = u.origin_id; dc.synced = !!u.origin_id; };
+    const dcSend = (changes, sql) => send({ type: "direct_cost", changes }, sql);
+
+    it("unlocks through sync and checks `synced` really went off", async () => {
+      const dc = { origin_id: "111101_2908", synced: true };
+      const calls = dcProcore(dc, real);
+      const sql = fakeSql();
+      const out = await (await dcSend([{ id: "9", action: "unlock" }], sql)).json();
+      expect(out.results[0]).toEqual({ id: "9", ok: true, originId: "" });
+      expect(calls.syncs[0].url).toContain("/direct_costs/sync");
+      expect(dc).toEqual({ origin_id: "", synced: false });
+      expect(statuses(sql)).toEqual(["done"]);
+    });
+
+    it("can finish a half-unlocked record: blank ID, but still locked", async () => {
+      const dc = { origin_id: "", synced: true };
+      dcProcore(dc, real);
+      const out = await (await dcSend([{ id: "9", action: "unlock" }])).json();
+      expect(out.results[0].ok).toBe(true);
+      expect(dc.synced).toBe(false);
+    });
+
+    it("locks through sync and checks `synced` came on", async () => {
+      const dc = { origin_id: "", synced: false };
+      dcProcore(dc, real);
+      const out = await (await dcSend([{ id: "9", action: "lock", origin_id: "111101_2908" }])).json();
+      expect(out.results[0].ok).toBe(true);
+      expect(dc).toEqual({ origin_id: "111101_2908", synced: true });
+    });
+
+    it("fails if the ID changed but the lock didn't, which is the bug this replaced", async () => {
+      const dc = { origin_id: "111101_2908", synced: true };
+      dcProcore(dc, (d, u) => { d.origin_id = u.origin_id; });
+      const sql = fakeSql();
+      const out = await (await dcSend([{ id: "9", action: "unlock" }], sql)).json();
+      expect(out.results[0].ok).toBe(false);
+      expect(out.results[0].error).toContain("still shows this as locked");
+      expect(statuses(sql)).toEqual(["failed"]);
+    });
+
+    it("still says already unlocked when it really is", async () => {
+      const dc = { origin_id: "", synced: false };
+      const calls = dcProcore(dc, real);
+      const out = await (await dcSend([{ id: "9", action: "unlock" }])).json();
+      expect(out.results[0].error).toBe("It's already unlocked.");
+      expect(calls.syncs).toHaveLength(0);
+    });
   });
 
   it("sends an owner invoice through its contract", async () => {

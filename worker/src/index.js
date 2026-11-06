@@ -1036,11 +1036,14 @@ const projectScoped = (name, wrapper, row) => ({
 const contractRow = (r) => ({ number: r.number ?? null, title: r.title || vendorOf(r), amount: r.grand_total ?? null });
 
 const ERP_TYPES = {
+  // A Direct Cost's lock and Synced badge come from `synced`, which only v1.1 shows. A normal PATCH can change
+  // origin_id but leaves `synced` alone, so the record stays locked; `synced` itself ignores writes. Only the bulk
+  // /sync endpoint moves it: an ID turns it on, a blank turns it off. origin_data stays, as it does on DCs NetSuite unlinks.
   direct_cost: {
     list: (p) => `/rest/v1.0/projects/${p}/direct_costs?`,
-    show: (p, id) => `/rest/v1.0/projects/${p}/direct_costs/${id}`,
-    patch: (p, id) => `/rest/v1.0/projects/${p}/direct_costs/${id}`,
-    body: (p, value) => ({ item: { origin_id: value } }),
+    show: (p, id) => `/rest/v1.1/projects/${p}/direct_costs/${id}`,
+    patch: (p) => `/rest/v1.0/projects/${p}/direct_costs/sync`,
+    body: (p, value, id) => ({ updates: [{ id: Number(id), origin_id: value }] }),
     row: (r) => ({ number: r.invoice_number || null, title: vendorOf(r) || String(r.description || "").trim() || null, amount: r.grand_total ?? null }),
   },
   change_order: projectScoped("change_order_packages", "change_order", contractRow),
@@ -1101,7 +1104,7 @@ async function fetchErpPages(env, token, path) {
 }
 
 function erpRow(type, r, parentId) {
-  return { id: String(r.id), parentId: parentId || null, status: r.status || null, originId: originOf(r), ...ERP_TYPES[type].row(r) };
+  return { id: String(r.id), parentId: parentId || null, status: r.status || null, originId: originOf(r), synced: r.synced === true, ...ERP_TYPES[type].row(r) };
 }
 
 // The ID each record had when it was last unlocked here, to offer back when re-locking. A nicety: never block on it.
@@ -1111,7 +1114,7 @@ async function lastOriginIdsFor(sql, projectId, type) {
     await ensureErpLinkLog(sql);
     const past = await sql`
       select distinct on (record_id) record_id, old_origin_id from erp_link_log
-      where project_id = ${projectId} and record_type = ${type} and action = 'unlock' and status = 'done'
+      where project_id = ${projectId} and record_type = ${type} and action = 'unlock' and status = 'done' and old_origin_id <> ''
       order by record_id, created_at desc`;
     for (const p of past) found[p.record_id] = p.old_origin_id;
   } catch (e) {
@@ -1194,7 +1197,7 @@ async function applyErpChange(env, token, sql, user, { projectId, type, reason }
     return fail(e.status === 404 ? "Procore can't find this record." : e.message.slice(0, 300));
   }
   const old = originOf(current);
-  if (action === "unlock" && !old) return fail("It's already unlocked.");
+  if (action === "unlock" && !old && current.synced !== true) return fail("It's already unlocked.");
   if (action === "lock" && old) return fail(`It's already linked to ${old}. Unlock it first to change the ID.`);
 
   const number = def.row(current).number;
@@ -1214,7 +1217,7 @@ async function applyErpChange(env, token, sql, user, { projectId, type, reason }
       .catch((e) => console.error("erp_link_log update failed:", e));
 
   try {
-    await procoreFetch(env, token, def.patch(projectId, id, change.parentId), { method: "PATCH", body: def.body(projectId, wanted) });
+    await procoreFetch(env, token, def.patch(projectId, id, change.parentId), { method: "PATCH", body: def.body(projectId, wanted, id) });
   } catch (e) {
     await finish("failed", e.message.slice(0, 500));
     return fail(`Procore refused this: ${e.message.slice(0, 200)}`);
@@ -1228,6 +1231,13 @@ async function applyErpChange(env, token, sql, user, { projectId, type, reason }
   }
   if (originOf(after) !== wanted) {
     const detail = `Procore answered OK, but the record shows "${originOf(after)}".`;
+    await finish("failed", detail);
+    return fail(detail);
+  }
+  // Where Procore reports the real lock, that has to match too. Blank origin_id with synced still on is the
+  // half-unlocked state a plain PATCH left behind on 2026-11-06.
+  if (typeof after.synced === "boolean" && after.synced !== (action === "lock")) {
+    const detail = `The ID saved, but Procore still shows this as ${after.synced ? "locked" : "unlocked"}.`;
     await finish("failed", detail);
     return fail(detail);
   }
