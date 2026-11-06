@@ -303,8 +303,10 @@ The panel's ERP links tab sets or blanks a record's `origin_id`, one at a time o
   `{project_id, type, reason, changes}`. Up to 5 changes per request, because of this account's subrequest ceiling. The
   panel sends larger batches 5 at a time. A Prime Change Order page may give the CO's own id, so a 404 on the package
   retries through `legacy_package_id`.
-- **Direct Costs are different:** their lock is `synced` (v1.1 only), which a normal PATCH can't move. They go through
-  `/direct_costs/sync`, and a change only counts once `synced` has really changed.
+- **Direct Costs are different:** their lock is `synced` (v1.1 only), which stays on while the header or any line item
+  has an ERP ID. Unlock blanks the lines, then the header through `/direct_costs/sync`, and saves the line IDs in
+  `erp_link_log.old_lines`. Lock restores them. A change only counts once `synced` has really changed. One Direct Cost
+  per request, up to 30 linked lines.
 - **Safety:** the whole request is validated first. Each record is re-read, so it won't unlock what's already unlocked or
   overwrite an existing link. The change is logged, written, then read back. A reason is required.
 - **Log:** `erp_link_log` holds who, why, and the old and new `origin_id`, written before the change. No log means no

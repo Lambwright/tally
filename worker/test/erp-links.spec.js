@@ -59,12 +59,13 @@ describe("ERP link changes", () => {
     return calls;
   }
 
-  function fakeSql({ failInsert = false } = {}) {
+  function fakeSql({ failInsert = false, failPast = false, pastLines = [] } = {}) {
     const log = [];
     const sql = (strings, ...values) => {
       const text = strings.join("?");
       log.push({ text, values });
       if (failInsert && text.includes("insert into")) return Promise.reject(new Error("db down"));
+      if (text.includes("select old_lines")) return failPast ? Promise.reject(new Error("db down")) : Promise.resolve(pastLines);
       return Promise.resolve(text.includes("insert into") ? [{ id: log.length }] : []);
     };
     sql.log = log;
@@ -173,68 +174,140 @@ describe("ERP link changes", () => {
     expect(calls.patches).toHaveLength(0);
   });
 
-  describe("Direct Costs and the synced flag", () => {
-    // dc: the record. onSync: what a sync call does to it.
-    function dcProcore(dc, onSync) {
-      const calls = { syncs: [] };
+  describe("Direct Costs: the lock is `synced`, on while the header or any line has an ID", () => {
+    // Behaves as Procore did live on 2026-11-06. `broken` skips or fails a write to test the checks.
+    function dcProcore(dc, broken = {}) {
+      const calls = { writes: [] };
       globalThis.fetch = async (url, init = {}) => {
         const u = String(url);
         if (!u.includes("/rest/")) return jsonRes({ access_token: "tok" });
-        if ((init.method || "GET") === "PATCH") {
-          calls.syncs.push({ url: u, body: JSON.parse(init.body) });
-          onSync(dc, JSON.parse(init.body).updates[0]);
+        if ((init.method || "GET") !== "PATCH") {
+          return jsonRes({ id: 9, origin_id: dc.origin_id, line_items: dc.line_items, synced: !!dc.origin_id || dc.line_items.some((l) => l.origin_id) });
+        }
+        const body = JSON.parse(init.body);
+        calls.writes.push({ url: u, body });
+        if (u.endsWith("/direct_costs/sync")) {
+          if (!broken.header) dc.origin_id = body.updates[0].origin_id;
           return jsonRes({ entities: [], errors: [] });
         }
-        return jsonRes({ id: 9, ...dc });
+        if (!body.line_item) return jsonRes({ errors: "param is missing" }, 400);
+        if (broken.lineStatus) return jsonRes({}, broken.lineStatus);
+        const line = dc.line_items.find((l) => u.endsWith(`/line_items/${l.id}`));
+        if (!broken.lineIgnored) line.origin_id = body.line_item.origin_id;
+        return jsonRes({ id: line.id });
       };
       return calls;
     }
-    const real = (dc, u) => { dc.origin_id = u.origin_id; dc.synced = !!u.origin_id; };
     const dcSend = (changes, sql) => send({ type: "direct_cost", changes }, sql);
+    const unlock = [{ id: "9", action: "unlock" }];
+    const lock = [{ id: "9", action: "lock", origin_id: "111101_2908" }];
+    const isLine = (w) => w.url.includes("/line_items/");
 
-    it("unlocks through sync and checks `synced` really went off", async () => {
-      const dc = { origin_id: "111101_2908", synced: true };
-      const calls = dcProcore(dc, real);
+    it("finishes Ben's stuck record: blank header, but the line still has an ID", async () => {
+      const dc = { origin_id: "", line_items: [{ id: 5, origin_id: "111101_uk_390762" }] };
+      const calls = dcProcore(dc);
       const sql = fakeSql();
-      const out = await (await dcSend([{ id: "9", action: "unlock" }], sql)).json();
+      const out = await (await dcSend(unlock, sql)).json();
       expect(out.results[0]).toEqual({ id: "9", ok: true, originId: "" });
-      expect(calls.syncs[0].url).toContain("/direct_costs/sync");
-      expect(dc).toEqual({ origin_id: "", synced: false });
+      expect(dc.line_items[0].origin_id).toBe("");
+      expect(calls.writes.every(isLine)).toBe(true);
+      const insert = sql.log.find((q) => q.text.includes("insert into erp_link_log"));
+      expect(insert.values).toContain(JSON.stringify({ 5: "111101_uk_390762" }));
       expect(statuses(sql)).toEqual(["done"]);
     });
 
-    it("can finish a half-unlocked record: blank ID, but still locked", async () => {
-      const dc = { origin_id: "", synced: true };
-      dcProcore(dc, real);
-      const out = await (await dcSend([{ id: "9", action: "unlock" }])).json();
+    it("unlocks a normal synced record, lines first, then the header", async () => {
+      const dc = { origin_id: "111101_2908", line_items: [{ id: 5, origin_id: "L1" }, { id: 6, origin_id: "" }, { id: 7, origin_id: "L3" }] };
+      const calls = dcProcore(dc);
+      const out = await (await dcSend(unlock)).json();
       expect(out.results[0].ok).toBe(true);
-      expect(dc.synced).toBe(false);
+      expect(calls.writes.map((w) => w.url.split("/").pop())).toEqual(["5", "7", "sync"]);
+      expect(dc.origin_id).toBe("");
+      expect(dc.line_items.map((l) => l.origin_id)).toEqual(["", "", ""]);
     });
 
-    it("locks through sync and checks `synced` came on", async () => {
-      const dc = { origin_id: "", synced: false };
-      dcProcore(dc, real);
-      const out = await (await dcSend([{ id: "9", action: "lock", origin_id: "111101_2908" }])).json();
+    it("re-locks and puts the saved line IDs back", async () => {
+      const dc = { origin_id: "", line_items: [{ id: 5, origin_id: "" }] };
+      dcProcore(dc);
+      const sql = fakeSql({ pastLines: [{ old_lines: { 5: "111101_uk_390762" } }] });
+      const out = await (await dcSend(lock, sql)).json();
       expect(out.results[0].ok).toBe(true);
-      expect(dc).toEqual({ origin_id: "111101_2908", synced: true });
+      expect(dc).toEqual({ origin_id: "111101_2908", line_items: [{ id: 5, origin_id: "111101_uk_390762" }] });
     });
 
-    it("fails if the ID changed but the lock didn't, which is the bug this replaced", async () => {
-      const dc = { origin_id: "111101_2908", synced: true };
-      dcProcore(dc, (d, u) => { d.origin_id = u.origin_id; });
+    it("merges several unlocks, reads a string, and skips lines gone or already filled", async () => {
+      const dc = { origin_id: "", line_items: [{ id: 5, origin_id: "" }, { id: 6, origin_id: "KEEP" }] };
+      const calls = dcProcore(dc);
+      const sql = fakeSql({ pastLines: [{ old_lines: { 5: "OLD", 6: "X", 8: "GONE" } }, { old_lines: JSON.stringify({ 5: "NEW" }) }] });
+      const out = await (await dcSend(lock, sql)).json();
+      expect(out.results[0].ok).toBe(true);
+      expect(dc.line_items).toEqual([{ id: 5, origin_id: "NEW" }, { id: 6, origin_id: "KEEP" }]);
+      expect(calls.writes.filter(isLine)).toHaveLength(1);
+    });
+
+    it("locks with just the header when no lines were saved", async () => {
+      const dc = { origin_id: "", line_items: [{ id: 5, origin_id: "" }] };
+      const calls = dcProcore(dc);
+      const out = await (await dcSend(lock)).json();
+      expect(out.results[0].ok).toBe(true);
+      expect(calls.writes.filter(isLine)).toHaveLength(0);
+    });
+
+    it("fails if a line write is refused, and a re-run can finish it", async () => {
+      const dc = { origin_id: "X", line_items: [{ id: 5, origin_id: "L1" }] };
+      dcProcore(dc, { lineStatus: 403 });
       const sql = fakeSql();
-      const out = await (await dcSend([{ id: "9", action: "unlock" }], sql)).json();
-      expect(out.results[0].ok).toBe(false);
+      const first = await (await dcSend(unlock, sql)).json();
+      expect(first.results[0].ok).toBe(false);
+      expect(first.results[0].error).toContain("Procore refused");
+      expect(dc.origin_id).toBe("X"); // the header wasn't touched
+      expect(statuses(sql)).toEqual(["failed"]);
+      dcProcore(dc);
+      expect((await (await dcSend(unlock)).json()).results[0].ok).toBe(true);
+    });
+
+    it("fails if `synced` stays on, which is what caught the missed line ID", async () => {
+      const dc = { origin_id: "X", line_items: [{ id: 5, origin_id: "L1" }] };
+      dcProcore(dc, { lineIgnored: true });
+      const sql = fakeSql();
+      const out = await (await dcSend(unlock, sql)).json();
       expect(out.results[0].error).toContain("still shows this as locked");
       expect(statuses(sql)).toEqual(["failed"]);
     });
 
+    it("says so if a line ID didn't come back on a re-lock", async () => {
+      const dc = { origin_id: "", line_items: [{ id: 5, origin_id: "" }] };
+      dcProcore(dc, { lineIgnored: true });
+      const out = await (await dcSend(lock, fakeSql({ pastLines: [{ old_lines: { 5: "L1" } }] }))).json();
+      expect(out.results[0].error).toContain("line ID(s) didn't save");
+    });
+
+    it("won't lock if the saved line IDs can't be read", async () => {
+      const dc = { origin_id: "", line_items: [{ id: 5, origin_id: "" }] };
+      const calls = dcProcore(dc);
+      const out = await (await dcSend(lock, fakeSql({ failPast: true }))).json();
+      expect(out.results[0].error).toContain("Nothing was changed");
+      expect(calls.writes).toHaveLength(0);
+    });
+
+    it("changes nothing if there are too many linked lines for one request", async () => {
+      const dc = { origin_id: "X", line_items: Array.from({ length: 31 }, (_, i) => ({ id: i + 1, origin_id: `L${i}` })) };
+      const calls = dcProcore(dc);
+      const out = await (await dcSend(unlock)).json();
+      expect(out.results[0].error).toContain("more than 30");
+      expect(calls.writes).toHaveLength(0);
+    });
+
+    it("takes one Direct Cost per request", async () => {
+      dcProcore({ origin_id: "X", line_items: [] });
+      expect((await dcSend([...unlock, { id: "8", action: "unlock" }])).status).toBe(400);
+    });
+
     it("still says already unlocked when it really is", async () => {
-      const dc = { origin_id: "", synced: false };
-      const calls = dcProcore(dc, real);
-      const out = await (await dcSend([{ id: "9", action: "unlock" }])).json();
+      const calls = dcProcore({ origin_id: "", line_items: [{ id: 5, origin_id: "" }] });
+      const out = await (await dcSend(unlock)).json();
       expect(out.results[0].error).toBe("It's already unlocked.");
-      expect(calls.syncs).toHaveLength(0);
+      expect(calls.writes).toHaveLength(0);
     });
   });
 

@@ -1036,13 +1036,16 @@ const projectScoped = (name, wrapper, row) => ({
 const contractRow = (r) => ({ number: r.number ?? null, title: r.title || vendorOf(r), amount: r.grand_total ?? null });
 
 const ERP_TYPES = {
-  // A Direct Cost's lock and Synced badge come from `synced`, which only v1.1 shows. A normal PATCH can change
-  // origin_id but leaves `synced` alone, so the record stays locked; `synced` itself ignores writes. Only the bulk
-  // /sync endpoint moves it: an ID turns it on, a blank turns it off. origin_data stays, as it does on DCs NetSuite unlinks.
+  // A Direct Cost's lock and Synced badge come from `synced`, which only v1.1 shows and which ignores writes. It's on
+  // while the header OR ANY LINE has an origin_id, and NetSuite puts its own IDs on the lines (111101_uk_390762). So an
+  // unlock has to blank both, and a re-lock restores both. The header goes through /sync; origin_data stays, as it does
+  // on DCs NetSuite unlinks. One per request, because the lines make each one a variable number of calls.
   direct_cost: {
+    maxChanges: 1,
     list: (p) => `/rest/v1.0/projects/${p}/direct_costs?`,
     show: (p, id) => `/rest/v1.1/projects/${p}/direct_costs/${id}`,
     patch: (p) => `/rest/v1.0/projects/${p}/direct_costs/sync`,
+    linePath: (p, id, lineId) => `/rest/v1.0/projects/${p}/direct_costs/${id}/line_items/${lineId}`,
     body: (p, value, id) => ({ updates: [{ id: Number(id), origin_id: value }] }),
     row: (r) => ({ number: r.invoice_number || null, title: vendorOf(r) || String(r.description || "").trim() || null, amount: r.grand_total ?? null }),
   },
@@ -1068,6 +1071,7 @@ const ERP_TYPES = {
 
 const ERP_MAX_ROWS = 500;
 const ERP_MAX_CHANGES = 5; // per request: ~5 subrequests each, and this account's per-invocation ceiling is low
+const ERP_MAX_LINES = 30; // linked lines on one Direct Cost, one call each, under that same ceiling
 const ERP_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_\-+.:#/ ]{0,99}$/;
 const originOf = (r) => (r?.origin_id == null ? "" : String(r.origin_id));
 
@@ -1089,6 +1093,19 @@ async function ensureErpLinkLog(sql) {
     status text not null default 'pending',
     detail text
   )`;
+  await sql`alter table erp_link_log add column if not exists old_lines jsonb`;
+}
+
+// A Direct Cost's line items carry their own ERP IDs: { lineId: originId }, non-blank ones only.
+const lineIdsOf = (r) => Object.fromEntries((r?.line_items || []).filter((l) => l.origin_id).map((l) => [String(l.id), String(l.origin_id)]));
+
+// The line IDs saved by past unlocks of this record, newest winning, to put back when it's locked again.
+async function pastLineIds(sql, projectId, type, id) {
+  const rows = await sql`
+    select old_lines from erp_link_log
+    where project_id = ${projectId} and record_type = ${type} and record_id = ${id} and action = 'unlock' and old_lines is not null
+    order by created_at`;
+  return Object.assign({}, ...rows.map((r) => (typeof r.old_lines === "string" ? JSON.parse(r.old_lines) : r.old_lines)));
 }
 
 async function fetchErpPages(env, token, path) {
@@ -1200,12 +1217,32 @@ async function applyErpChange(env, token, sql, user, { projectId, type, reason }
   if (action === "unlock" && !old && current.synced !== true) return fail("It's already unlocked.");
   if (action === "lock" && old) return fail(`It's already linked to ${old}. Unlock it first to change the ID.`);
 
+  // The lines to write: on unlock, every line with an ID, saved below so a re-lock can restore them; on lock,
+  // what past unlocks saved for lines still on the record and still blank.
+  let lines = {};
+  if (def.linePath) {
+    if (action === "unlock") {
+      lines = lineIdsOf(current);
+    } else {
+      try {
+        const past = await pastLineIds(sql, projectId, type, id);
+        const blank = (current.line_items || []).filter((l) => !l.origin_id).map((l) => String(l.id));
+        lines = Object.fromEntries(Object.entries(past).filter(([lineId]) => blank.includes(lineId)));
+      } catch (e) {
+        console.error("erp_link_log read failed:", e);
+        return fail("Nothing was changed: the saved line IDs couldn't be read. Try again in a minute.");
+      }
+    }
+    if (Object.keys(lines).length > ERP_MAX_LINES) return fail(`Nothing was changed: this has more than ${ERP_MAX_LINES} linked lines, which is more than one request can do.`);
+  }
+
   const number = def.row(current).number;
+  const savedLines = action === "unlock" && Object.keys(lines).length ? JSON.stringify(lines) : null;
   let logId;
   try {
     const [row] = await sql`
-      insert into erp_link_log (username, display_name, project_id, record_type, record_id, record_number, action, old_origin_id, new_origin_id, reason)
-      values (${user.username}, ${user.displayName || null}, ${projectId}, ${type}, ${id}, ${number == null ? null : String(number)}, ${action}, ${old}, ${wanted}, ${reason})
+      insert into erp_link_log (username, display_name, project_id, record_type, record_id, record_number, action, old_origin_id, new_origin_id, reason, old_lines)
+      values (${user.username}, ${user.displayName || null}, ${projectId}, ${type}, ${id}, ${number == null ? null : String(number)}, ${action}, ${old}, ${wanted}, ${reason}, ${savedLines}::jsonb)
       returning id`;
     logId = row.id;
   } catch (e) {
@@ -1216,8 +1253,21 @@ async function applyErpChange(env, token, sql, user, { projectId, type, reason }
     sql`update erp_link_log set status = ${status}, detail = ${detail}, finished_at = now() where id = ${logId}`
       .catch((e) => console.error("erp_link_log update failed:", e));
 
+  const writeHeader = () => procoreFetch(env, token, def.patch(projectId, id, change.parentId), { method: "PATCH", body: def.body(projectId, wanted, id) });
+  const writeLines = async () => {
+    for (const [lineId, value] of Object.entries(lines)) {
+      await procoreFetch(env, token, def.linePath(projectId, id, lineId), { method: "PATCH", body: { line_item: { origin_id: action === "lock" ? value : "" } } });
+    }
+  };
   try {
-    await procoreFetch(env, token, def.patch(projectId, id, change.parentId), { method: "PATCH", body: def.body(projectId, wanted, id) });
+    if (action === "lock") {
+      await writeHeader();
+      await writeLines();
+    } else {
+      // Lines first: if one fails the record stays locked, and Unlock can simply be run again.
+      await writeLines();
+      if (old || !def.linePath) await writeHeader();
+    }
   } catch (e) {
     await finish("failed", e.message.slice(0, 500));
     return fail(`Procore refused this: ${e.message.slice(0, 200)}`);
@@ -1241,6 +1291,15 @@ async function applyErpChange(env, token, sql, user, { projectId, type, reason }
     await finish("failed", detail);
     return fail(detail);
   }
+  if (action === "lock") {
+    const nowOn = lineIdsOf(after);
+    const missed = Object.entries(lines).filter(([lineId, value]) => nowOn[lineId] !== value).length;
+    if (missed) {
+      const detail = `It's locked, but ${missed} line ID(s) didn't save.`;
+      await finish("failed", detail);
+      return fail(detail);
+    }
+  }
   await finish("done", null);
   return { id, ok: true, originId: wanted };
 }
@@ -1260,7 +1319,8 @@ async function handleErpLinkChange(request, env, sql, user) {
   if (!projectId || !Object.hasOwn(ERP_TYPES, type || "")) return json({ error: "bad_request", detail: "A project and a record type are both needed." }, 400);
   if (reason.length < 3) return json({ error: "bad_request", detail: "Say why you're making this change." }, 400);
   const raw = Array.isArray(body?.changes) ? body.changes : [];
-  if (!raw.length || raw.length > ERP_MAX_CHANGES) return json({ error: "bad_request", detail: `Send 1 to ${ERP_MAX_CHANGES} changes at a time.` }, 400);
+  const maxChanges = ERP_TYPES[type].maxChanges ?? ERP_MAX_CHANGES;
+  if (!raw.length || raw.length > maxChanges) return json({ error: "bad_request", detail: `Send 1 to ${maxChanges} changes at a time.` }, 400);
 
   const changes = [];
   for (const c of raw) {
