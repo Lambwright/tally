@@ -1104,11 +1104,61 @@ function erpRow(type, r, parentId) {
   return { id: String(r.id), parentId: parentId || null, status: r.status || null, originId: originOf(r), ...ERP_TYPES[type].row(r) };
 }
 
-// GET /erp-links?project_id=&type=
+// The ID each record had when it was last unlocked here, to offer back when re-locking. A nicety: never block on it.
+async function lastOriginIdsFor(sql, projectId, type) {
+  const found = {};
+  try {
+    await ensureErpLinkLog(sql);
+    const past = await sql`
+      select distinct on (record_id) record_id, old_origin_id from erp_link_log
+      where project_id = ${projectId} and record_type = ${type} and action = 'unlock' and status = 'done'
+      order by record_id, created_at desc`;
+    for (const p of past) found[p.record_id] = p.old_origin_id;
+  } catch (e) {
+    console.error("erp_link_log read failed:", e);
+  }
+  return found;
+}
+
+// One record, by the id Procore gave the panel. A Prime Change Order page may give the CO's own id, but the
+// link lives on its package (legacy_package_id), so a 404 there gets one more try through the CO.
+async function readErpRecord(env, token, type, projectId, id) {
+  const def = ERP_TYPES[type];
+  try {
+    return await procoreFetch(env, token, def.show(projectId, id));
+  } catch (e) {
+    if (e.status !== 404 || type !== "change_order") throw e;
+  }
+  const co = await procoreFetch(env, token, `/rest/v1.0/projects/${projectId}/prime_change_orders/${id}`);
+  if (!co.legacy_package_id) {
+    const err = new Error("That Change Order has no package.");
+    err.status = 404;
+    throw err;
+  }
+  return procoreFetch(env, token, def.show(projectId, String(co.legacy_package_id)));
+}
+
+// GET /erp-links?project_id=&type=          every record of that type
+// GET /erp-links?project_id=&type=&id=      just the record open in Procore
 async function handleErpLinkList(url, env, sql) {
   const projectId = procoreIdParam(url.searchParams.get("project_id"));
   const type = url.searchParams.get("type");
   if (!projectId || !Object.hasOwn(ERP_TYPES, type || "")) return json({ error: "bad_request", detail: "A project and a record type are both needed." }, 400);
+
+  if (url.searchParams.has("id")) {
+    const id = procoreIdParam(url.searchParams.get("id"));
+    if (!id) return json({ error: "bad_request", detail: "That record id isn't valid." }, 400);
+    let record;
+    try {
+      record = await readErpRecord(env, await getProcoreToken(env), type, projectId, id);
+    } catch (e) {
+      return procorePanelError(e);
+    }
+    const row = erpRow(type, record, ERP_TYPES[type].needsParent ? procoreIdParam(record.contract?.id) : null);
+    const lastOriginIds = await lastOriginIdsFor(sql, projectId, type);
+    return json({ row: { ...row, lastOriginId: lastOriginIds[row.id] || null } });
+  }
+
   let rows = [];
   try {
     const token = await getProcoreToken(env);
@@ -1125,18 +1175,7 @@ async function handleErpLinkList(url, env, sql) {
     return procorePanelError(e);
   }
 
-  // The ID each record had when it was last unlocked here, to offer back when re-locking. A nicety: never block on it.
-  const lastOriginIds = {};
-  try {
-    await ensureErpLinkLog(sql);
-    const past = await sql`
-      select distinct on (record_id) record_id, old_origin_id from erp_link_log
-      where project_id = ${projectId} and record_type = ${type} and action = 'unlock' and status = 'done'
-      order by record_id, created_at desc`;
-    for (const p of past) lastOriginIds[p.record_id] = p.old_origin_id;
-  } catch (e) {
-    console.error("erp_link_log read failed:", e);
-  }
+  const lastOriginIds = await lastOriginIdsFor(sql, projectId, type);
   return json({ rows: rows.map((r) => ({ ...r, lastOriginId: lastOriginIds[r.id] || null })), truncated: rows.length >= ERP_MAX_ROWS });
 }
 

@@ -212,6 +212,51 @@ describe("ERP link list", () => {
     expect(res.status).toBe(200);
   });
 
+  describe("one record", () => {
+    const procore = (routes) => {
+      const seen = [];
+      globalThis.fetch = async (url) => {
+        const u = String(url);
+        if (!u.includes("/rest/")) return jsonRes({ access_token: "tok" });
+        seen.push(u);
+        const hit = Object.entries(routes).find(([k]) => u.includes(k));
+        return hit ? jsonRes(hit[1]) : jsonRes({}, 404);
+      };
+      return seen;
+    };
+    const read = (qs) => handleErpLinkList(new URL(`https://t/erp-links?project_id=7&${qs}`), env, sql);
+
+    it("reads just that record, with one Procore call", async () => {
+      const seen = procore({ "/direct_costs/2": { id: 2, vendor_name: "V", grand_total: "5.0", status: "approved", origin_id: "" } });
+      const out = await (await read("type=direct_cost&id=2")).json();
+      expect(out.row).toMatchObject({ id: "2", title: "V", originId: "", lastOriginId: "112240" });
+      expect(seen).toHaveLength(1);
+    });
+
+    it("finds a CO's package when Procore gave the CO's own id", async () => {
+      procore({ "/prime_change_orders/55": { id: 55, legacy_package_id: 2 }, "/change_order_packages/2?": { id: 2, number: "001", title: "T", origin_id: "94009" } });
+      const out = await (await read("type=change_order&id=55")).json();
+      expect(out.row).toMatchObject({ id: "2", number: "001", originId: "94009" });
+    });
+
+    it("keeps an owner invoice's contract, so it can be saved", async () => {
+      procore({ "/payment_applications/9": { id: 9, number: 1, origin_id: null, contract: { id: 3 } } });
+      const out = await (await read("type=owner_invoice&id=9")).json();
+      expect(out.row).toMatchObject({ id: "9", parentId: "3" });
+    });
+
+    it("answers 404 when the id isn't that kind of record", async () => {
+      procore({});
+      expect((await read("type=work_order&id=9")).status).toBe(404);
+      expect((await read("type=change_order&id=9")).status).toBe(404);
+    });
+
+    it("rejects a bad id", async () => {
+      procore({});
+      expect((await read("type=direct_cost&id=1;drop")).status).toBe(400);
+    });
+  });
+
   it("rejects an unknown type", async () => {
     expect((await handleErpLinkList(new URL("https://t/erp-links?project_id=7&type=__proto__"), env, sql)).status).toBe(400);
   });
