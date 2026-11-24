@@ -54,6 +54,13 @@ const PARSE_FAILURE_FLAGS = new Set(["parse_failed", "claude_failed", "form_pars
 
 const dateOnly = (s) => (s ? String(s).slice(0, 10) : "");
 
+// Column total in whole cents, so adding 12.50 + 11.12 never drifts. Blank or non-numeric cells count as nothing.
+const sumCents = (rows, key) =>
+  rows.reduce((a, r) => {
+    const n = Number(r[key]);
+    return a + (r[key] !== null && r[key] !== "" && r[key] !== undefined && Number.isFinite(n) ? Math.round(n * 100) : 0);
+  }, 0);
+
 function money(n, currency = "CAD") {
   if (n === null || n === undefined || n === "") return "—";
   const num = Number(n);
@@ -833,6 +840,15 @@ export default function SubmissionDetail({ id, onClose, onChanged, me }) {
               })}
               {lines.length === 0 && (
                 <tr><td colSpan={11} className="row-secondary" style={{ padding: 12 }}>No lines yet — add one below.</td></tr>
+              )}
+              {lines.length > 0 && (
+                <tr className="lines-total-row">
+                  <td colSpan={4}>Total · {lines.length} line{lines.length === 1 ? "" : "s"}</td>
+                  <td>{money(sumCents(lines, "gross_amount") / 100)}</td>
+                  <td />
+                  <td>{money(sumCents(lines, "net_amount") / 100)}</td>
+                  <td colSpan={4} />
+                </tr>
               )}
               {actionable && (addOpen ? (
                 <tr className="add-line-tr">
